@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SubRecon Pro</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: { 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca' }
+          },
+          keyframes: {
+            fadein: { '0%': { opacity: 0, transform: 'translateY(4px)' }, '100%': { opacity: 1, transform: 'translateY(0)' } }
+          },
+          animation: { fadein: 'fadein 0.25s ease-out' }
+        }
+      }
+    }
+  </script>
+  <style>
+    .progress-stripes {
+      background-image: linear-gradient(45deg, rgba(255,255,255,0.15) 25%, transparent 25%, transparent 50%, rgba(255,255,255,0.15) 50%, rgba(255,255,255,0.15) 75%, transparent 75%, transparent);
+      background-size: 1rem 1rem;
+      animation: stripe 1s linear infinite;
+    }
+    @keyframes stripe { from { background-position: 1rem 0; } to { background-position: 0 0; } }
+    th.sortable { cursor: pointer; user-select: none; }
+    th.sortable:hover { color: #a5b4fc; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <div class="max-w-6xl mx-auto px-4 py-8">
+
+    <!-- Header -->
+    <header class="text-center mb-10">
+      <div class="text-5xl mb-2">🛡️🔍</div>
+      <h1 class="text-4xl font-extrabold bg-gradient-to-r from-indigo-400 via-sky-400 to-emerald-400 bg-clip-text text-transparent">
+        SubRecon Pro
+      </h1>
+      <p class="text-gray-400 mt-2">Subdomain Enumeration &amp; Takeover Risk Analysis</p>
+    </header>
+
+    <!-- Scan Form -->
+    <section class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg">
+      <div class="flex flex-col sm:flex-row gap-3">
+        <input id="domainInput" type="text" placeholder="target.com" autocomplete="off"
+          class="flex-1 bg-gray-950 border border-gray-700 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-brand-500" />
+        <button id="startBtn" onclick="startScan()"
+          class="bg-brand-600 hover:bg-brand-700 transition-colors px-6 py-3 rounded-lg font-semibold text-white">
+          Start Scan
+        </button>
+      </div>
+      <p id="domainError" class="text-red-400 text-sm mt-2 hidden">Please enter a valid domain (e.g. example.com).</p>
+
+      <div class="mt-4">
+        <button onclick="toggleAdvanced()" class="text-sm text-gray-400 hover:text-gray-200">
+          <span id="advChevron">▸</span> Advanced Options
+        </button>
+        <div id="advancedPanel" class="hidden mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">SecurityTrails API key (optional)</label>
+            <input id="stKey" type="password" autocomplete="off"
+              class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
+          </div>
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Shodan API key (optional)</label>
+            <input id="shodanKey" type="password" autocomplete="off"
+              class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Progress Panel -->
+    <section id="progressPanel" class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg hidden">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-lg font-semibold">Scanning…</h2>
+        <button onclick="cancelScan()" class="text-sm text-red-400 hover:text-red-300 border border-red-500/40 rounded px-3 py-1">Cancel</button>
+      </div>
+      <div class="w-full bg-gray-800 rounded-full h-4 overflow-hidden mb-2">
+        <div id="progressBar" class="progress-stripes bg-brand-600 h-4 rounded-full transition-all duration-500" style="width:0%"></div>
+      </div>
+      <p id="progressText" class="text-sm text-gray-400 mb-4">Discovered 0 subdomains so far</p>
+
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="text-gray-500 text-left border-b border-gray-800">
+            <th class="py-2">Source</th>
+            <th class="py-2">Status</th>
+          </tr>
+        </thead>
+        <tbody id="sourceTable"></tbody>
+      </table>
+    </section>
+
+    <!-- Results Dashboard -->
+    <section id="resultsPanel" class="hidden">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-2xl font-bold">Results for <span id="resultDomain" class="text-brand-400"></span></h2>
+        <button onclick="downloadCSV()"
+          class="bg-emerald-600 hover:bg-emerald-700 transition-colors px-5 py-2.5 rounded-lg font-semibold text-white flex items-center gap-2">
+          ⬇ Download CSV
+        </button>
+      </div>
+
+      <!-- Summary cards -->
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <div class="bg-gray-900 border border-blue-500/30 rounded-xl p-4">
+          <div class="text-3xl font-bold text-blue-400" id="cardTotal">0</div>
+          <div class="text-xs text-gray-400 mt-1">Total Subdomains</div>
+        </div>
+        <div class="bg-gray-900 border border-emerald-500/30 rounded-xl p-4">
+          <div class="text-3xl font-bold text-emerald-400" id="cardAlive">0</div>
+          <div class="text-xs text-gray-400 mt-1">Resolved &amp; Alive</div>
+        </div>
+        <div class="bg-gray-900 border border-red-500/30 rounded-xl p-4">
+          <div class="text-3xl font-bold text-red-400" id="cardHigh">0</div>
+          <div class="text-xs text-gray-400 mt-1">HIGH Risk</div>
+        </div>
+        <div class="bg-gray-900 border border-orange-500/30 rounded-xl p-4">
+          <div class="text-3xl font-bold text-orange-400" id="cardMedium">0</div>
+          <div class="text-xs text-gray-400 mt-1">MEDIUM Risk</div>
+        </div>
+      </div>
+
+      <!-- Risk breakdown bar -->
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 mb-6">
+        <div class="text-sm text-gray-400 mb-2">Risk breakdown</div>
+        <div class="flex w-full h-5 rounded-full overflow-hidden bg-gray-800">
+          <div id="barHigh" class="bg-red-500 h-full" style="width:0%"></div>
+          <div id="barMedium" class="bg-orange-500 h-full" style="width:0%"></div>
+          <div id="barNone" class="bg-gray-500 h-full" style="width:0%"></div>
+        </div>
+        <div class="flex gap-4 text-xs text-gray-400 mt-2">
+          <span><span class="inline-block w-2 h-2 rounded-full bg-red-500"></span> HIGH</span>
+          <span><span class="inline-block w-2 h-2 rounded-full bg-orange-500"></span> MEDIUM</span>
+          <span><span class="inline-block w-2 h-2 rounded-full bg-gray-500"></span> NONE/LOW</span>
+        </div>
+      </div>
+
+      <!-- Filters -->
+      <div class="flex flex-wrap items-center gap-2 mb-4">
+        <div class="flex flex-wrap gap-2" id="filterBtns">
+          <button data-filter="all" class="filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm">All</button>
+          <button data-filter="alive" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Alive Only</button>
+          <button data-filter="high" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">HIGH Risk</button>
+          <button data-filter="medium" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">MEDIUM Risk</button>
+          <button data-filter="unresolved" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Unresolved</button>
+        </div>
+        <input id="searchInput" type="text" placeholder="Search subdomains…" oninput="applyFilters()"
+          class="ml-auto bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
+      </div>
+
+      <!-- Results table -->
+      <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-gray-400 text-left border-b border-gray-800">
+              <th class="sortable py-3 px-3" onclick="sortResults('subdomain')">Subdomain</th>
+              <th class="py-3 px-3">IP Addresses</th>
+              <th class="py-3 px-3">CNAME</th>
+              <th class="sortable py-3 px-3" onclick="sortResults('http_status')">HTTP</th>
+              <th class="sortable py-3 px-3" onclick="sortResults('https_status')">HTTPS</th>
+              <th class="py-3 px-3">Sources</th>
+              <th class="sortable py-3 px-3" onclick="sortResults('takeover_risk')">Risk</th>
+              <th class="sortable py-3 px-3" onclick="sortResults('alive')">Live</th>
+            </tr>
+          </thead>
+          <tbody id="resultsTable"></tbody>
+        </table>
+        <p id="emptyRow" class="text-center text-gray-500 py-6 hidden">No subdomains match the current filter.</p>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="text-center text-xs text-gray-600 mt-12">
+      ⚠️ For authorized security testing only. Unauthorized use is illegal.
+    </footer>
+  </div>
+
+  <script>
+    let currentJobId = null;
+    let pollInterval = null;
+    let allResults = [];
+    let filteredResults = [];
+    let sortState = { column: null, asc: true };
+    let activeFilter = 'all';
+
+    const DOMAIN_RE = /^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
+    const SOURCES = ['crt.sh','HackerTarget','AlienVault','RapidDNS','URLScan','ThreatCrowd','Wayback','Anubis','BufferOver','SecurityTrails','Shodan'];
+
+    function toggleAdvanced() {
+      const p = document.getElementById('advancedPanel');
+      const c = document.getElementById('advChevron');
+      p.classList.toggle('hidden');
+      c.textContent = p.classList.contains('hidden') ? '▸' : '▾';
+    }
+
+    function statusBadge(status) {
+      switch (status) {
+        case 'running': return '<span class="text-yellow-400 animate-pulse">🔄 Running</span>';
+        case 'done': return '<span class="text-green-400">✅ Done</span>';
+        case 'error': return '<span class="text-red-400">❌ Error</span>';
+        default: return '<span class="text-gray-500">⏳ Pending</span>';
+      }
+    }
+
+    async function startScan() {
+      const input = document.getElementById('domainInput');
+      const domain = input.value.trim().toLowerCase();
+      const err = document.getElementById('domainError');
+      if (!DOMAIN_RE.test(domain)) {
+        err.classList.remove('hidden');
+        return;
+      }
+      err.classList.add('hidden');
+
+      const body = { domain };
+      const st = document.getElementById('stKey').value.trim();
+      const sh = document.getElementById('shodanKey').value.trim();
+      if (st) body.securitytrails_key = st;
+      if (sh) body.shodan_key = sh;
+
+      document.getElementById('startBtn').disabled = true;
+      document.getElementById('resultsPanel').classList.add('hidden');
+      document.getElementById('progressPanel').classList.remove('hidden');
+      renderSourceTable({});
+      updateProgress(0, 0);
+
+      try {
+        const resp = await fetch('/api/enumerate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (!resp.ok) {
+          const e = await resp.json().catch(() => ({}));
+          throw new Error(e.detail || 'Request failed');
+        }
+        const data = await resp.json();
+        currentJobId = data.job_id;
+        pollInterval = setInterval(pollStatus, 2000);
+        pollStatus();
+      } catch (e) {
+        alert('Failed to start scan: ' + e.message);
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('progressPanel').classList.add('hidden');
+      }
+    }
+
+    function updateProgress(pct, found) {
+      document.getElementById('progressBar').style.width = pct + '%';
+      document.getElementById('progressText').textContent = `Discovered ${found} subdomains so far`;
+    }
+
+    function renderSourceTable(statuses) {
+      const tbody = document.getElementById('sourceTable');
+      tbody.innerHTML = SOURCES.map(s => {
+        const st = statuses[s] || 'pending';
+        return `<tr class="border-b border-gray-800/60"><td class="py-2">${s}</td><td class="py-2">${statusBadge(st)}</td></tr>`;
+      }).join('');
+    }
+
+    async function pollStatus() {
+      if (!currentJobId) return;
+      try {
+        const resp = await fetch(`/api/status/${currentJobId}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        updateProgress(data.progress, data.subdomains_found);
+        renderSourceTable(data.source_statuses || {});
+
+        if (data.status === 'done') {
+          clearInterval(pollInterval);
+          pollInterval = null;
+          await loadResults();
+        } else if (data.status === 'error') {
+          clearInterval(pollInterval);
+          pollInterval = null;
+          alert('Scan failed: ' + (data.error || 'unknown error'));
+          document.getElementById('startBtn').disabled = false;
+        }
+      } catch (e) {
+        // transient; keep polling
+      }
+    }
+
+    async function loadResults() {
+      const resp = await fetch(`/api/results/${currentJobId}`);
+      if (!resp.ok) {
+        alert('Failed to load results');
+        document.getElementById('startBtn').disabled = false;
+        return;
+      }
+      const data = await resp.json();
+      displayResults(data);
+    }
+
+    function displayResults(data) {
+      allResults = data.subdomains || [];
+      document.getElementById('progressPanel').classList.add('hidden');
+      document.getElementById('resultsPanel').classList.remove('hidden');
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('resultDomain').textContent = data.domain;
+
+      document.getElementById('cardTotal').textContent = data.total;
+      document.getElementById('cardAlive').textContent = data.alive;
+      document.getElementById('cardHigh').textContent = data.high_risk;
+      document.getElementById('cardMedium').textContent = data.medium_risk;
+
+      const total = data.total || 1;
+      const high = data.high_risk;
+      const medium = data.medium_risk;
+      const none = Math.max(0, data.total - high - medium);
+      document.getElementById('barHigh').style.width = (100 * high / total) + '%';
+      document.getElementById('barMedium').style.width = (100 * medium / total) + '%';
+      document.getElementById('barNone').style.width = (100 * none / total) + '%';
+
+      activeFilter = 'all';
+      setActiveFilterButton();
+      applyFilters();
+    }
+
+    function setActiveFilterButton() {
+      document.querySelectorAll('.filter-btn').forEach(btn => {
+        if (btn.dataset.filter === activeFilter) {
+          btn.className = 'filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm';
+        } else {
+          btn.className = 'filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm';
+        }
+      });
+    }
+
+    document.getElementById('filterBtns').addEventListener('click', (e) => {
+      const btn = e.target.closest('.filter-btn');
+      if (!btn) return;
+      activeFilter = btn.dataset.filter;
+      setActiveFilterButton();
+      applyFilters();
+    });
+
+    function applyFilters() {
+      const search = document.getElementById('searchInput').value.trim().toLowerCase();
+      filteredResults = allResults.filter(r => {
+        if (search && !r.subdomain.toLowerCase().includes(search)) return false;
+        switch (activeFilter) {
+          case 'alive': return r.alive;
+          case 'high': return r.takeover_risk === 'HIGH';
+          case 'medium': return r.takeover_risk === 'MEDIUM';
+          case 'unresolved': return !r.resolved;
+          default: return true;
+        }
+      });
+      if (sortState.column) applySort();
+      renderTable();
+    }
+
+    function sortResults(column) {
+      if (sortState.column === column) {
+        sortState.asc = !sortState.asc;
+      } else {
+        sortState.column = column;
+        sortState.asc = true;
+      }
+      applySort();
+      renderTable();
+    }
+
+    function applySort() {
+      const col = sortState.column;
+      const dir = sortState.asc ? 1 : -1;
+      const riskOrder = { HIGH: 3, MEDIUM: 2, LOW: 1, NONE: 0 };
+      filteredResults.sort((a, b) => {
+        let va = a[col], vb = b[col];
+        if (col === 'takeover_risk') { va = riskOrder[va] ?? 0; vb = riskOrder[vb] ?? 0; }
+        if (col === 'alive') { va = va ? 1 : 0; vb = vb ? 1 : 0; }
+        if (va == null) va = -Infinity;
+        if (vb == null) vb = -Infinity;
+        if (typeof va === 'string') return va.localeCompare(vb) * dir;
+        return (va - vb) * dir;
+      });
+    }
+
+    function riskBadge(risk) {
+      let cls = 'bg-gray-500';
+      if (risk === 'HIGH') cls = 'bg-red-500';
+      else if (risk === 'MEDIUM') cls = 'bg-orange-500';
+      return `<span class="${cls} text-white text-xs font-semibold px-2 py-0.5 rounded">${risk}</span>`;
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function renderTable() {
+      const tbody = document.getElementById('resultsTable');
+      const empty = document.getElementById('emptyRow');
+      if (!filteredResults.length) {
+        tbody.innerHTML = '';
+        empty.classList.remove('hidden');
+        return;
+      }
+      empty.classList.add('hidden');
+      tbody.innerHTML = filteredResults.map(r => {
+        const dot = r.alive
+          ? '<span class="text-green-400">●</span>'
+          : '<span class="text-gray-600">●</span>';
+        const title = r.takeover_detail ? ` title="${escapeHtml(r.takeover_detail)}"` : '';
+        return `<tr class="border-b border-gray-800/60 animate-fadein hover:bg-gray-800/40">
+          <td class="py-2 px-3 font-mono text-brand-300">${escapeHtml(r.subdomain)}</td>
+          <td class="py-2 px-3 text-gray-400 font-mono text-xs">${escapeHtml((r.ip_addresses||[]).join(', ')) || '—'}</td>
+          <td class="py-2 px-3 text-gray-400 font-mono text-xs">${escapeHtml(r.cname || '') || '—'}</td>
+          <td class="py-2 px-3">${r.http_status ?? '—'}</td>
+          <td class="py-2 px-3">${r.https_status ?? '—'}</td>
+          <td class="py-2 px-3 text-gray-500 text-xs">${escapeHtml((r.sources||[]).join(', '))}</td>
+          <td class="py-2 px-3"${title}>${riskBadge(r.takeover_risk)}</td>
+          <td class="py-2 px-3 text-center">${dot}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    function cancelScan() {
+      if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+      currentJobId = null;
+      document.getElementById('progressPanel').classList.add('hidden');
+      document.getElementById('startBtn').disabled = false;
+    }
+
+    function downloadCSV() {
+      if (currentJobId) window.open(`/api/download/${currentJobId}`);
+    }
+
+    document.getElementById('domainInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') startScan();
+    });
+  </script>
+</body>
+</html>
