@@ -124,10 +124,22 @@ Jobs are held in memory and automatically expire one hour after creation.
 
 ## Security note
 
-CORS is configured to allow all origins so the bundled frontend works out of
-the box for local, single-user use. If you deploy SubRecon Pro to a shared or
-public host, restrict `allow_origins` in `main.py` and place the service behind
-authentication.
+CORS is scoped to localhost origins by default
+(`http://localhost:8080`, `http://127.0.0.1:8080`) for local, single-user use.
+To allow other origins, set the `SUBRECON_CORS_ORIGINS` environment variable to
+a comma-separated list of origins (e.g.
+`SUBRECON_CORS_ORIGINS="https://recon.example.com"`). Credentials are not
+enabled, so a wildcard origin is never paired with cookie/credential sharing.
+If you deploy SubRecon Pro to a shared or public host, keep the origin list
+tight and place the service behind authentication.
+
+Additional hardening: the `domain` input is validated against a strict
+RFC-1035 hostname rule (length- and label-capped, IP literals and
+scheme/slash/`@`/whitespace rejected) before it reaches any outbound request;
+the subdomain HTTP probe skips any host that resolves to a private, loopback,
+link-local, or cloud-metadata address (SSRF guard); CSV export neutralizes
+spreadsheet formula injection; and the per-job work and concurrent-job counts
+are capped to limit resource exhaustion.
 
 TLS handling uses two separate HTTP clients: a **verified** client (standard CA
 validation) for all data-source and authenticated API calls — so SecurityTrails

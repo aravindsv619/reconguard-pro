@@ -8,6 +8,7 @@ exposes an in-memory job API plus a single-file dark-themed frontend.
 import asyncio
 import csv
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -38,9 +39,86 @@ HTTP_PROBE_TIMEOUT = 5.0
 ANALYSIS_CONCURRENCY = 50
 JOB_TTL_SECONDS = 3600
 
+# DoS caps (resource exhaustion guards). MAX_ACTIVE_JOBS bounds the number of
+# simultaneously pending/running jobs (POSTs beyond it get 429);
+# MAX_SUBDOMAINS_PER_JOB bounds how many discovered hosts a single job will
+# analyze (DNS/HTTP probe) so a huge passive-DNS result set can't exhaust the
+# process. Probe concurrency itself stays bounded by Semaphore(ANALYSIS_CONCURRENCY).
+MAX_ACTIVE_JOBS = 20
+MAX_SUBDOMAINS_PER_JOB = 5000
+
+# Maximum total length of a domain name per RFC 1035 (<= 253 chars).
+MAX_DOMAIN_LENGTH = 253
+
 DOMAIN_RE = re.compile(
     r"^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$"
 )
+
+
+def is_valid_hostname(name: str) -> bool:
+    """Strict RFC-1035 hostname check applied BEFORE a value is interpolated
+    into any outbound URL / passed to ``dig`` / HTTP-probed.
+
+    Rejects: empty input, anything longer than 253 chars, empty or oversized
+    (>63 char) labels, schemes (``http://``), slashes, ``@``, whitespace, and
+    IP addresses (the trailing ``[a-zA-Z]{2,}`` TLD rule in DOMAIN_RE rejects
+    all-numeric final labels, so bare IPv4/IPv6 literals do not match).
+    """
+    if not name or len(name) > MAX_DOMAIN_LENGTH:
+        return False
+    # Reject obvious URL / injection characters early (defense in depth; the
+    # regex already excludes them, but this keeps intent explicit).
+    if any(c in name for c in "/\\@ \t\r\n:") or "*" in name:
+        return False
+    labels = name.split(".")
+    if any(len(label) == 0 or len(label) > 63 for label in labels):
+        return False
+    # Reject bare IP literals explicitly (DOMAIN_RE also rejects them).
+    try:
+        ipaddress.ip_address(name)
+        return False
+    except ValueError:
+        pass
+    return bool(DOMAIN_RE.match(name))
+
+
+def _is_safe_public_ip(ip: str) -> bool:
+    """Return True only for globally-routable public addresses.
+
+    Returns False (unsafe → do NOT probe) for private, loopback, link-local
+    (incl. the 169.254.169.254 cloud metadata address), reserved, multicast,
+    and unspecified ranges for both IPv4 and IPv6
+    (127.0.0.0/8, 10/8, 172.16/12, 192.168/16, 169.254/16, ::1, fc00::/7, ...).
+    Unparseable input is treated as unsafe. This is the SSRF guard that keeps
+    the probe client from reaching internal/metadata endpoints.
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    ):
+        return False
+    return True
+
+
+def _csv_safe(value) -> str:
+    """Neutralize CSV formula/injection per OWASP.
+
+    If the stringified value begins with a formula trigger (= + - @) or a
+    control char (tab, CR, LF) that spreadsheet apps may interpret, prefix a
+    single quote so the cell is treated as text. Preserves the value otherwise.
+    """
+    text = "" if value is None else str(value)
+    if text and text[0] in ("=", "+", "-", "@", "\t", "\r", "\n"):
+        return "'" + text
+    return text
 
 # ---------------------------------------------------------------------------
 # Takeover fingerprints
@@ -399,7 +477,13 @@ async def _resolve_ptrs(ip_addresses: list[str]) -> list[str]:
 
 
 def _dig_cname(host: str) -> Optional[str]:
-    """Resolve a CNAME via the `dig` binary (fast, authoritative when present)."""
+    """Resolve a CNAME via the `dig` binary (fast, authoritative when present).
+
+    Security: the subprocess is invoked with an argument LIST (never a shell
+    string, never ``shell=True``), so ``host`` cannot be interpreted as shell
+    syntax. ``host`` is additionally gated by ``is_valid_hostname`` upstream
+    (see ``analyze_subdomain``) and the call has a hard 5s timeout.
+    """
     try:
         out = subprocess.run(
             ["dig", "+short", "CNAME", host],
@@ -460,6 +544,11 @@ async def check_http(client: httpx.AsyncClient, host: str) -> tuple[Optional[int
     ``client`` here is the probe client (TLS verification disabled) so that
     arbitrary target subdomains presenting expired or self-signed certs do not
     produce spurious failures. It is never used for authenticated API calls.
+
+    SSRF note: callers MUST only invoke this for hosts whose resolved IPs are
+    public (see the ``_is_safe_public_ip`` gate in ``analyze_subdomain``). This
+    function does not re-resolve, so the IP-range guard lives at the single
+    call site to avoid a resolve/connect TOCTOU window.
     """
     http_status: Optional[int] = None
     https_status: Optional[int] = None
@@ -554,10 +643,35 @@ def check_takeover(
 async def analyze_subdomain(
     probe_client: httpx.AsyncClient, sub: str, sources: list[str], sem: asyncio.Semaphore
 ) -> SubdomainResult:
+    # Hostname gate: subdomains arrive from untrusted third-party passive-DNS
+    # sources. Only strictly-valid RFC-1035 hostnames reach `dig`/HTTP probes.
+    if not is_valid_hostname(sub):
+        return SubdomainResult(
+            subdomain=sub,
+            ip_addresses=[],
+            cname=None,
+            http_status=None,
+            https_status=None,
+            sources=sorted(sources),
+            takeover_risk="NONE",
+            takeover_service=None,
+            takeover_detail=None,
+            resolved=False,
+            alive=False,
+        )
+
     async with sem:
         ip_addresses = await resolve_dns(sub)
         cname = await resolve_cname(sub)
-        http_status, https_status, body = await check_http(probe_client, sub)
+        # SSRF guard: never probe a host that resolves to a private/internal/
+        # loopback/link-local/metadata address. If the host resolved to IP(s)
+        # but none are public, skip the HTTP probe entirely (status stays None,
+        # alive=False). Hosts with no A/AAAA records (CNAME-only) are probed via
+        # their CNAME chain, which httpx re-resolves at connect time.
+        if ip_addresses and not any(_is_safe_public_ip(ip) for ip in ip_addresses):
+            http_status, https_status, body = None, None, ""
+        else:
+            http_status, https_status, body = await check_http(probe_client, sub)
         ptr_hosts = await _resolve_ptrs(ip_addresses)
 
     resolved = bool(ip_addresses) or bool(cname)
@@ -648,6 +762,9 @@ async def run_enumeration(job_id: str, domain: str, keys: dict) -> None:
         subs = sorted(
             s for s in collected if s and "*" not in s and s != domain.lower()
         )
+        # DoS cap: bound the number of hosts analyzed per job so an enormous
+        # passive-DNS result set cannot exhaust DNS/HTTP probe resources.
+        subs = subs[:MAX_SUBDOMAINS_PER_JOB]
         job.subdomains_found = len(subs)
 
         sem = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
@@ -711,11 +828,24 @@ async def lifespan(app: FastAPI):
         await app.state.probe_client.aclose()
 
 
+# FastAPI debug is left OFF (default) so tracebacks are never returned to
+# clients; handlers raise HTTPException with generic messages and the generic
+# 500 handler returns {"detail": "Internal Server Error"} with no stack trace.
 app = FastAPI(title="SubRecon Pro", lifespan=lifespan)
 
+# CORS: scoped to localhost origins by default for this local single-user tool.
+# Override with the SUBRECON_CORS_ORIGINS env var (comma-separated list of
+# origins). Credentials are intentionally NOT enabled, so a wildcard origin is
+# never paired with allow_credentials=True (which browsers forbid anyway).
+_default_cors = "http://localhost:8080,http://127.0.0.1:8080"
+_cors_origins = [
+    o.strip()
+    for o in os.environ.get("SUBRECON_CORS_ORIGINS", _default_cors).split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -729,10 +859,17 @@ async def health():
 @app.post("/api/enumerate")
 async def enumerate_domain(req: EnumerateRequest):
     domain = req.domain.strip().lower().rstrip(".")
-    if not DOMAIN_RE.match(domain):
+    # Strict RFC-1035 validation (length cap, label sizes, no scheme/slash/@/
+    # whitespace, no IP literals) BEFORE the value ever reaches an outbound URL.
+    if not is_valid_hostname(domain):
         raise HTTPException(status_code=400, detail="Invalid domain format")
 
     cleanup_old_jobs()
+    # DoS cap: reject new work when too many jobs are already in flight.
+    active = sum(1 for j in JOBS.values() if j.status in ("pending", "running"))
+    if active >= MAX_ACTIVE_JOBS:
+        raise HTTPException(status_code=429, detail="Too many active jobs, retry later")
+
     job_id = uuid.uuid4().hex
     JOBS[job_id] = JobState(job_id=job_id, domain=domain)
     keys = {
@@ -810,21 +947,29 @@ async def download_csv(job_id: str):
     writer = csv.writer(buffer)
     writer.writerow(CSV_COLUMNS)
     for r in job.results:
+        # Text columns are passed through _csv_safe to neutralize spreadsheet
+        # formula/injection (values from attacker-poisonable cert logs). The
+        # 11-column contract and order are unchanged; numeric/bool columns
+        # (http_status, https_status, resolved, alive) pass through as-is.
         writer.writerow([
-            r["subdomain"],
-            ";".join(r["ip_addresses"]),
-            r["cname"] or "",
+            _csv_safe(r["subdomain"]),
+            _csv_safe(";".join(r["ip_addresses"])),
+            _csv_safe(r["cname"] or ""),
             r["http_status"] if r["http_status"] is not None else "",
             r["https_status"] if r["https_status"] is not None else "",
-            ";".join(r["sources"]),
+            _csv_safe(";".join(r["sources"])),
             r["resolved"],
             r["alive"],
-            r["takeover_risk"],
-            r["takeover_service"] or "",
-            r["takeover_detail"] or "",
+            _csv_safe(r["takeover_risk"]),
+            _csv_safe(r["takeover_service"] or ""),
+            _csv_safe(r["takeover_detail"] or ""),
         ])
     buffer.seek(0)
-    filename = f"subrecon_{job.domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    # Sanitize the filename so no CRLF/quote can break the Content-Disposition
+    # header. job.domain is already is_valid_hostname-validated, but strip to a
+    # safe charset as defense-in-depth.
+    safe_domain = re.sub(r"[^a-z0-9.-]", "_", job.domain.lower()) or "domain"
+    filename = f"subrecon_{safe_domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     return StreamingResponse(
         iter([buffer.getvalue()]),
         media_type="text/csv",

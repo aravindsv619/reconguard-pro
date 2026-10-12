@@ -386,10 +386,21 @@
     }
 
     function riskBadge(risk) {
+      // Whitelist the risk value before it reaches innerHTML. takeover_risk is
+      // a server-controlled enum today, but data on this page originates from
+      // attacker-poisonable third-party cert logs, so never trust it raw.
+      const label = (risk === 'HIGH' || risk === 'MEDIUM' || risk === 'LOW' || risk === 'NONE')
+        ? risk : 'NONE';
       let cls = 'bg-gray-500';
-      if (risk === 'HIGH') cls = 'bg-red-500';
-      else if (risk === 'MEDIUM') cls = 'bg-orange-500';
-      return `<span class="${cls} text-white text-xs font-semibold px-2 py-0.5 rounded">${risk}</span>`;
+      if (label === 'HIGH') cls = 'bg-red-500';
+      else if (label === 'MEDIUM') cls = 'bg-orange-500';
+      return `<span class="${cls} text-white text-xs font-semibold px-2 py-0.5 rounded">${label}</span>`;
+    }
+
+    function statusCell(v) {
+      // Coerce HTTP status codes to integers before injecting into the DOM so
+      // only a number (or an em dash) can ever reach innerHTML.
+      return Number.isInteger(v) ? v : '—';
     }
 
     function escapeHtml(s) {
@@ -414,8 +425,8 @@
           <td class="py-2 px-3 font-mono text-brand-300">${escapeHtml(r.subdomain)}</td>
           <td class="py-2 px-3 text-gray-400 font-mono text-xs">${escapeHtml((r.ip_addresses||[]).join(', ')) || '—'}</td>
           <td class="py-2 px-3 text-gray-400 font-mono text-xs">${escapeHtml(r.cname || '') || '—'}</td>
-          <td class="py-2 px-3">${r.http_status ?? '—'}</td>
-          <td class="py-2 px-3">${r.https_status ?? '—'}</td>
+          <td class="py-2 px-3">${statusCell(r.http_status)}</td>
+          <td class="py-2 px-3">${statusCell(r.https_status)}</td>
           <td class="py-2 px-3 text-gray-500 text-xs">${escapeHtml((r.sources||[]).join(', '))}</td>
           <td class="py-2 px-3"${title}>${riskBadge(r.takeover_risk)}</td>
           <td class="py-2 px-3 text-center">${dot}</td>
