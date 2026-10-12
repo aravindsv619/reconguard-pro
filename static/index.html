@@ -71,6 +71,38 @@
             <input id="shodanKey" type="password" autocomplete="off"
               class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
           </div>
+
+          <!-- Active DNS discovery -->
+          <div class="sm:col-span-2 border-t border-gray-800 pt-3 mt-1">
+            <label class="flex items-center gap-2 text-sm text-gray-200 cursor-pointer">
+              <input id="activeToggle" type="checkbox" class="accent-brand-600" onchange="toggleActive()" />
+              Enable active DNS brute-force
+            </label>
+            <p class="text-amber-400 text-xs mt-1">
+              ⚠️ Active mode sends DNS queries directly to the target's resolvers.
+              Use only on domains you are authorized to test.
+            </p>
+          </div>
+
+          <div id="activeOptions" class="sm:col-span-2 hidden">
+            <label class="block text-xs text-gray-500 mb-1">Custom wordlist (optional)</label>
+            <textarea id="wordlistInput" rows="4"
+              placeholder="One subdomain label per line (e.g. dev, staging, api)"
+              class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-500"></textarea>
+            <div class="flex items-center gap-2 mt-2">
+              <label class="text-xs text-gray-500">Wordlist mode</label>
+              <select id="wordlistMode"
+                class="bg-gray-950 border border-gray-700 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-brand-500">
+                <option value="replace">Replace built-in</option>
+                <option value="append">Append to built-in</option>
+              </select>
+            </div>
+            <p class="text-xs text-gray-500 mt-1">Falls back to the built-in list when left empty.</p>
+            <label class="flex items-center gap-2 text-sm text-gray-200 cursor-pointer mt-3">
+              <input id="permToggle" type="checkbox" class="accent-brand-600" />
+              Enable permutation discovery
+            </label>
+          </div>
         </div>
       </div>
     </section>
@@ -95,6 +127,7 @@
         </thead>
         <tbody id="sourceTable"></tbody>
       </table>
+      <div id="scanNotes" class="hidden text-amber-400 text-xs mt-3 space-y-1"></div>
     </section>
 
     <!-- Results Dashboard -->
@@ -155,6 +188,12 @@
           class="ml-auto bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
       </div>
 
+      <!-- Chip legend -->
+      <div class="flex flex-wrap gap-3 text-xs text-gray-400 mb-2">
+        <span><span class="bg-amber-500 text-black font-semibold px-1.5 py-0.5 rounded">BF</span> brute-force hit (active)</span>
+        <span><span class="bg-violet-500 text-white font-semibold px-1.5 py-0.5 rounded">PERM</span> permutation hit (active)</span>
+      </div>
+
       <!-- Results table -->
       <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto">
         <table class="w-full text-sm">
@@ -189,6 +228,8 @@
     let filteredResults = [];
     let sortState = { column: null, asc: true };
     let activeFilter = 'all';
+    let activeRequested = false;
+    let permRequested = false;
 
     const DOMAIN_RE = /^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
     const SOURCES = ['crt.sh','HackerTarget','AlienVault','RapidDNS','URLScan','ThreatCrowd','Wayback','Anubis','BufferOver','SecurityTrails','Shodan'];
@@ -198,6 +239,11 @@
       const c = document.getElementById('advChevron');
       p.classList.toggle('hidden');
       c.textContent = p.classList.contains('hidden') ? '▸' : '▾';
+    }
+
+    function toggleActive() {
+      const on = document.getElementById('activeToggle').checked;
+      document.getElementById('activeOptions').classList.toggle('hidden', !on);
     }
 
     function statusBadge(status) {
@@ -224,6 +270,22 @@
       const sh = document.getElementById('shodanKey').value.trim();
       if (st) body.securitytrails_key = st;
       if (sh) body.shodan_key = sh;
+
+      // Active DNS discovery (fields omitted entirely when active is off, so
+      // the request is byte-for-byte the passive-only shape).
+      const activeOn = document.getElementById('activeToggle').checked;
+      const permOn = document.getElementById('permToggle').checked;
+      activeRequested = activeOn;
+      permRequested = activeOn && permOn;
+      if (activeOn) {
+        body.active = true;
+        if (permOn) body.permutations = true;
+        const wl = document.getElementById('wordlistInput').value;
+        if (wl && wl.trim()) {
+          body.wordlist = wl;
+          body.wordlist_mode = document.getElementById('wordlistMode').value;
+        }
+      }
 
       document.getElementById('startBtn').disabled = true;
       document.getElementById('resultsPanel').classList.add('hidden');
@@ -259,10 +321,32 @@
 
     function renderSourceTable(statuses) {
       const tbody = document.getElementById('sourceTable');
-      tbody.innerHTML = SOURCES.map(s => {
+      // Base passive sources, plus the active phases when active was requested
+      // (and the server has registered them). statusBadge returns a fixed
+      // whitelist of strings; source names are from the known-constant lists.
+      const rows = SOURCES.slice();
+      if (activeRequested || 'bruteforce' in statuses) rows.push('bruteforce');
+      if (permRequested || 'permutation' in statuses) rows.push('permutation');
+      const labels = { bruteforce: 'Brute-force (active)', permutation: 'Permutation (active)' };
+      tbody.innerHTML = rows.map(s => {
         const st = statuses[s] || 'pending';
-        return `<tr class="border-b border-gray-800/60"><td class="py-2">${s}</td><td class="py-2">${statusBadge(st)}</td></tr>`;
+        const name = labels[s] || s;
+        return `<tr class="border-b border-gray-800/60"><td class="py-2">${name}</td><td class="py-2">${statusBadge(st)}</td></tr>`;
       }).join('');
+    }
+
+    function renderNotes(notes) {
+      const box = document.getElementById('scanNotes');
+      if (!box) return;
+      const list = Array.isArray(notes) ? notes : [];
+      box.innerHTML = '';
+      if (!list.length) { box.classList.add('hidden'); return; }
+      box.classList.remove('hidden');
+      list.forEach(n => {
+        const p = document.createElement('p');
+        p.textContent = n;  // textContent → no HTML interpolation of server data
+        box.appendChild(p);
+      });
     }
 
     async function pollStatus() {
@@ -273,6 +357,7 @@
         const data = await resp.json();
         updateProgress(data.progress, data.subdomains_found);
         renderSourceTable(data.source_statuses || {});
+        renderNotes(data.notes);
 
         if (data.status === 'done') {
           clearInterval(pollInterval);
@@ -407,6 +492,21 @@
       return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
 
+    function sourceChips(sources) {
+      // Build chips ONLY from a fixed JS whitelist keyed on known active-source
+      // tags; nothing from server data is interpolated into the markup, so this
+      // stays XSS-safe. The textual source list itself is escapeHtml-ed below.
+      const list = Array.isArray(sources) ? sources : [];
+      let html = '';
+      if (list.includes('bruteforce')) {
+        html += ' <span class="bg-amber-500 text-black text-[10px] font-semibold px-1.5 py-0.5 rounded">BF</span>';
+      }
+      if (list.includes('permutation')) {
+        html += ' <span class="bg-violet-500 text-white text-[10px] font-semibold px-1.5 py-0.5 rounded">PERM</span>';
+      }
+      return html;
+    }
+
     function renderTable() {
       const tbody = document.getElementById('resultsTable');
       const empty = document.getElementById('emptyRow');
@@ -427,7 +527,7 @@
           <td class="py-2 px-3 text-gray-400 font-mono text-xs">${escapeHtml(r.cname || '') || '—'}</td>
           <td class="py-2 px-3">${statusCell(r.http_status)}</td>
           <td class="py-2 px-3">${statusCell(r.https_status)}</td>
-          <td class="py-2 px-3 text-gray-500 text-xs">${escapeHtml((r.sources||[]).join(', '))}</td>
+          <td class="py-2 px-3 text-gray-500 text-xs">${escapeHtml((r.sources||[]).join(', '))}${sourceChips(r.sources)}</td>
           <td class="py-2 px-3"${title}>${riskBadge(r.takeover_risk)}</td>
           <td class="py-2 px-3 text-center">${dot}</td>
         </tr>`;

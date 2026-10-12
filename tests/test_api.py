@@ -25,7 +25,7 @@ def clear_jobs():
 def client(monkeypatch):
     # Replace enumeration with a deterministic synchronous filler so the job
     # reaches `done` immediately after POST.
-    async def fake_run(job_id, domain, keys):
+    async def fake_run(job_id, domain, keys, **kwargs):
         job = main.JOBS[job_id]
         job.status = "done"
         job.progress = 100

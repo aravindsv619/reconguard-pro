@@ -50,9 +50,220 @@ MAX_SUBDOMAINS_PER_JOB = 5000
 # Maximum total length of a domain name per RFC 1035 (<= 253 chars).
 MAX_DOMAIN_LENGTH = 253
 
+# ---------------------------------------------------------------------------
+# Active DNS discovery (brute-force + permutation) — all OFF by default.
+# ---------------------------------------------------------------------------
+# Candidate-level DoS bound: the total number of generated brute-force +
+# permutation candidates is capped here, independently of MAX_SUBDOMAINS_PER_JOB
+# (which still bounds the FINAL analyzed set). Active mode may generate up to
+# MAX_ACTIVE_CANDIDATES candidates but, after dedup/merge, still only analyzes
+# MAX_SUBDOMAINS_PER_JOB hosts — matching existing passive behavior.
+MAX_ACTIVE_CANDIDATES = 20000
+
+# Active resolution shares the SAME bounded-concurrency semaphore as passive
+# analysis (asyncio.Semaphore(ANALYSIS_CONCURRENCY)); this constant documents
+# the intended active concurrency and is currently equal to ANALYSIS_CONCURRENCY.
+ACTIVE_RESOLVE_CONCURRENCY = 50
+
+# Absolute path to the bundled default wordlist, resolved relative to this file.
+DEFAULT_WORDLIST_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "wordlists", "default.txt"
+)
+
+# Strict single-label validator (one DNS label, RFC-1035). Applied to every
+# wordlist label and to every generated permutation fragment.
+LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+# Permutation (altdns-style) seed words and separators.
+PERMUTATION_WORDS = [
+    "dev", "staging", "prod", "test", "qa", "uat", "old", "new",
+    "1", "2", "01", "02", "admin", "internal", "api",
+]
+PERMUTATION_SEPARATORS = ["-", "."]
+
 DOMAIN_RE = re.compile(
     r"^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$"
 )
+
+
+def _is_valid_label(label: str) -> bool:
+    """True iff `label` is a single valid DNS label after lowercasing.
+
+    Used to validate wordlist labels and generated permutation fragments
+    before they are composed into a full hostname.
+    """
+    if not isinstance(label, str):
+        return False
+    return bool(LABEL_RE.match(label.strip().lower()))
+
+
+def load_default_wordlist() -> list[str]:
+    """Load the bundled default wordlist from DEFAULT_WORDLIST_PATH.
+
+    Lowercases/strips each line, drops blanks, `#` comments, invalid labels,
+    and duplicates (preserving first-seen order). Never raises — on a missing
+    or unreadable file it logs at debug level and returns [] so the app still
+    starts.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        with open(DEFAULT_WORDLIST_PATH, encoding="utf-8") as fh:
+            for raw in fh:
+                label = raw.strip().lower()
+                if not label or label.startswith("#"):
+                    continue
+                if not _is_valid_label(label) or label in seen:
+                    continue
+                seen.add(label)
+                out.append(label)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("default wordlist load failed: %s", exc)
+        return []
+    return out
+
+
+# Loaded once at import; the list is static.
+DEFAULT_WORDLIST: list[str] = load_default_wordlist()
+
+
+def parse_custom_wordlist(text: Optional[str]) -> list[str]:
+    """Parse a user-supplied newline-separated wordlist into valid labels.
+
+    Lowercases/strips, drops blanks and `#` comments, keeps only labels passing
+    `_is_valid_label`, de-duplicates preserving order. Invalid labels are
+    SILENTLY dropped (never a 400). Returns [] for empty/None input.
+    """
+    if not text:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in text.split("\n"):
+        label = raw.strip().lower()
+        if not label or label.startswith("#"):
+            continue
+        if not _is_valid_label(label) or label in seen:
+            continue
+        seen.add(label)
+        out.append(label)
+    return out
+
+
+def build_bruteforce_candidates(
+    domain: str, labels: list[str], limit: int
+) -> tuple[list[str], bool]:
+    """Compose `{label}.{domain}` candidates (no network I/O).
+
+    Stops once `limit` candidates are produced (candidate-cap enforcement) and
+    skips any composed host that fails `is_valid_hostname` (defense in depth).
+    Returns (candidates, truncated) where `truncated` is True if more labels
+    remained when the cap was hit.
+    """
+    candidates: list[str] = []
+    truncated = False
+    for i, label in enumerate(labels):
+        if len(candidates) >= limit:
+            # More labels remain beyond the cap.
+            truncated = i < len(labels)
+            break
+        host = f"{label}.{domain}".lower()
+        if is_valid_hostname(host):
+            candidates.append(host)
+    return candidates, truncated
+
+
+def generate_permutations(
+    known_hosts,
+    domain: str,
+    words: list[str],
+    separators: list[str],
+    limit: int,
+) -> tuple[list[str], bool]:
+    """Generate altdns-style permutations from already-discovered hosts.
+
+    For each in-scope host under `domain`, take the label portion left of the
+    base domain and generate variants: (a) prepend/append each word with each
+    separator; (b) increment a trailing number in the first label (+1..+3);
+    (c) swap `-`<->`.` within the label portion. All lowercased, re-validated
+    with `is_valid_hostname` (invalid dropped), de-duplicated, excluding the
+    base domain and anything already in `known_hosts`, and never exceeding
+    `limit` total. Returns (candidates, truncated). No network I/O.
+    """
+    domain = domain.lower()
+    suffix = "." + domain
+    known_set = {h.lower() for h in known_hosts}
+    candidates: list[str] = []
+    seen: set[str] = set()
+    truncated = False
+
+    def emit(host: str) -> bool:
+        """Append a validated, novel candidate.
+
+        Returns False once the cap is reached, signaling the caller to stop
+        generating (and marking the result truncated). Returns True to continue.
+        """
+        nonlocal truncated
+        host = host.lower()
+        if host in seen or host in known_set or host == domain:
+            return True
+        if not is_valid_hostname(host):
+            return True
+        if len(candidates) >= limit:
+            truncated = True
+            return False
+        seen.add(host)
+        candidates.append(host)
+        if len(candidates) >= limit:
+            # Cap now full; any further generation would be dropped.
+            truncated = True
+            return False
+        return True
+
+    for host in known_set:
+        host = host.lower()
+        # Only permute in-scope hosts strictly below the base domain.
+        if not host.endswith(suffix):
+            continue
+        prefix = host[: -len(suffix)]  # label portion left of base domain
+        if not prefix:
+            continue
+
+        # (a) prepend / append each word with each separator.
+        for word in words:
+            for sep in separators:
+                if not emit(f"{word}{sep}{prefix}{suffix}"):
+                    return candidates, truncated
+                if not emit(f"{prefix}{sep}{word}{suffix}"):
+                    return candidates, truncated
+            # Numeric words are also appended directly (no separator), the
+            # common altdns pattern that turns `api` into `api1`, `api2`, ...
+            if word.isdigit():
+                if not emit(f"{prefix}{word}{suffix}"):
+                    return candidates, truncated
+
+        # (b) increment a trailing number in the first (leftmost) label.
+        first_label = prefix.split(".")[0]
+        rest = prefix[len(first_label):]  # includes leading '.' if any
+        m = re.match(r"^(.*?)(\d+)$", first_label)
+        if m:
+            stem, num = m.group(1), m.group(2)
+            width = len(num)
+            base_val = int(num)
+            for delta in (1, 2, 3):
+                new_num = str(base_val + delta).zfill(width)
+                new_first = f"{stem}{new_num}"
+                if not emit(f"{new_first}{rest}{suffix}"):
+                    return candidates, truncated
+
+        # (c) swap '-' <-> '.' within the label portion.
+        if "-" in prefix:
+            if not emit(f"{prefix.replace('-', '.')}{suffix}"):
+                return candidates, truncated
+        if "." in prefix:
+            if not emit(f"{prefix.replace('.', '-')}{suffix}"):
+                return candidates, truncated
+
+    return candidates, truncated
 
 
 def is_valid_hostname(name: str) -> bool:
@@ -192,6 +403,9 @@ class JobState:
     error: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     cancelled: bool = False
+    # Human-readable notes surfaced in the status endpoint (e.g. candidate-cap
+    # truncation messages for active discovery). Empty for passive-only jobs.
+    notes: list = field(default_factory=list)
 
 
 JOBS: dict[str, JobState] = {}
@@ -201,6 +415,12 @@ class EnumerateRequest(BaseModel):
     domain: str
     securitytrails_key: Optional[str] = None
     shodan_key: Optional[str] = None
+    # Active DNS discovery (OFF by default). Omitting all of these reproduces
+    # today's passive-only behavior byte-for-byte.
+    active: bool = False
+    wordlist: Optional[str] = None
+    wordlist_mode: Optional[str] = "replace"  # "replace" | "append"
+    permutations: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +915,41 @@ async def analyze_subdomain(
     )
 
 
+async def resolve_candidates(
+    probe_client: httpx.AsyncClient,
+    candidates: list[str],
+    sem: asyncio.Semaphore,
+    source_tag: str,
+    on_done=None,
+) -> dict[str, SubdomainResult]:
+    """Resolve active-discovery candidates through the SHARED analysis path.
+
+    This is the ONLY place active discovery touches the network, and it does so
+    exclusively via `analyze_subdomain` under the SHARED semaphore `sem`. That
+    means the `is_valid_hostname` gate and the `_is_safe_public_ip` SSRF guard
+    both apply to brute-force/permutation hosts identically to passive hosts —
+    there is no parallel probe path that could bypass the IP guard.
+
+    Returns only the candidates that are HITS (`resolved` is True), keyed by
+    subdomain, each tagged with `source_tag`. `on_done`, if given, is called
+    once per completed candidate (used to update progress counters).
+    """
+    hits: dict[str, SubdomainResult] = {}
+
+    async def analyze_candidate(cand: str) -> None:
+        res = await analyze_subdomain(probe_client, cand, [source_tag], sem)
+        if res["resolved"]:
+            hits[cand] = res
+        if on_done is not None:
+            on_done()
+
+    await asyncio.gather(
+        *(analyze_candidate(c) for c in candidates),
+        return_exceptions=True,
+    )
+    return hits
+
+
 # ---------------------------------------------------------------------------
 # Job engine
 # ---------------------------------------------------------------------------
@@ -720,7 +975,15 @@ async def _periodic_cleanup() -> None:
             logger.debug("cleanup error: %s", exc)
 
 
-async def run_enumeration(job_id: str, domain: str, keys: dict) -> None:
+async def run_enumeration(
+    job_id: str,
+    domain: str,
+    keys: dict,
+    active: bool = False,
+    wordlist: Optional[str] = None,
+    wordlist_mode: str = "replace",
+    permutations: bool = False,
+) -> None:
     job = JOBS.get(job_id)
     if job is None:
         return
@@ -732,10 +995,18 @@ async def run_enumeration(job_id: str, domain: str, keys: dict) -> None:
     job.progress = 0
     for name in SOURCES:
         job.source_statuses[name] = "pending"
+    # Register the active phases as extra "sources" ONLY when active mode is on,
+    # so a passive-only job's status payload is identical to today's.
+    if active:
+        job.source_statuses["bruteforce"] = "pending"
+        if permutations:
+            job.source_statuses["permutation"] = "pending"
 
     collected: set[str] = set()
     # Per-subdomain source attribution, built as each source returns.
     subdomain_sources: dict[str, set[str]] = {}
+    # Results produced by the active phases (already analyzed), keyed by host.
+    analyzed: dict[str, SubdomainResult] = {}
 
     async def run_source(name: str, fn) -> None:
         job.source_statuses[name] = "running"
@@ -751,42 +1022,147 @@ async def run_enumeration(job_id: str, domain: str, keys: dict) -> None:
             logger.debug("source %s failed: %s", name, exc)
             job.source_statuses[name] = "error"
 
+    # Progress split: passive analysis fills 0->50 / 50->100 when inactive;
+    # when active, passive fills 0->40, active discovery 40->50, analysis
+    # 50->100.
+    passive_cap = 40 if active else 50
+
     try:
         await asyncio.gather(
             *(run_source(name, fn) for name, fn in SOURCES.items()),
             return_exceptions=True,
         )
-        job.progress = 50
+        job.progress = passive_cap
 
+        sem = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
+
+        # ---------------- Active discovery phases ----------------
+        # These run AFTER all passive sources complete. Every candidate flows
+        # through resolve_candidates -> analyze_subdomain (shared semaphore,
+        # same SSRF/hostname guards). Candidate growth is bounded by
+        # MAX_ACTIVE_CANDIDATES at every generation point.
+        active_generated = 0
+        if active:
+            # --- Brute-force phase ---
+            job.source_statuses["bruteforce"] = "running"
+            job.current_source = "bruteforce"
+            custom = parse_custom_wordlist(wordlist)
+            if custom:
+                if wordlist_mode == "append":
+                    # dedupe preserving order: default first, then custom.
+                    seen: set[str] = set()
+                    labels: list[str] = []
+                    for lbl in DEFAULT_WORDLIST + custom:
+                        if lbl not in seen:
+                            seen.add(lbl)
+                            labels.append(lbl)
+                else:  # "replace"
+                    labels = custom
+            else:
+                # No valid custom labels: fall back to the built-in default.
+                labels = DEFAULT_WORDLIST
+
+            bf_candidates, bf_trunc = build_bruteforce_candidates(
+                domain, labels, MAX_ACTIVE_CANDIDATES
+            )
+            active_generated += len(bf_candidates)
+            if bf_trunc:
+                job.notes.append(
+                    f"candidate cap of {MAX_ACTIVE_CANDIDATES} reached; some "
+                    "brute-force candidates were skipped"
+                )
+
+            def _bump() -> None:
+                job.subdomains_found = len(collected) + len(analyzed)
+
+            bf_hits = await resolve_candidates(
+                probe_client, bf_candidates, sem, "bruteforce", on_done=_bump
+            )
+            for host, res in bf_hits.items():
+                analyzed[host] = res
+                subdomain_sources.setdefault(host, set()).add("bruteforce")
+                collected.add(host)
+            job.source_statuses["bruteforce"] = "done"
+            job.progress = max(job.progress, passive_cap + 3)
+
+            # --- Permutation phase ---
+            if permutations:
+                job.source_statuses["permutation"] = "running"
+                job.current_source = "permutation"
+                # Seed = everything discovered so far (passive + brute-force).
+                seed = {
+                    s for s in collected
+                    if s and "*" not in s and s != domain.lower()
+                }
+                remaining_cap = max(0, MAX_ACTIVE_CANDIDATES - active_generated)
+                perm_candidates, perm_trunc = generate_permutations(
+                    seed, domain, PERMUTATION_WORDS, PERMUTATION_SEPARATORS,
+                    remaining_cap,
+                )
+                active_generated += len(perm_candidates)
+                if perm_trunc:
+                    job.notes.append(
+                        f"candidate cap of {MAX_ACTIVE_CANDIDATES} reached; "
+                        "some permutation candidates were skipped"
+                    )
+                perm_hits = await resolve_candidates(
+                    probe_client, perm_candidates, sem, "permutation",
+                    on_done=_bump,
+                )
+                for host, res in perm_hits.items():
+                    analyzed[host] = res
+                    subdomain_sources.setdefault(host, set()).add("permutation")
+                    collected.add(host)
+                job.source_statuses["permutation"] = "done"
+
+            job.progress = max(job.progress, 50)
+
+        # ---------------- Shared analysis pass ----------------
         # Deduplicate: lowercase, drop wildcards and the base domain itself.
         subs = sorted(
             s for s in collected if s and "*" not in s and s != domain.lower()
         )
         # DoS cap: bound the number of hosts analyzed per job so an enormous
-        # passive-DNS result set cannot exhaust DNS/HTTP probe resources.
+        # result set cannot exhaust DNS/HTTP probe resources.
         subs = subs[:MAX_SUBDOMAINS_PER_JOB]
         job.subdomains_found = len(subs)
 
-        sem = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
-        results: list = [None] * len(subs)
+        # Analyze only hosts not already analyzed in an active phase; active
+        # hosts are reused as-is (no double-probing).
+        pending = [s for s in subs if s not in analyzed]
+        analysis_base = 50
+        results_map: dict[str, SubdomainResult] = {}
         done_count = 0
 
-        async def analyze_one(idx: int, sub: str) -> None:
+        async def analyze_one(sub: str) -> None:
             nonlocal done_count
             res = await analyze_subdomain(
                 probe_client, sub, sorted(subdomain_sources.get(sub, set())), sem
             )
-            results[idx] = res
+            results_map[sub] = res
             done_count += 1
-            if subs:
-                job.progress = 50 + int(50 * done_count / len(subs))
+            if pending:
+                job.progress = analysis_base + int(
+                    (100 - analysis_base) * done_count / len(pending)
+                )
 
         await asyncio.gather(
-            *(analyze_one(i, sub) for i, sub in enumerate(subs)),
+            *(analyze_one(sub) for sub in pending),
             return_exceptions=True,
         )
 
-        job.results = [r for r in results if r is not None]
+        # Merge: active-analyzed hosts carry the full union of their sources
+        # (bruteforce/permutation + any passive source that also found them).
+        final_results: list = []
+        for sub in subs:
+            if sub in results_map:
+                final_results.append(results_map[sub])
+            elif sub in analyzed:
+                res = analyzed[sub]
+                res["sources"] = sorted(subdomain_sources.get(sub, set()))
+                final_results.append(res)
+
+        job.results = final_results
         job.progress = 100
         job.current_source = ""
         job.status = "done"
@@ -876,7 +1252,19 @@ async def enumerate_domain(req: EnumerateRequest):
         "securitytrails_key": req.securitytrails_key,
         "shodan_key": req.shodan_key,
     }
-    asyncio.create_task(run_enumeration(job_id, domain, keys))
+    # Normalize wordlist_mode to the accepted set; any other value -> "replace".
+    wordlist_mode = req.wordlist_mode if req.wordlist_mode == "append" else "replace"
+    asyncio.create_task(
+        run_enumeration(
+            job_id,
+            domain,
+            keys,
+            active=req.active,
+            wordlist=req.wordlist,
+            wordlist_mode=wordlist_mode,
+            permutations=req.permutations,
+        )
+    )
     return {"job_id": job_id}
 
 
@@ -891,6 +1279,7 @@ async def job_status(job_id: str):
         "current_source": job.current_source,
         "subdomains_found": job.subdomains_found,
         "source_statuses": job.source_statuses,
+        "notes": job.notes,
         "error": job.error,
     }
 

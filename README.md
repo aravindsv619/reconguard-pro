@@ -13,6 +13,9 @@ CSV — all from a dark-themed browser dashboard.
 
 - Passive subdomain discovery from 11 independent public sources (no scanning
   of the target is required for discovery).
+- **Active DNS discovery (optional, OFF by default):** wordlist brute-forcing
+  against a bundled 2,400+ label list plus altdns-style permutation generation.
+  See [Active DNS discovery](#active-dns-discovery) below.
 - DNS resolution (A/AAAA) and CNAME detection per subdomain.
 - HTTP and HTTPS liveness probing with status codes.
 - Subdomain-takeover risk scoring (HIGH / MEDIUM / LOW / NONE) using a built-in
@@ -67,6 +70,57 @@ Then open <http://localhost:8080> in your browser, enter a target domain, and
 click **Start Scan**. Watch sources complete in the progress panel, review the
 results dashboard, and click **Download CSV** to export.
 
+### Active DNS discovery
+
+Passive discovery queries third-party datasets only and never touches the
+target. **Active discovery is different and more intrusive:** it composes
+candidate hostnames and resolves them, sending DNS queries that resolve against
+the target's own authoritative resolvers.
+
+> ⚠️ **Authorization warning.** Active mode is OFF by default. Only enable it on
+> domains you own or are explicitly authorized to test. Active DNS brute-force
+> and permutation discovery generate direct DNS lookups for the target and are
+> noticeably more intrusive than passive discovery.
+
+Enable it under **Advanced Options** in the scan form:
+
+- **Enable active DNS brute-force** — composes `{label}.{domain}` from a
+  wordlist and keeps hosts that resolve (A/AAAA or CNAME). Hits are tagged
+  `bruteforce` in the `sources` column and shown with an amber **BF** chip.
+- **Custom wordlist** — one subdomain label per line. Each label is lowercased
+  and validated against `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`; invalid labels
+  are silently dropped. Choose **Replace built-in** to use only your labels, or
+  **Append to built-in** to add them to the bundled list. If the box is empty
+  (or every label is invalid), discovery falls back to the built-in list.
+- **Enable permutation discovery** — from every already-discovered host
+  (passive + brute-force hits), generates altdns-style variants: prepend/append
+  common words (`dev`, `staging`, `prod`, `test`, `qa`, `uat`, `api`, …) with
+  `-` and `.` separators, increments trailing numbers (`api1` → `api2`, `api3`),
+  and swaps `-`/`.`. Resolving variants are tagged `permutation` and shown with
+  a violet **PERM** chip.
+
+**Bundled default wordlist:** `wordlists/default.txt` (one label per line,
+2,400+ deduped lowercase labels covering infrastructure, environments,
+services, databases, cloud/orchestration, and app/web hosts). Regenerate it
+with `python wordlists/gen_wordlist.py`.
+
+**Bounds (DoS safety):**
+
+- `MAX_ACTIVE_CANDIDATES = 20000` caps the total brute-force + permutation
+  candidates generated per job; anything beyond the cap is skipped and a note
+  is surfaced in the job status.
+- `MAX_SUBDOMAINS_PER_JOB = 5000` still bounds the final analyzed set.
+- `ANALYSIS_CONCURRENCY = 50` — active resolution shares the SAME bounded
+  `asyncio.Semaphore` as passive analysis; there is no separate probe path, so
+  every active host passes the identical hostname and SSRF (private/internal/
+  metadata IP) guards.
+
+**Request fields (all optional, backward compatible):** the `/api/enumerate`
+body accepts `active` (bool, default `false`), `wordlist` (newline-separated
+string), `wordlist_mode` (`"replace"` | `"append"`, default `"replace"`), and
+`permutations` (bool, default `false`). Omitting all of them reproduces the
+exact passive-only behavior and status payload.
+
 ### Optional API keys
 
 SecurityTrails and Shodan improve coverage. Provide keys in either of two ways:
@@ -114,7 +168,7 @@ collide with the CSV comma delimiter.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| POST | `/api/enumerate` | Start a job. Body: `{domain, securitytrails_key?, shodan_key?}`. Returns `{job_id}`. |
+| POST | `/api/enumerate` | Start a job. Body: `{domain, securitytrails_key?, shodan_key?, active?, wordlist?, wordlist_mode?, permutations?}`. The last four enable active discovery and are optional (omitting them keeps passive-only behavior). Returns `{job_id}`. |
 | GET | `/api/status/{job_id}` | Poll job status, progress, and per-source state. |
 | GET | `/api/results/{job_id}` | Full results JSON once the job is `done`. |
 | GET | `/api/download/{job_id}` | Download the CSV report. |

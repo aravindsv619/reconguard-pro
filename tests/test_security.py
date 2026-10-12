@@ -247,7 +247,7 @@ def test_csv_filename_has_no_crlf(monkeypatch):
 # 4. DoS job cap (429)
 # ---------------------------------------------------------------------------
 def test_max_active_jobs_returns_429(monkeypatch):
-    async def never_run(job_id, domain, keys):
+    async def never_run(job_id, domain, keys, **kwargs):
         return  # leave the job in its initial state
 
     monkeypatch.setattr(main, "run_enumeration", never_run)
@@ -278,7 +278,7 @@ def test_cors_default_is_localhost_only():
 def test_api_key_never_leaks(monkeypatch):
     secret = "SECRET-ST-KEY-123456"
 
-    async def fake_run(job_id, domain, keys):
+    async def fake_run(job_id, domain, keys, **kwargs):
         # Mimic a completed job; the key must not appear anywhere surfaced.
         job = main.JOBS[job_id]
         job.status = "done"
