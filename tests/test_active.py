@@ -144,8 +144,12 @@ async def test_active_hit_tagged_bruteforce_and_permutation(monkeypatch):
     # Only a specific brute-force label and a specific permutation resolve.
     resolving = {"www.example.com": ["93.184.216.34"], "www2.example.com": ["93.184.216.34"]}
 
-    async def fake_resolve_dns(host):
-        return resolving.get(host, [])
+    async def fake_resolve_dns_detailed(host):
+        ips = resolving.get(host, [])
+        return ips, ("RESOLVED" if ips else "NXDOMAIN")
+
+    async def fake_resolve_cname_chain(host):
+        return []
 
     async def fake_resolve_cname(host):
         return None
@@ -156,7 +160,8 @@ async def test_active_hit_tagged_bruteforce_and_permutation(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return []
 
-    monkeypatch.setattr(main, "resolve_dns", fake_resolve_dns)
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
     monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
     monkeypatch.setattr(main, "check_http", fake_check_http)
     monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
@@ -197,9 +202,12 @@ async def test_active_hosts_still_pass_ssrf_guard(monkeypatch):
 
     probe_called = {"n": 0}
 
-    async def fake_resolve_dns(host):
+    async def fake_resolve_dns_detailed(host):
         # Every active candidate resolves to internal/metadata IPs.
-        return ["127.0.0.1", "169.254.169.254"]
+        return ["127.0.0.1", "169.254.169.254"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return []
 
     async def fake_resolve_cname(host):
         return None
@@ -211,7 +219,8 @@ async def test_active_hosts_still_pass_ssrf_guard(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return []
 
-    monkeypatch.setattr(main, "resolve_dns", fake_resolve_dns)
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
     monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
     monkeypatch.setattr(main, "check_http", fake_check_http)
     monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
@@ -244,8 +253,13 @@ async def test_active_hosts_still_pass_ssrf_guard(monkeypatch):
 
 async def test_resolve_candidates_only_returns_hits(monkeypatch):
     """resolve_candidates keeps resolving candidates, drops non-resolving."""
-    async def fake_resolve_dns(host):
-        return ["93.184.216.34"] if host == "hit.example.com" else []
+    async def fake_resolve_dns_detailed(host):
+        if host == "hit.example.com":
+            return ["93.184.216.34"], "RESOLVED"
+        return [], "NXDOMAIN"
+
+    async def fake_resolve_cname_chain(host):
+        return []
 
     async def fake_resolve_cname(host):
         return None
@@ -256,7 +270,8 @@ async def test_resolve_candidates_only_returns_hits(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return []
 
-    monkeypatch.setattr(main, "resolve_dns", fake_resolve_dns)
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
     monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
     monkeypatch.setattr(main, "check_http", fake_check_http)
     monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
@@ -376,8 +391,11 @@ async def test_custom_wordlist_all_invalid_falls_back_to_default(monkeypatch):
 
     seen_hosts = []
 
-    async def fake_resolve_dns(host):
+    async def fake_resolve_dns_detailed(host):
         seen_hosts.append(host)
+        return [], "NXDOMAIN"
+
+    async def fake_resolve_cname_chain(host):
         return []
 
     async def fake_resolve_cname(host):
@@ -389,7 +407,8 @@ async def test_custom_wordlist_all_invalid_falls_back_to_default(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return []
 
-    monkeypatch.setattr(main, "resolve_dns", fake_resolve_dns)
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
     monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
     monkeypatch.setattr(main, "check_http", fake_check_http)
     monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)

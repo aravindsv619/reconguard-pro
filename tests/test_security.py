@@ -96,8 +96,11 @@ async def test_analyze_subdomain_skips_probe_for_private_ip(monkeypatch):
     """A subdomain resolving only to internal IPs must NOT be HTTP-probed."""
     probe_called = False
 
-    async def fake_resolve_dns(host):
-        return ["127.0.0.1", "169.254.169.254"]
+    async def fake_resolve_dns_detailed(host):
+        return ["127.0.0.1", "169.254.169.254"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return []
 
     async def fake_resolve_cname(host):
         return None
@@ -110,7 +113,8 @@ async def test_analyze_subdomain_skips_probe_for_private_ip(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return []
 
-    monkeypatch.setattr(main, "resolve_dns", fake_resolve_dns)
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
     monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
     monkeypatch.setattr(main, "check_http", fake_check_http)
     monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
@@ -126,11 +130,59 @@ async def test_analyze_subdomain_skips_probe_for_private_ip(monkeypatch):
     assert res["alive"] is False
 
 
+async def test_analyze_subdomain_verify_private_ip_issues_no_probe(monkeypatch):
+    """VERIFY detection on a private-IP host must still issue NO new probe.
+
+    The host's only A record is internal, so the SSRF guard skips check_http;
+    the dangling-CNAME-to-cloud-resource target is present but, with no HTTP
+    statuses gathered (both None), VERIFY detection relies solely on the
+    already-collected data and never triggers a network call.
+    """
+    probe_called = False
+
+    async def fake_resolve_dns_detailed(host):
+        return ["10.0.0.5"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return ["app.us-east-1.elb.amazonaws.com"]
+
+    async def fake_resolve_cname(host):
+        return "app.us-east-1.elb.amazonaws.com"
+
+    async def fake_check_http(client, host):
+        nonlocal probe_called
+        probe_called = True
+        return 200, 200, "should-not-happen"
+
+    async def fake_resolve_ptrs(ips):
+        return []
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+
+    import asyncio
+
+    sem = asyncio.Semaphore(1)
+    res = await main.analyze_subdomain(None, "internal.example.com", ["crt.sh"], sem)
+
+    # No new unguarded probe fired (private IP → check_http skipped).
+    assert probe_called is False
+    # With no HTTP response gathered, the dangling cloud CNAME is flagged VERIFY.
+    assert res["takeover_risk"] == "VERIFY"
+    assert res["takeover_service"] == "AWS ELB"
+
+
 async def test_analyze_subdomain_probes_public_ip(monkeypatch):
     probe_called = False
 
-    async def fake_resolve_dns(host):
-        return ["93.184.216.34"]
+    async def fake_resolve_dns_detailed(host):
+        return ["93.184.216.34"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return []
 
     async def fake_resolve_cname(host):
         return None
@@ -143,7 +195,8 @@ async def test_analyze_subdomain_probes_public_ip(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return []
 
-    monkeypatch.setattr(main, "resolve_dns", fake_resolve_dns)
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
     monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
     monkeypatch.setattr(main, "check_http", fake_check_http)
     monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
@@ -212,6 +265,8 @@ def test_csv_download_neutralizes_injection(monkeypatch):
             takeover_detail="-dangerous detail",
             resolved=True,
             alive=True,
+            dns_status="=cmd",
+            cname_chain=["+evil.github.io"],
         )
     ]
     main.JOBS["csvjob"] = job
@@ -222,12 +277,14 @@ def test_csv_download_neutralizes_injection(monkeypatch):
 
     reader = csv.reader(io.StringIO(resp.text))
     header = next(reader)
-    assert header == main.CSV_COLUMNS  # column contract unchanged
+    assert header == main.CSV_COLUMNS  # column contract (now 12 columns)
+    assert header[-1] == "dns_status"
     row = next(reader)
     assert row[0].startswith("'")  # subdomain
     assert row[2].startswith("'")  # cname
     assert row[5].startswith("'")  # sources
     assert row[10].startswith("'")  # takeover_detail
+    assert row[11].startswith("'")  # dns_status neutralized (12th column)
 
 
 def test_csv_filename_has_no_crlf(monkeypatch):
@@ -296,6 +353,8 @@ def test_api_key_never_leaks(monkeypatch):
                 takeover_detail=None,
                 resolved=True,
                 alive=True,
+                dns_status="RESOLVED",
+                cname_chain=[],
             )
         ]
 

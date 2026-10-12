@@ -44,6 +44,8 @@ def client(monkeypatch):
                 takeover_detail="fingerprint matched",
                 resolved=True,
                 alive=True,
+                dns_status="RESOLVED",
+                cname_chain=["a.github.io"],
             )
         ]
 
@@ -95,6 +97,11 @@ def test_download_csv_header(client):
     reader = csv.reader(io.StringIO(resp.text))
     header = next(reader)
     assert header == main.CSV_COLUMNS
+    # 12-column contract: dns_status is the final column.
+    assert header[-1] == "dns_status"
+    assert len(header) == 12
     first = next(reader)
     assert first[0] == "a.example.com"
     assert "1.2.3.4" in first[1]
+    # dns_status value lands in the 12th cell.
+    assert first[11] == "RESOLVED"

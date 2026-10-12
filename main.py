@@ -374,6 +374,68 @@ TAKEOVER_FINGERPRINTS = {
 
 
 # ---------------------------------------------------------------------------
+# Cloud-resource CNAME targets (for the VERIFY takeover tier)
+# ---------------------------------------------------------------------------
+# Risk ordering used everywhere: HIGH > VERIFY > MEDIUM > LOW > NONE
+# (sort weights HIGH=4, VERIFY=3, MEDIUM=2, LOW=1, NONE=0). The VERIFY tier
+# sits between MEDIUM and HIGH: it flags a dangling CNAME pointing at a known
+# cloud resource that returns a "gone" HTTP signal (404/503) but where no
+# body fingerprint confirmed an actual takeover. It is a "confirm manually"
+# signal, never a confirmed takeover — hence weaker than a fingerprint-backed
+# HIGH/MEDIUM but stronger than an unconfirmed LOW.
+#
+# Each entry is (compiled anchored regex, provider_name). Patterns are anchored
+# with \Z so they match the FULL (lowercased, trailing-dot-stripped) CNAME
+# target and never a mere substring (which would create false positives such
+# as "evil-amazonaws.com.attacker.net").
+CLOUD_RESOURCE_PATTERNS = [
+    # AWS ELB (classic + regional)
+    (re.compile(r"^.+\.elb\.amazonaws\.com\Z"), "AWS ELB"),
+    (re.compile(r"^.+\.elb\.[a-z0-9-]+\.amazonaws\.com\Z"), "AWS ELB"),
+    # AWS S3 (global, website, and regional endpoints)
+    (re.compile(r"^.+\.s3\.amazonaws\.com\Z"), "AWS S3"),
+    (re.compile(r"^.+\.s3-website[.-][a-z0-9-]+\.amazonaws\.com\Z"), "AWS S3"),
+    (re.compile(r"^.+\.s3\.[a-z0-9-]+\.amazonaws\.com\Z"), "AWS S3"),
+    # CloudFront
+    (re.compile(r"^.+\.cloudfront\.net\Z"), "AWS CloudFront"),
+    # Azure
+    (re.compile(r"^.+\.azurewebsites\.net\Z"), "Azure Web Apps"),
+    (re.compile(r"^.+\.trafficmanager\.net\Z"), "Azure Traffic Manager"),
+    (re.compile(r"^.+\.cloudapp\.azure\.com\Z"), "Azure Cloud App"),
+    (re.compile(r"^.+\.blob\.core\.windows\.net\Z"), "Azure Blob Storage"),
+    # Heroku
+    (re.compile(r"^.+\.herokudns\.com\Z"), "Heroku"),
+    (re.compile(r"^.+\.herokuapp\.com\Z"), "Heroku"),
+    # GitHub Pages
+    (re.compile(r"^.+\.github\.io\Z"), "GitHub Pages"),
+    # GCP
+    (re.compile(r"^.+\.storage\.googleapis\.com\Z"), "Google Cloud Storage"),
+    (re.compile(r"^.+\.appspot\.com\Z"), "Google App Engine"),
+    # Fastly
+    (re.compile(r"^.+\.fastly\.net\Z"), "Fastly"),
+]
+
+
+def _match_cloud_resource(target: Optional[str]) -> Optional[str]:
+    """Return the cloud provider name a CNAME target points at, else None.
+
+    ``target`` is lowercased and its trailing dot stripped, then matched with
+    the anchored CLOUD_RESOURCE_PATTERNS so only a full-hostname suffix match
+    counts (no substring false positives). Returns the provider name on the
+    first matching pattern, or None when the target is empty/unknown.
+    """
+    if not target:
+        return None
+    host = target.strip().rstrip(".").lower()
+    if not host:
+        return None
+    for pattern, provider in CLOUD_RESOURCE_PATTERNS:
+        if pattern.match(host):
+            return provider
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Typing
 # ---------------------------------------------------------------------------
 class SubdomainResult(TypedDict):
@@ -383,11 +445,14 @@ class SubdomainResult(TypedDict):
     http_status: Optional[int]
     https_status: Optional[int]
     sources: list[str]
-    takeover_risk: str  # HIGH | MEDIUM | LOW | NONE
+    # Risk ordering: HIGH > VERIFY > MEDIUM > LOW > NONE (see CLOUD_RESOURCE_PATTERNS).
+    takeover_risk: str  # HIGH | VERIFY | MEDIUM | LOW | NONE
     takeover_service: Optional[str]
     takeover_detail: Optional[str]
     resolved: bool
     alive: bool
+    dns_status: str  # RESOLVED | NXDOMAIN | NO_ANSWER | SERVFAIL | TIMEOUT | ERROR
+    cname_chain: list[str]
 
 
 @dataclass
@@ -690,20 +755,129 @@ SOURCES = {
 # Per-subdomain analysis
 # ---------------------------------------------------------------------------
 async def resolve_dns(host: str) -> list[str]:
-    """Return the set of A/AAAA addresses for host, or [] on failure."""
-    loop = asyncio.get_running_loop()
+    """Return the set of A/AAAA addresses for host, or [] on failure.
+
+    Kept for backward compatibility; delegates to resolve_dns_detailed and
+    discards the status so existing callers/tests see unchanged behavior.
+    """
+    ips, _status = await resolve_dns_detailed(host)
+    return ips
+
+
+# dns_status vocabulary and the risk-ordering note live together here:
+# dns_status in {RESOLVED, NXDOMAIN, NO_ANSWER, SERVFAIL, TIMEOUT, ERROR}.
+# Risk ordering used across the app: HIGH > VERIFY > MEDIUM > LOW > NONE
+# (weights HIGH=4, VERIFY=3, MEDIUM=2, LOW=1, NONE=0).
+def _dig_dns_status(host: str) -> Optional[tuple[list[str], str]]:
+    """Resolve A/AAAA records and an authoritative status via the `dig` binary.
+
+    Returns (ip_addresses, dns_status) using dig's rcode + answer section:
+    NOERROR with A/AAAA answers -> RESOLVED; NOERROR with no address answer ->
+    NO_ANSWER; NXDOMAIN -> NXDOMAIN; SERVFAIL -> SERVFAIL; a dig timeout ->
+    TIMEOUT. Returns None when dig is unavailable/unusable so the caller can
+    fall back to the stdlib resolver.
+
+    Security: invoked with an argument LIST (never a shell string); ``host`` is
+    gated by ``is_valid_hostname`` upstream and the call has a hard 5s timeout.
+    """
     try:
-        infos = await loop.run_in_executor(
-            None, socket.getaddrinfo, host, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+        out = subprocess.run(
+            ["dig", "+noall", "+answer", "+comments", "A", host],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
+    except FileNotFoundError:
+        # dig not installed — signal the caller to use the stdlib fallback.
+        return None
+    except subprocess.TimeoutExpired:
+        return [], "TIMEOUT"
     except Exception:  # noqa: BLE001
-        return []
+        return None
+
+    text = out.stdout or ""
+    # Extract the response rcode from the "status: XXX" header line.
+    m = re.search(r"status:\s*([A-Z]+)", text)
+    status_code = m.group(1) if m else None
+    if status_code == "NXDOMAIN":
+        return [], "NXDOMAIN"
+    if status_code == "SERVFAIL":
+        return [], "SERVFAIL"
+
+    # Collect A/AAAA answers (ignore CNAME/other RR types in the answer section).
+    ips: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(";"):
+            continue
+        parts = line.split()
+        if len(parts) >= 5 and parts[3] in ("A", "AAAA"):
+            addr = parts[4].strip()
+            if addr and addr not in ips:
+                ips.append(addr)
+
+    if status_code == "NOERROR":
+        return (ips, "RESOLVED") if ips else (ips, "NO_ANSWER")
+    if status_code is None:
+        # Couldn't parse a status header — let the stdlib fallback decide.
+        return None
+    # Any other rcode: report what we have, defaulting to NO_ANSWER when empty.
+    return (ips, "RESOLVED") if ips else (ips, "NO_ANSWER")
+
+
+def _socket_dns_status(host: str) -> tuple[list[str], str]:
+    """stdlib-resolver fallback returning (ip_addresses, dns_status).
+
+    Stdlib limitation: ``socket.getaddrinfo`` collapses most DNS failure modes
+    into a single ``gaierror`` and cannot distinguish NXDOMAIN from SERVFAIL
+    from a CNAME-only NO_ANSWER. Best-effort mapping only: EAI_NONAME /
+    EAI_NODATA -> NXDOMAIN, socket.timeout -> TIMEOUT, anything else -> ERROR.
+    """
+    try:
+        infos = socket.getaddrinfo(
+            host, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+        )
+    except socket.timeout:
+        return [], "TIMEOUT"
+    except socket.gaierror as exc:
+        name_errnos = {
+            getattr(socket, "EAI_NONAME", None),
+            getattr(socket, "EAI_NODATA", None),
+        }
+        name_errnos.discard(None)
+        if exc.errno in name_errnos:
+            return [], "NXDOMAIN"
+        return [], "ERROR"
+    except Exception:  # noqa: BLE001
+        return [], "ERROR"
     ips: list[str] = []
     for info in infos:
         addr = info[4][0]
         if addr not in ips:
             ips.append(addr)
-    return ips
+    return (ips, "RESOLVED") if ips else (ips, "NO_ANSWER")
+
+
+def _resolve_dns_detailed_sync(host: str) -> tuple[list[str], str]:
+    """Prefer dig's authoritative status; fall back to the stdlib resolver."""
+    dig_result = _dig_dns_status(host)
+    if dig_result is not None:
+        return dig_result
+    return _socket_dns_status(host)
+
+
+async def resolve_dns_detailed(host: str) -> tuple[list[str], str]:
+    """Return (ip_addresses, dns_status), running the blocking work off-loop.
+
+    dns_status is one of RESOLVED, NXDOMAIN, NO_ANSWER, SERVFAIL, TIMEOUT,
+    ERROR. Uses `dig` when present for a precise status signal, else the stdlib
+    resolver with best-effort mapping (see _socket_dns_status).
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _resolve_dns_detailed_sync, host)
+    except Exception:  # noqa: BLE001
+        return [], "ERROR"
 
 
 async def _resolve_ptrs(ip_addresses: list[str]) -> list[str]:
@@ -788,6 +962,45 @@ async def resolve_cname(host: str) -> Optional[str]:
         return None
 
 
+# Hard cap on CNAME hops followed; stops runaway/looping chains.
+MAX_CNAME_HOPS = 10
+
+
+def _resolve_cname_chain_sync(host: str) -> list[str]:
+    """Follow the CNAME chain (dig-first, socket fallback) up to MAX_CNAME_HOPS.
+
+    Returns the ordered list of CNAME targets. The first element equals the
+    single-hop value from _resolve_cname_sync, so cname_chain[0] always matches
+    the existing `cname` field. Stops on no further CNAME, on revisiting a host
+    (loop protection), or at the hop cap.
+    """
+    chain: list[str] = []
+    seen: set[str] = set()
+    current = host.strip().rstrip(".").lower()
+    for _ in range(MAX_CNAME_HOPS):
+        if current in seen:
+            break
+        seen.add(current)
+        nxt = _resolve_cname_sync(current)
+        if not nxt:
+            break
+        nxt = nxt.strip().rstrip(".").lower()
+        if not nxt or nxt == current:
+            break
+        chain.append(nxt)
+        current = nxt
+    return chain
+
+
+async def resolve_cname_chain(host: str) -> list[str]:
+    """Async wrapper for _resolve_cname_chain_sync (runs off the event loop)."""
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _resolve_cname_chain_sync, host)
+    except Exception:  # noqa: BLE001
+        return []
+
+
 async def check_http(client: httpx.AsyncClient, host: str) -> tuple[Optional[int], Optional[int], str]:
     """Probe http:// and https://; return (http_status, https_status, body).
 
@@ -835,6 +1048,9 @@ def check_takeover(
     a_records: list[str],
     http_body: str,
     ptr_hosts: Optional[list[str]] = None,
+    http_status: Optional[int] = None,
+    https_status: Optional[int] = None,
+    cname_chain: Optional[list[str]] = None,
 ) -> tuple[str, Optional[str], Optional[str]]:
     """Return (risk, service, detail).
 
@@ -849,6 +1065,16 @@ def check_takeover(
     fingerprint keys so the service can still be identified without a CNAME.
     ``ptr_hosts`` may be passed pre-resolved (so the blocking reverse-DNS stays
     off the event loop); when omitted the PTRs are resolved inline.
+
+    VERIFY tier (precedence HIGH > VERIFY > MEDIUM > LOW > NONE): if the
+    fingerprint loop did NOT already return a HIGH/MEDIUM/LOW finding, and the
+    final CNAME-chain target points at a known cloud resource
+    (CLOUD_RESOURCE_PATTERNS) while the HTTP signal looks "gone" (http_status
+    or https_status in {404, 503}, or both statuses None alongside a
+    cloud-resource CNAME), return a VERIFY finding. VERIFY NEVER overrides an
+    earlier HIGH/MEDIUM fingerprint match — it only fires when the stronger
+    check did not. It uses ONLY already-gathered data (CNAME string + the
+    HTTP statuses passed in) and issues NO new network request.
     """
     body_lower = (http_body or "").lower()
     cname_lower = (cname or "").lower()
@@ -862,6 +1088,11 @@ def check_takeover(
             if ptr:
                 ptr_hosts.append(ptr)
 
+    # A confirmed HIGH/MEDIUM fingerprint match returns immediately. A
+    # service match WITHOUT body confirmation is a LOW; we hold (do not return)
+    # the first such LOW so the VERIFY tier below can supersede it when the
+    # dangling-cloud-resource signal holds (precedence HIGH > VERIFY > LOW).
+    held_low: Optional[tuple[str, Optional[str], Optional[str]]] = None
     for key, meta in TAKEOVER_FINGERPRINTS.items():
         via_cname = key in cname_lower
         via_name = sub_lower.endswith(key)
@@ -877,16 +1108,56 @@ def check_takeover(
             )
             return meta["severity"], meta["service"], detail
         # Service matched (CNAME / host / A-record PTR) but body did not
-        # confirm → low confidence.
-        if matched_ptr and not via_cname and not via_name:
-            pointer = f"A-record {matched_ptr}"
-        else:
-            pointer = "CNAME/host"
-        return (
-            "LOW",
-            meta["service"],
-            f"{pointer} points to {meta['service']} but no takeover fingerprint confirmed",
+        # confirm → low confidence. Remember only the first such match.
+        if held_low is None:
+            if matched_ptr and not via_cname and not via_name:
+                pointer = f"A-record {matched_ptr}"
+            else:
+                pointer = "CNAME/host"
+            held_low = (
+                "LOW",
+                meta["service"],
+                f"{pointer} points to {meta['service']} but no takeover fingerprint confirmed",
+            )
+
+    # VERIFY tier — evaluated AFTER the fingerprint loop and only when no
+    # HIGH/MEDIUM already returned (those return above). Precedence
+    # HIGH > VERIFY > MEDIUM > LOW > NONE: VERIFY may supersede a held LOW
+    # (e.g. an AWS CNAME that only matched the broad "amazonaws.com" key) but
+    # NEVER a confirmed HIGH/MEDIUM. The final CNAME-chain target must point at
+    # a known cloud resource AND the HTTP signal must look "gone" — either an
+    # explicit 404/503, or no HTTP response at all (both statuses None and no
+    # body gathered). A live host returning real content stays LOW. Uses ONLY
+    # already-gathered data (CNAME chain + the HTTP statuses passed in) and
+    # issues NO new network request.
+    chain = cname_chain or []
+    final_target = chain[-1] if chain else cname
+    provider = _match_cloud_resource(final_target)
+    if provider is not None:
+        gone_signal = http_status in (404, 503) or https_status in (404, 503)
+        no_response = (
+            http_status is None
+            and https_status is None
+            and not (http_body or "").strip()
         )
+        if gone_signal or no_response:
+            if gone_signal:
+                status_val = (
+                    http_status if http_status in (404, 503) else https_status
+                )
+                status_text = str(status_val)
+            else:
+                status_text = "no HTTP response"
+            target_display = (final_target or "").strip().rstrip(".").lower()
+            detail = (
+                f"Dangling CNAME to {provider} ({target_display}) returning "
+                f"{status_text} — confirm the resource still exists and is "
+                "owned by you before assuming it is safe."
+            )
+            return "VERIFY", provider, detail
+
+    if held_low is not None:
+        return held_low
     return "NONE", None, None
 
 
@@ -908,11 +1179,14 @@ async def analyze_subdomain(
             takeover_detail=None,
             resolved=False,
             alive=False,
+            dns_status="ERROR",
+            cname_chain=[],
         )
 
     async with sem:
-        ip_addresses = await resolve_dns(sub)
-        cname = await resolve_cname(sub)
+        ip_addresses, dns_status = await resolve_dns_detailed(sub)
+        cname_chain = await resolve_cname_chain(sub)
+        cname = cname_chain[0] if cname_chain else await resolve_cname(sub)
         # SSRF guard: never probe a host that resolves to a private/internal/
         # loopback/link-local/metadata address. If the host resolved to IP(s)
         # but none are public, skip the HTTP probe entirely (status stays None,
@@ -924,10 +1198,20 @@ async def analyze_subdomain(
             http_status, https_status, body = await check_http(probe_client, sub)
         ptr_hosts = await _resolve_ptrs(ip_addresses)
 
-    resolved = bool(ip_addresses) or bool(cname)
+    # resolved is true iff DNS actually returned addresses (dns_status
+    # RESOLVED). CNAME-only hosts are still probed via their chain but are not
+    # considered "resolved" by the A/AAAA definition the summary counts use.
+    resolved = dns_status == "RESOLVED"
     alive = http_status is not None or https_status is not None
     risk, service, detail = check_takeover(
-        sub, cname, ip_addresses, body, ptr_hosts=ptr_hosts
+        sub,
+        cname,
+        ip_addresses,
+        body,
+        ptr_hosts=ptr_hosts,
+        http_status=http_status,
+        https_status=https_status,
+        cname_chain=cname_chain,
     )
 
     return SubdomainResult(
@@ -942,6 +1226,8 @@ async def analyze_subdomain(
         takeover_detail=detail,
         resolved=resolved,
         alive=alive,
+        dns_status=dns_status,
+        cname_chain=cname_chain,
     )
 
 
@@ -1320,7 +1606,14 @@ def _summarize(results: list) -> dict:
     alive = sum(1 for r in results if r["alive"])
     high = sum(1 for r in results if r["takeover_risk"] == "HIGH")
     medium = sum(1 for r in results if r["takeover_risk"] == "MEDIUM")
-    return {"resolved": resolved, "alive": alive, "high_risk": high, "medium_risk": medium}
+    verify = sum(1 for r in results if r["takeover_risk"] == "VERIFY")
+    return {
+        "resolved": resolved,
+        "alive": alive,
+        "high_risk": high,
+        "medium_risk": medium,
+        "verify": verify,
+    }
 
 
 @app.get("/api/results/{job_id}")
@@ -1352,6 +1645,7 @@ CSV_COLUMNS = [
     "takeover_risk",
     "takeover_service",
     "takeover_detail",
+    "dns_status",
 ]
 
 
@@ -1369,8 +1663,9 @@ async def download_csv(job_id: str):
     for r in job.results:
         # Text columns are passed through _csv_safe to neutralize spreadsheet
         # formula/injection (values from attacker-poisonable cert logs). The
-        # 11-column contract and order are unchanged; numeric/bool columns
-        # (http_status, https_status, resolved, alive) pass through as-is.
+        # first 11 columns keep their exact order; dns_status is appended as
+        # the 12th (also _csv_safe'd). Numeric/bool columns (http_status,
+        # https_status, resolved, alive) pass through as-is.
         writer.writerow([
             _csv_safe(r["subdomain"]),
             _csv_safe(";".join(r["ip_addresses"])),
@@ -1383,6 +1678,7 @@ async def download_csv(job_id: str):
             _csv_safe(r["takeover_risk"]),
             _csv_safe(r["takeover_service"] or ""),
             _csv_safe(r["takeover_detail"] or ""),
+            _csv_safe(r["dns_status"]),
         ])
     buffer.seek(0)
     # Sanitize the filename so no CRLF/quote can break the Content-Disposition
