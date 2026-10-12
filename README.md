@@ -17,7 +17,9 @@ CSV — all from a dark-themed browser dashboard.
 - HTTP and HTTPS liveness probing with status codes.
 - Subdomain-takeover risk scoring (HIGH / MEDIUM / LOW / NONE) using a built-in
   fingerprint library covering 30+ services (GitHub Pages, AWS S3/CloudFront,
-  Heroku, Azure, Shopify, Netlify, Fastly, and more).
+  Heroku, Azure, Shopify, Netlify, Fastly, and more). Matching considers the
+  CNAME, the subdomain name, and the reverse-DNS (PTR) hostname of each
+  A-record, so dangling IP-only records are scored as well.
 - Live progress tracking with per-source status.
 - Filterable, sortable results table and a risk-breakdown chart.
 - One-click CSV report download.
@@ -42,8 +44,10 @@ CSV — all from a dark-themed browser dashboard.
 ## Requirements
 
 - Python 3.11+ (tested on 3.14)
-- `dig` (from `dnsutils` / `bind-utils`) is used for CNAME lookups when
-  available; the tool degrades gracefully if it is not installed.
+- `dig` (from `dnsutils` / `bind-utils`) is used as the fast path for CNAME
+  lookups when available. When `dig` is absent, CNAME resolution falls back to
+  the Python standard-library resolver (`socket.gethostbyname_ex`), so no
+  external binary is required — `dig` only speeds things up.
 
 ## Installation
 
@@ -78,6 +82,22 @@ SecurityTrails and Shodan improve coverage. Provide keys in either of two ways:
 
 Both sources are skipped silently when no key is supplied.
 
+## Development & tests
+
+The runtime stack in `requirements.txt` is all that is needed to run the app.
+Test-only tooling lives in `requirements-dev.txt`:
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest
+```
+
+The suite (under `tests/`) uses `respx` to mock every outbound HTTP call and
+covers the source parsers (including crt.sh wildcard stripping, Wayback URL
+parsing, and the key-optional SecurityTrails/Shodan skip), the three
+`check_takeover` branches plus A-record PTR matching and the socket CNAME
+fallback, the job state machine and cleanup, and the API/CSV contract.
+
 ## CSV report format
 
 The downloaded CSV contains one row per subdomain with these columns:
@@ -108,3 +128,10 @@ CORS is configured to allow all origins so the bundled frontend works out of
 the box for local, single-user use. If you deploy SubRecon Pro to a shared or
 public host, restrict `allow_origins` in `main.py` and place the service behind
 authentication.
+
+TLS handling uses two separate HTTP clients: a **verified** client (standard CA
+validation) for all data-source and authenticated API calls — so SecurityTrails
+and Shodan API keys are never sent over unverified TLS — and a separate client
+with verification disabled used **only** to probe target subdomains for
+liveness and takeover fingerprints, where expired or self-signed certificates
+are common. No credentials are ever sent on the probe client.

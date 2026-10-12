@@ -378,7 +378,28 @@ async def resolve_dns(host: str) -> list[str]:
     return ips
 
 
+async def _resolve_ptrs(ip_addresses: list[str]) -> list[str]:
+    """Resolve PTR hostnames for a list of IPs off the event loop."""
+    if not ip_addresses:
+        return []
+    loop = asyncio.get_running_loop()
+
+    def _run() -> list[str]:
+        hosts: list[str] = []
+        for ip in ip_addresses:
+            ptr = _reverse_ptr(ip)
+            if ptr:
+                hosts.append(ptr)
+        return hosts
+
+    try:
+        return await loop.run_in_executor(None, _run)
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _dig_cname(host: str) -> Optional[str]:
+    """Resolve a CNAME via the `dig` binary (fast, authoritative when present)."""
     try:
         out = subprocess.run(
             ["dig", "+short", "CNAME", host],
@@ -394,16 +415,52 @@ def _dig_cname(host: str) -> Optional[str]:
     return None
 
 
+def _socket_cname(host: str) -> Optional[str]:
+    """Pure-Python CNAME fallback using the stdlib resolver.
+
+    ``socket.gethostbyname_ex`` returns the canonical hostname the OS resolver
+    followed to. When that canonical name differs from the queried host it is,
+    in practice, the CNAME target. This requires no external binary, so CNAME
+    (and CNAME-based takeover) detection still works where `dig` is absent.
+    """
+    try:
+        canonical, aliases, _ = socket.gethostbyname_ex(host)
+    except Exception:  # noqa: BLE001
+        return None
+    canonical = (canonical or "").strip().rstrip(".").lower()
+    host_norm = host.strip().rstrip(".").lower()
+    if canonical and canonical != host_norm:
+        return canonical
+    for alias in aliases or []:
+        alias_norm = (alias or "").strip().rstrip(".").lower()
+        if alias_norm and alias_norm != host_norm:
+            return alias_norm
+    return None
+
+
+def _resolve_cname_sync(host: str) -> Optional[str]:
+    """Try `dig` first, then fall back to the stdlib socket resolver."""
+    cname = _dig_cname(host)
+    if cname:
+        return cname
+    return _socket_cname(host)
+
+
 async def resolve_cname(host: str) -> Optional[str]:
     loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, _dig_cname, host)
+        return await loop.run_in_executor(None, _resolve_cname_sync, host)
     except Exception:  # noqa: BLE001
         return None
 
 
 async def check_http(client: httpx.AsyncClient, host: str) -> tuple[Optional[int], Optional[int], str]:
-    """Probe http:// and https://; return (http_status, https_status, body)."""
+    """Probe http:// and https://; return (http_status, https_status, body).
+
+    ``client`` here is the probe client (TLS verification disabled) so that
+    arbitrary target subdomains presenting expired or self-signed certs do not
+    produce spurious failures. It is never used for authenticated API calls.
+    """
     http_status: Optional[int] = None
     https_status: Optional[int] = None
     body = ""
@@ -422,22 +479,55 @@ async def check_http(client: httpx.AsyncClient, host: str) -> tuple[Optional[int
     return http_status, https_status, body
 
 
+def _reverse_ptr(ip: str) -> Optional[str]:
+    """Best-effort reverse DNS for an IP, used to surface A-record takeover
+    vectors (a dangling record resolving to a deprovisioned cloud host whose
+    PTR still names the service domain). Returns None on failure."""
+    try:
+        host, _, _ = socket.gethostbyaddr(ip)
+    except Exception:  # noqa: BLE001
+        return None
+    return (host or "").strip().rstrip(".").lower() or None
+
+
 def check_takeover(
-    subdomain: str, cname: Optional[str], a_records: list[str], http_body: str
+    subdomain: str,
+    cname: Optional[str],
+    a_records: list[str],
+    http_body: str,
+    ptr_hosts: Optional[list[str]] = None,
 ) -> tuple[str, Optional[str], Optional[str]]:
     """Return (risk, service, detail).
 
-    Two-signal logic: a known service domain must appear in the CNAME or the
-    subdomain itself, and the service fingerprint string must be present in the
-    HTTP body to confirm a HIGH/MEDIUM finding. A service match without a body
-    confirmation is downgraded to LOW.
+    Two-signal logic: a known service domain must appear in the CNAME, the
+    subdomain name, or an A-record's reverse-DNS hostname, and the service
+    fingerprint string must be present in the HTTP body to confirm a
+    HIGH/MEDIUM finding. A service match without a body confirmation is
+    downgraded to LOW.
+
+    ``a_records`` lets A-record-only takeover vectors (dangling cloud IP with
+    no CNAME) be scored: each IP's PTR hostname is matched against the
+    fingerprint keys so the service can still be identified without a CNAME.
+    ``ptr_hosts`` may be passed pre-resolved (so the blocking reverse-DNS stays
+    off the event loop); when omitted the PTRs are resolved inline.
     """
     body_lower = (http_body or "").lower()
     cname_lower = (cname or "").lower()
     sub_lower = subdomain.lower()
 
+    # Reverse-resolve A records once so an IP-only dangling record can match.
+    if ptr_hosts is None:
+        ptr_hosts = []
+        for ip in a_records or []:
+            ptr = _reverse_ptr(ip)
+            if ptr:
+                ptr_hosts.append(ptr)
+
     for key, meta in TAKEOVER_FINGERPRINTS.items():
-        matched = (key in cname_lower) or sub_lower.endswith(key)
+        via_cname = key in cname_lower
+        via_name = sub_lower.endswith(key)
+        matched_ptr = next((p for p in ptr_hosts if key in p), None)
+        matched = via_cname or via_name or matched_ptr is not None
         if not matched:
             continue
         fingerprint = meta["fingerprint"].lower()
@@ -447,22 +537,34 @@ def check_takeover(
                 f"\"{meta['fingerprint']}\""
             )
             return meta["severity"], meta["service"], detail
-        # Service domain matched but body did not confirm → low confidence.
-        return "LOW", meta["service"], f"CNAME/host points to {meta['service']} but no takeover fingerprint confirmed"
+        # Service matched (CNAME / host / A-record PTR) but body did not
+        # confirm → low confidence.
+        if matched_ptr and not via_cname and not via_name:
+            pointer = f"A-record {matched_ptr}"
+        else:
+            pointer = "CNAME/host"
+        return (
+            "LOW",
+            meta["service"],
+            f"{pointer} points to {meta['service']} but no takeover fingerprint confirmed",
+        )
     return "NONE", None, None
 
 
 async def analyze_subdomain(
-    client: httpx.AsyncClient, sub: str, sources: list[str], sem: asyncio.Semaphore
+    probe_client: httpx.AsyncClient, sub: str, sources: list[str], sem: asyncio.Semaphore
 ) -> SubdomainResult:
     async with sem:
         ip_addresses = await resolve_dns(sub)
         cname = await resolve_cname(sub)
-        http_status, https_status, body = await check_http(client, sub)
+        http_status, https_status, body = await check_http(probe_client, sub)
+        ptr_hosts = await _resolve_ptrs(ip_addresses)
 
     resolved = bool(ip_addresses) or bool(cname)
     alive = http_status is not None or https_status is not None
-    risk, service, detail = check_takeover(sub, cname, ip_addresses, body)
+    risk, service, detail = check_takeover(
+        sub, cname, ip_addresses, body, ptr_hosts=ptr_hosts
+    )
 
     return SubdomainResult(
         subdomain=sub,
@@ -509,6 +611,7 @@ async def run_enumeration(job_id: str, domain: str, keys: dict) -> None:
     if job is None:
         return
     client: httpx.AsyncClient = app.state.client
+    probe_client: httpx.AsyncClient = app.state.probe_client
     cleanup_old_jobs()
 
     job.status = "running"
@@ -554,7 +657,7 @@ async def run_enumeration(job_id: str, domain: str, keys: dict) -> None:
         async def analyze_one(idx: int, sub: str) -> None:
             nonlocal done_count
             res = await analyze_subdomain(
-                client, sub, sorted(subdomain_sources.get(sub, set())), sem
+                probe_client, sub, sorted(subdomain_sources.get(sub, set())), sem
             )
             results[idx] = res
             done_count += 1
@@ -581,10 +684,22 @@ async def run_enumeration(job_id: str, domain: str, keys: dict) -> None:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Verified client for data-source and authenticated API calls (SecurityTrails,
+    # Shodan). TLS is validated so API keys never travel over unauthenticated TLS.
     app.state.client = httpx.AsyncClient(
         headers={"User-Agent": USER_AGENT},
         follow_redirects=True,
         timeout=SOURCE_TIMEOUT,
+        verify=True,
+    )
+    # Separate probe client with TLS verification disabled, used only to fetch
+    # target subdomain bodies (which frequently present invalid/self-signed
+    # certs) for liveness and takeover-fingerprint checks. No credentials are
+    # ever sent on this client.
+    app.state.probe_client = httpx.AsyncClient(
+        headers={"User-Agent": USER_AGENT},
+        follow_redirects=True,
+        timeout=HTTP_PROBE_TIMEOUT,
         verify=False,
     )
     cleanup_task = asyncio.create_task(_periodic_cleanup())
@@ -593,6 +708,7 @@ async def lifespan(app: FastAPI):
     finally:
         cleanup_task.cancel()
         await app.state.client.aclose()
+        await app.state.probe_client.aclose()
 
 
 app = FastAPI(title="SubRecon Pro", lifespan=lifespan)

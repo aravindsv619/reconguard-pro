@@ -1,0 +1,5 @@
+# Development/test-only dependencies (not required to run the app).
+# Install with: .venv/bin/pip install -r requirements-dev.txt
+pytest==9.1.1
+pytest-asyncio==1.4.0
+respx==0.23.1
