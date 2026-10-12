@@ -415,6 +415,7 @@ class EnumerateRequest(BaseModel):
     domain: str
     securitytrails_key: Optional[str] = None
     shodan_key: Optional[str] = None
+    c99_key: Optional[str] = None
     # Active DNS discovery (OFF by default). Omitting all of these reproduces
     # today's passive-only behavior byte-for-byte.
     active: bool = False
@@ -641,6 +642,34 @@ async def query_shodan(client: httpx.AsyncClient, domain: str, keys: dict) -> se
     return out
 
 
+async def query_c99(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
+    out: set[str] = set()
+    api_key = keys.get("c99_key") or os.environ.get("C99_API_KEY")
+    if not api_key:
+        return out
+    try:
+        resp = await _get(
+            client,
+            f"https://api.c99.nl/subdomainfinder?key={api_key}&domain={domain}&json",
+        )
+        data = resp.json()
+        # Be defensive: c99 returns {"success": bool, "subdomains": [...]}.
+        # On an invalid key / failed lookup success is false (or an error
+        # field is present); handle that and any missing/empty list without
+        # raising. Non-JSON/HTML error bodies raise in resp.json() and are
+        # caught below, yielding an empty result.
+        if not isinstance(data, dict) or not data.get("success"):
+            return out
+        for entry in data.get("subdomains") or []:
+            host = entry.get("subdomain", "") if isinstance(entry, dict) else ""
+            norm = _normalize_host(host, domain)
+            if norm:
+                out.add(norm)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("c99 failed: %s", exc)
+    return out
+
+
 SOURCES = {
     "crt.sh": query_crtsh,
     "HackerTarget": query_hackertarget,
@@ -653,6 +682,7 @@ SOURCES = {
     "BufferOver": query_bufferover,
     "SecurityTrails": query_securitytrails,
     "Shodan": query_shodan,
+    "c99": query_c99,
 }
 
 
@@ -1251,6 +1281,7 @@ async def enumerate_domain(req: EnumerateRequest):
     keys = {
         "securitytrails_key": req.securitytrails_key,
         "shodan_key": req.shodan_key,
+        "c99_key": req.c99_key,
     }
     # Normalize wordlist_mode to the accepted set; any other value -> "replace".
     wordlist_mode = req.wordlist_mode if req.wordlist_mode == "append" else "replace"

@@ -71,6 +71,12 @@
             <input id="shodanKey" type="password" autocomplete="off"
               class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
           </div>
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">c99.nl API key (optional)</label>
+            <input id="c99Key" type="password" autocomplete="off"
+              class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
+            <p class="text-xs text-gray-500 mt-1">Optional. Paid c99.nl API key — results merged if provided.</p>
+          </div>
 
           <!-- Active DNS discovery -->
           <div class="sm:col-span-2 border-t border-gray-800 pt-3 mt-1">
@@ -232,7 +238,7 @@
     let permRequested = false;
 
     const DOMAIN_RE = /^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
-    const SOURCES = ['crt.sh','HackerTarget','AlienVault','RapidDNS','URLScan','ThreatCrowd','Wayback','Anubis','BufferOver','SecurityTrails','Shodan'];
+    const SOURCES = ['crt.sh','HackerTarget','AlienVault','RapidDNS','URLScan','ThreatCrowd','Wayback','Anubis','BufferOver','SecurityTrails','Shodan','c99'];
 
     function toggleAdvanced() {
       const p = document.getElementById('advancedPanel');
@@ -268,8 +274,10 @@
       const body = { domain };
       const st = document.getElementById('stKey').value.trim();
       const sh = document.getElementById('shodanKey').value.trim();
+      const c99 = document.getElementById('c99Key').value.trim();
       if (st) body.securitytrails_key = st;
       if (sh) body.shodan_key = sh;
+      if (c99) body.c99_key = c99;
 
       // Active DNS discovery (fields omitted entirely when active is off, so
       // the request is byte-for-byte the passive-only shape).

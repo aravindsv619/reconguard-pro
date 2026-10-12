@@ -297,6 +297,34 @@ def test_enumerate_omitting_active_fields_registers_no_active_sources(monkeypatc
     assert set(status["source_statuses"]) == set(main.SOURCES)
 
 
+def test_enumerate_omitting_c99_key_behaves_as_before(monkeypatch):
+    # Regression: POST /api/enumerate with c99_key omitted carries c99_key=None
+    # in the keys dict (backward compatible) and registers c99 as a source,
+    # exactly like SecurityTrails/Shodan when their key is absent.
+    captured = {}
+
+    async def fake_run(job_id, domain, keys, **kwargs):
+        captured["keys"] = keys
+        job = main.JOBS[job_id]
+        job.status = "done"
+        job.progress = 100
+        job.source_statuses = {name: "done" for name in main.SOURCES}
+
+    monkeypatch.setattr(main, "run_enumeration", fake_run)
+
+    with TestClient(main.app) as c:
+        job_id = c.post("/api/enumerate", json={"domain": "example.com"}).json()["job_id"]
+        status = c.get(f"/api/status/{job_id}").json()
+
+    # c99 key defaults to None, alongside the other keyed sources.
+    assert captured["keys"]["c99_key"] is None
+    assert captured["keys"]["securitytrails_key"] is None
+    assert captured["keys"]["shodan_key"] is None
+    # c99 is a registered source in the status panel.
+    assert "c99" in status["source_statuses"]
+    assert set(status["source_statuses"]) == set(main.SOURCES)
+
+
 def test_enumerate_passes_active_fields_when_present(monkeypatch):
     captured = {}
 

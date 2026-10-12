@@ -169,6 +169,53 @@ async def test_shodan_with_key(client):
     assert out == {"q.example.com", "r.example.com"}
 
 
+async def test_c99_skips_without_key(client):
+    out = await main.query_c99(client, DOMAIN, {})
+    assert out == set()
+
+
+@respx.mock
+async def test_c99_with_key(client):
+    respx.get("https://api.c99.nl/subdomainfinder").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "subdomains": [
+                    {"subdomain": "WWW.example.com"},
+                    {"subdomain": "api.example.com"},
+                    {"subdomain": "www.example.com"},
+                    {"subdomain": "notinscope.org"},
+                ],
+            },
+        )
+    )
+    out = await main.query_c99(client, DOMAIN, {"c99_key": "k"})
+    assert out == {"www.example.com", "api.example.com"}
+
+
+@respx.mock
+async def test_c99_handles_success_false(client):
+    respx.get("https://api.c99.nl/subdomainfinder").mock(
+        return_value=httpx.Response(
+            200, json={"success": False, "error": "invalid key"}
+        )
+    )
+    out = await main.query_c99(client, DOMAIN, {"c99_key": "bad"})
+    assert out == set()
+
+
+@respx.mock
+async def test_c99_handles_html_error_body(client):
+    respx.get("https://api.c99.nl/subdomainfinder").mock(
+        return_value=httpx.Response(
+            200, text="<html><body>blocked</body></html>"
+        )
+    )
+    out = await main.query_c99(client, DOMAIN, {"c99_key": "k"})
+    assert out == set()
+
+
 @respx.mock
 async def test_source_failure_returns_empty_not_raises(client):
     respx.get("https://crt.sh/").mock(side_effect=httpx.ConnectError("boom"))

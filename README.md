@@ -26,7 +26,7 @@ CSV — all from a dark-themed browser dashboard.
 - Live progress tracking with per-source status.
 - Filterable, sortable results table and a risk-breakdown chart.
 - One-click CSV report download.
-- Optional SecurityTrails and Shodan API keys for additional coverage.
+- Optional SecurityTrails, Shodan, and c99.nl API keys for additional coverage.
 
 ## Data sources
 
@@ -43,6 +43,7 @@ CSV — all from a dark-themed browser dashboard.
 | BufferOver | no |
 | SecurityTrails | optional |
 | Shodan | optional |
+| c99.nl | optional (paid) |
 
 ## Requirements
 
@@ -123,18 +124,22 @@ exact passive-only behavior and status payload.
 
 ### Optional API keys
 
-SecurityTrails and Shodan improve coverage. Provide keys in either of two ways:
+SecurityTrails, Shodan, and c99.nl improve coverage. c99.nl is a **paid**
+service — its subdomain finder requires a purchased API key (there is no free
+keyless tier). Provide keys in either of two ways:
 
-- Enter them in the **Advanced Options** section of the scan form, or
+- Enter them in the **Advanced Options** section of the scan form (fields
+  `securitytrails_key`, `shodan_key`, `c99_key` in the POST body), or
 - Set environment variables before launching the server:
 
   ```bash
   export SECURITYTRAILS_API_KEY="your-key"
   export SHODAN_API_KEY="your-key"
+  export C99_API_KEY="your-key"
   .venv/bin/python main.py
   ```
 
-Both sources are skipped silently when no key is supplied.
+All three keyed sources are skipped silently when no key is supplied.
 
 ## Development & tests
 
@@ -168,7 +173,7 @@ collide with the CSV comma delimiter.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| POST | `/api/enumerate` | Start a job. Body: `{domain, securitytrails_key?, shodan_key?, active?, wordlist?, wordlist_mode?, permutations?}`. The last four enable active discovery and are optional (omitting them keeps passive-only behavior). Returns `{job_id}`. |
+| POST | `/api/enumerate` | Start a job. Body: `{domain, securitytrails_key?, shodan_key?, c99_key?, active?, wordlist?, wordlist_mode?, permutations?}`. The last four enable active discovery and are optional (omitting them keeps passive-only behavior). Returns `{job_id}`. |
 | GET | `/api/status/{job_id}` | Poll job status, progress, and per-source state. |
 | GET | `/api/results/{job_id}` | Full results JSON once the job is `done`. |
 | GET | `/api/download/{job_id}` | Download the CSV report. |
