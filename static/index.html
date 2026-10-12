@@ -147,7 +147,7 @@
       </div>
 
       <!-- Summary cards -->
-      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <div class="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
         <div class="bg-gray-900 border border-blue-500/30 rounded-xl p-4">
           <div class="text-3xl font-bold text-blue-400" id="cardTotal">0</div>
           <div class="text-xs text-gray-400 mt-1">Total Subdomains</div>
@@ -160,6 +160,10 @@
           <div class="text-3xl font-bold text-red-400" id="cardHigh">0</div>
           <div class="text-xs text-gray-400 mt-1">HIGH Risk</div>
         </div>
+        <div class="bg-gray-900 border border-amber-500/30 rounded-xl p-4">
+          <div class="text-3xl font-bold text-amber-400" id="cardVerify">0</div>
+          <div class="text-xs text-gray-400 mt-1">VERIFY Risk</div>
+        </div>
         <div class="bg-gray-900 border border-orange-500/30 rounded-xl p-4">
           <div class="text-3xl font-bold text-orange-400" id="cardMedium">0</div>
           <div class="text-xs text-gray-400 mt-1">MEDIUM Risk</div>
@@ -171,11 +175,13 @@
         <div class="text-sm text-gray-400 mb-2">Risk breakdown</div>
         <div class="flex w-full h-5 rounded-full overflow-hidden bg-gray-800">
           <div id="barHigh" class="bg-red-500 h-full" style="width:0%"></div>
+          <div id="barVerify" class="bg-amber-500 h-full" style="width:0%"></div>
           <div id="barMedium" class="bg-orange-500 h-full" style="width:0%"></div>
           <div id="barNone" class="bg-gray-500 h-full" style="width:0%"></div>
         </div>
         <div class="flex gap-4 text-xs text-gray-400 mt-2">
           <span><span class="inline-block w-2 h-2 rounded-full bg-red-500"></span> HIGH</span>
+          <span><span class="inline-block w-2 h-2 rounded-full bg-amber-500"></span> VERIFY</span>
           <span><span class="inline-block w-2 h-2 rounded-full bg-orange-500"></span> MEDIUM</span>
           <span><span class="inline-block w-2 h-2 rounded-full bg-gray-500"></span> NONE/LOW</span>
         </div>
@@ -187,6 +193,7 @@
           <button data-filter="all" class="filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm">All</button>
           <button data-filter="alive" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Alive Only</button>
           <button data-filter="high" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">HIGH Risk</button>
+          <button data-filter="verify" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Verify</button>
           <button data-filter="medium" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">MEDIUM Risk</button>
           <button data-filter="unresolved" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Unresolved</button>
         </div>
@@ -208,6 +215,7 @@
               <th class="sortable py-3 px-3" onclick="sortResults('subdomain')">Subdomain</th>
               <th class="py-3 px-3">IP Addresses</th>
               <th class="py-3 px-3">CNAME</th>
+              <th class="sortable py-3 px-3" onclick="sortResults('dns_status')">DNS</th>
               <th class="sortable py-3 px-3" onclick="sortResults('http_status')">HTTP</th>
               <th class="sortable py-3 px-3" onclick="sortResults('https_status')">HTTPS</th>
               <th class="py-3 px-3">Sources</th>
@@ -403,13 +411,16 @@
       document.getElementById('cardTotal').textContent = data.total;
       document.getElementById('cardAlive').textContent = data.alive;
       document.getElementById('cardHigh').textContent = data.high_risk;
+      document.getElementById('cardVerify').textContent = data.verify || 0;
       document.getElementById('cardMedium').textContent = data.medium_risk;
 
       const total = data.total || 1;
       const high = data.high_risk;
+      const verify = data.verify || 0;
       const medium = data.medium_risk;
-      const none = Math.max(0, data.total - high - medium);
+      const none = Math.max(0, data.total - high - verify - medium);
       document.getElementById('barHigh').style.width = (100 * high / total) + '%';
+      document.getElementById('barVerify').style.width = (100 * verify / total) + '%';
       document.getElementById('barMedium').style.width = (100 * medium / total) + '%';
       document.getElementById('barNone').style.width = (100 * none / total) + '%';
 
@@ -443,6 +454,7 @@
         switch (activeFilter) {
           case 'alive': return r.alive;
           case 'high': return r.takeover_risk === 'HIGH';
+          case 'verify': return r.takeover_risk === 'VERIFY';
           case 'medium': return r.takeover_risk === 'MEDIUM';
           case 'unresolved': return !r.resolved;
           default: return true;
@@ -466,7 +478,7 @@
     function applySort() {
       const col = sortState.column;
       const dir = sortState.asc ? 1 : -1;
-      const riskOrder = { HIGH: 3, MEDIUM: 2, LOW: 1, NONE: 0 };
+      const riskOrder = { HIGH: 4, VERIFY: 3, MEDIUM: 2, LOW: 1, NONE: 0 };
       filteredResults.sort((a, b) => {
         let va = a[col], vb = b[col];
         if (col === 'takeover_risk') { va = riskOrder[va] ?? 0; vb = riskOrder[vb] ?? 0; }
@@ -482,12 +494,17 @@
       // Whitelist the risk value before it reaches innerHTML. takeover_risk is
       // a server-controlled enum today, but data on this page originates from
       // attacker-poisonable third-party cert logs, so never trust it raw.
-      const label = (risk === 'HIGH' || risk === 'MEDIUM' || risk === 'LOW' || risk === 'NONE')
+      const label = (risk === 'HIGH' || risk === 'VERIFY' || risk === 'MEDIUM' || risk === 'LOW' || risk === 'NONE')
         ? risk : 'NONE';
+      // Fixed Tailwind classes per label (no raw interpolation). VERIFY sits
+      // between MEDIUM and HIGH and uses an amber badge; it also needs dark
+      // text for contrast against the lighter amber background.
       let cls = 'bg-gray-500';
+      let text = 'text-white';
       if (label === 'HIGH') cls = 'bg-red-500';
+      else if (label === 'VERIFY') { cls = 'bg-amber-500'; text = 'text-black'; }
       else if (label === 'MEDIUM') cls = 'bg-orange-500';
-      return `<span class="${cls} text-white text-xs font-semibold px-2 py-0.5 rounded">${label}</span>`;
+      return `<span class="${cls} ${text} text-xs font-semibold px-2 py-0.5 rounded">${label}</span>`;
     }
 
     function statusCell(v) {
@@ -529,10 +546,16 @@
           ? '<span class="text-green-400">●</span>'
           : '<span class="text-gray-600">●</span>';
         const title = r.takeover_detail ? ` title="${escapeHtml(r.takeover_detail)}"` : '';
+        // Full CNAME chain (additive JSON from the backend) is surfaced as a
+        // title attribute, joined with ' -> ' and escapeHtml-ed so hostile
+        // chain entries stay inert; the cell text keeps the single-cname value.
+        const chain = Array.isArray(r.cname_chain) ? r.cname_chain : [];
+        const cnameTitle = chain.length > 1 ? ` title="${escapeHtml(chain.join(' -> '))}"` : '';
         return `<tr class="border-b border-gray-800/60 animate-fadein hover:bg-gray-800/40">
           <td class="py-2 px-3 font-mono text-brand-300">${escapeHtml(r.subdomain)}</td>
           <td class="py-2 px-3 text-gray-400 font-mono text-xs">${escapeHtml((r.ip_addresses||[]).join(', ')) || '—'}</td>
-          <td class="py-2 px-3 text-gray-400 font-mono text-xs">${escapeHtml(r.cname || '') || '—'}</td>
+          <td class="py-2 px-3 text-gray-400 font-mono text-xs"${cnameTitle}>${escapeHtml(r.cname || '') || '—'}</td>
+          <td class="py-2 px-3 text-gray-400 font-mono text-xs">${escapeHtml(r.dns_status || '') || '—'}</td>
           <td class="py-2 px-3">${statusCell(r.http_status)}</td>
           <td class="py-2 px-3">${statusCell(r.https_status)}</td>
           <td class="py-2 px-3 text-gray-500 text-xs">${escapeHtml((r.sources||[]).join(', '))}${sourceChips(r.sources)}</td>

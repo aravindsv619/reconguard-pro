@@ -16,13 +16,16 @@ CSV — all from a dark-themed browser dashboard.
 - **Active DNS discovery (optional, OFF by default):** wordlist brute-forcing
   against a bundled 2,400+ label list plus altdns-style permutation generation.
   See [Active DNS discovery](#active-dns-discovery) below.
-- DNS resolution (A/AAAA) and CNAME detection per subdomain.
+- DNS resolution (A/AAAA) and CNAME detection per subdomain, including a
+  `dns_status` resolver outcome and the full multi-hop `cname_chain`.
 - HTTP and HTTPS liveness probing with status codes.
-- Subdomain-takeover risk scoring (HIGH / MEDIUM / LOW / NONE) using a built-in
-  fingerprint library covering 30+ services (GitHub Pages, AWS S3/CloudFront,
-  Heroku, Azure, Shopify, Netlify, Fastly, and more). Matching considers the
-  CNAME, the subdomain name, and the reverse-DNS (PTR) hostname of each
-  A-record, so dangling IP-only records are scored as well.
+- Subdomain-takeover risk scoring (HIGH / VERIFY / MEDIUM / LOW / NONE) using a
+  built-in fingerprint library covering 30+ services (GitHub Pages, AWS
+  S3/CloudFront, Heroku, Azure, Shopify, Netlify, Fastly, and more). Matching
+  considers the CNAME, the subdomain name, and the reverse-DNS (PTR) hostname of
+  each A-record, so dangling IP-only records are scored as well. The **VERIFY**
+  tier flags dangling CNAMEs that point at an unclaimed-looking cloud resource
+  (see [Takeover risk tiers](#takeover-risk-tiers)).
 - Live progress tracking with per-source status.
 - Filterable, sortable results table and a risk-breakdown chart.
 - One-click CSV report download.
@@ -157,17 +160,87 @@ parsing, and the key-optional SecurityTrails/Shodan skip), the three
 `check_takeover` branches plus A-record PTR matching and the socket CNAME
 fallback, the job state machine and cleanup, and the API/CSV contract.
 
+## Takeover risk tiers
+
+Each subdomain is scored into one of five tiers. Ordered most to least severe:
+
+**HIGH > VERIFY > MEDIUM > LOW > NONE**
+
+- **HIGH** — a service fingerprint confirmed the target is unclaimed/dangling
+  (the response body matched a known takeover signature).
+- **VERIFY** — the subdomain has a dangling CNAME pointing at a recognized cloud
+  resource (see below) and the HTTP signal looks "gone" (404/503, or no response
+  at all) without a confirmed body fingerprint. This is **not** a confirmed
+  takeover: it means the resource may have been deprovisioned and the pointer
+  left behind. **Manual confirmation is required** — check whether the resource
+  still exists and is owned by you before assuming the record is safe or
+  reclaimable. VERIFY sorts between MEDIUM and HIGH and is rendered with an amber
+  badge in the dashboard.
+- **MEDIUM** — a weaker/service-name match without a confirmed body fingerprint.
+- **LOW** — a cloud-resource CNAME that still appears live (e.g. returns 200).
+- **NONE** — no takeover indicators.
+
+### Cloud resource coverage (`CLOUD_RESOURCE_PATTERNS`)
+
+VERIFY detection matches the final CNAME-chain target (anchored host-suffix
+match, no substring false positives) against these providers:
+
+- **AWS** — Elastic Load Balancing (`*.elb.amazonaws.com`), S3
+  (`*.s3*.amazonaws.com`, `*.s3-website-*.amazonaws.com`), CloudFront
+  (`*.cloudfront.net`).
+- **Azure** — Web Apps (`*.azurewebsites.net`), Traffic Manager
+  (`*.trafficmanager.net`), Cloud App (`*.cloudapp.azure.com`), Blob Storage
+  (`*.blob.core.windows.net`).
+- **Heroku** — `*.herokudns.com`, `*.herokuapp.com`.
+- **GitHub Pages** — `*.github.io`.
+- **Google Cloud** — Storage (`*.storage.googleapis.com`), App Engine
+  (`*.appspot.com`).
+- **Fastly** — `*.fastly.net`.
+
+VERIFY uses only already-gathered data (the CNAME chain plus the HTTP statuses
+collected during the single guarded probe) and issues no additional network
+request, so the SSRF guard is preserved.
+
+## DNS reporting
+
+### `dns_status`
+
+Per-subdomain resolver outcome (one of six values):
+
+| Value | Meaning |
+| --- | --- |
+| `RESOLVED` | A/AAAA records returned (`resolved` is `true` only in this case). |
+| `NXDOMAIN` | The name does not exist. |
+| `NO_ANSWER` | The name exists but has no A/AAAA (e.g. CNAME-only). |
+| `SERVFAIL` | The resolver reported a server failure. |
+| `TIMEOUT` | The lookup timed out. |
+| `ERROR` | Other/unknown resolution error (also used for invalid hostnames). |
+
+The `resolved` boolean is derived strictly as `dns_status == "RESOLVED"`, so a
+CNAME-only host (no A/AAAA) now reports `resolved: false`. `dns_status` is shown
+as its own **DNS** column in the results table.
+
+### `cname_chain`
+
+An additive JSON array (`list[str]`) listing every CNAME target following
+multiple hops (bounded to 10 hops, loop-protected). The first element equals the
+existing single `cname` field; the array is empty when there is no CNAME. The
+single `cname` field is unchanged. In the dashboard the full chain (joined with
+` -> `) is surfaced as a hover title on the CNAME cell when there is more than
+one hop.
+
 ## CSV report format
 
-The downloaded CSV contains one row per subdomain with these columns:
+The downloaded CSV contains one row per subdomain with these 12 columns:
 
 ```
 subdomain, ip_addresses, cname, http_status, https_status, sources,
-resolved, alive, takeover_risk, takeover_service, takeover_detail
+resolved, alive, takeover_risk, takeover_service, takeover_detail, dns_status
 ```
 
-List fields (`ip_addresses`, `sources`) are joined with `;` so they don't
-collide with the CSV comma delimiter.
+`dns_status` is the 12th column, appended at the end; the first 11 columns keep
+their exact order and meaning. List fields (`ip_addresses`, `sources`) are
+joined with `;` so they don't collide with the CSV comma delimiter.
 
 ## API
 
