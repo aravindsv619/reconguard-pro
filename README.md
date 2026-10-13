@@ -26,6 +26,15 @@ CSV — all from a dark-themed browser dashboard.
   each A-record, so dangling IP-only records are scored as well. The **VERIFY**
   tier flags dangling CNAMEs that point at an unclaimed-looking cloud resource
   (see [Takeover risk tiers](#takeover-risk-tiers)).
+- **Active takeover verification:** every VERIFY/HIGH row gets a single guarded
+  confirmation probe that turns the heuristic tier into a concrete
+  **VULNERABLE / NOT_VULNERABLE / INCONCLUSIVE** verdict with human-readable
+  evidence (`takeover_verdict` / `takeover_evidence`). See
+  [Active takeover verification](#active-takeover-verification).
+- **Full DNS-records listing:** every subdomain is enumerated across all record
+  types (A/AAAA/CNAME/MX/NS/TXT/SOA) and surfaced as a per-subdomain Records
+  panel and a trailing `dns_records` CSV column. See
+  [`dns_records`](#dns_records).
 - Live progress tracking with per-source status.
 - Filterable, sortable results table and a risk-breakdown chart.
 - One-click CSV report download.
@@ -201,6 +210,51 @@ VERIFY uses only already-gathered data (the CNAME chain plus the HTTP statuses
 collected during the single guarded probe) and issues no additional network
 request, so the SSRF guard is preserved.
 
+## Active takeover verification
+
+The VERIFY tier is a heuristic. On top of it, SubRecon Pro runs an **active
+confirmation pass** that resolves the dangling CNAME target's own DNS, probes
+it once (guarded), and turns the tier into a concrete verdict with evidence.
+Only VERIFY/HIGH rows are verified; every other row carries an empty verdict.
+
+Each verified row exposes two fields (`takeover_verdict`, `takeover_evidence`)
+and a verdict badge in the dashboard. The verdict is one of:
+
+| Verdict | Meaning |
+| --- | --- |
+| `VULNERABLE` | The target shows a resource-not-found signature (or is NXDOMAIN for a user-chosen-name provider). The dangling pointer is likely claimable — **act now.** A confirmed `VULNERABLE` verdict also promotes the row's risk tier from VERIFY to HIGH. |
+| `NOT_VULNERABLE` | The target still serves content or is an AWS-assigned (non-claimable) name. The record is dangling but not takeover-able as observed. |
+| `INCONCLUSIVE` | No decisive signal (indeterminate response, CloudFront, SSRF-skipped probe, or any error). **Manual confirmation required.** |
+
+### Who is claimable — the ELB/CloudFront vs S3/GitHub distinction
+
+Not every cloud DNS name can be re-registered by an attacker, and the verdict
+logic treats the two groups differently:
+
+- **AWS-assigned names are NOT attacker-claimable.** Elastic Load Balancing
+  (`*.elb.amazonaws.com`) and CloudFront (`*.cloudfront.net`) DNS names are
+  issued by AWS, not chosen by the account owner, so an attacker cannot create
+  a replacement with the same name. A dangling CNAME to one of these is usually
+  a down/internal service (an ELB 503 means "no healthy targets"), not a
+  takeover. ELB therefore reports `NOT_VULNERABLE` while it still resolves, and
+  CloudFront is capped at `INCONCLUSIVE` and **never** returns `VULNERABLE`.
+- **User-chosen names ARE attacker-claimable.** S3 buckets, GitHub Pages,
+  Heroku apps, Azure sites, Google Cloud, and Fastly services use names the
+  original owner picked. If that resource is deleted the name becomes free, so
+  an attacker can re-register it. These providers reach `VULNERABLE` only on a
+  provider-specific resource-not-found signature (e.g. S3 `NoSuchBucket`,
+  GitHub Pages "There isn't a GitHub Pages site here", Heroku "No such app",
+  Fastly "unknown domain") **or** when the target hostname is NXDOMAIN.
+
+### Safety invariants
+
+The confirmation probe reuses the existing SSRF guard (`_is_safe_public_ip`):
+if the target resolves only to private/loopback/link-local/metadata IPs the
+probe is **skipped** and the verdict is `INCONCLUSIVE`. The single probe is
+bounded by the same `asyncio.Semaphore` as the rest of analysis (no new
+fan-out) and uses a dedicated short timeout, and the whole verification body is
+wrapped so it can never raise — any failure degrades to `INCONCLUSIVE`.
+
 ## DNS reporting
 
 ### `dns_status`
@@ -229,18 +283,43 @@ single `cname` field is unchanged. In the dashboard the full chain (joined with
 ` -> `) is surfaced as a hover title on the CNAME cell when there is more than
 one hop.
 
+### `dns_records`
+
+A per-subdomain listing of **every** DNS record type, not just the A/AAAA/CNAME
+used for resolution. For each type in A, AAAA, CNAME, MX, NS, TXT, SOA, a
+`dig +short <TYPE> <host>` lookup is run and its answer lines are parsed into a
+list; the field is a JSON object keyed by record type (only types that returned
+at least one answer appear). The lookup runs `dig` as an argument list (no
+shell), gates the host through the hostname validator, and uses a short per-type
+timeout so one slow type cannot stall the enumeration. When `dig` is absent it
+falls back to the Python standard library (A/AAAA via `getaddrinfo`, CNAME via
+the socket resolver; MX/NS/TXT/SOA are left empty in that mode).
+
+This field is purely **additive** — it never touches `ip_addresses`, `cname`,
+or `cname_chain`. In the dashboard each subdomain row has a small ▸ toggle that
+reveals a **Records** panel listing all discovered record types. In the CSV it
+is one trailing `dns_records` column where values are joined with `,` and types
+with `;` so the whole listing stays inside a single comma-CSV cell, e.g.
+`A=1.2.3.4;MX=10 mail.example.com;NS=ns1.example.com,ns2.example.com`.
+
 ## CSV report format
 
-The downloaded CSV contains one row per subdomain with these 12 columns:
+The downloaded CSV contains one row per subdomain with these 15 columns:
 
 ```
 subdomain, ip_addresses, cname, http_status, https_status, sources,
-resolved, alive, takeover_risk, takeover_service, takeover_detail, dns_status
+resolved, alive, takeover_risk, takeover_service, takeover_detail, dns_status,
+takeover_verdict, takeover_evidence, dns_records
 ```
 
-`dns_status` is the 12th column, appended at the end; the first 11 columns keep
-their exact order and meaning. List fields (`ip_addresses`, `sources`) are
-joined with `;` so they don't collide with the CSV comma delimiter.
+The first 12 columns keep their exact order and meaning (`dns_status` is the
+12th). Columns 13-15 — `takeover_verdict`, `takeover_evidence`, and
+`dns_records` — are appended at the end. List fields (`ip_addresses`,
+`sources`) are joined with `;` so they don't collide with the CSV comma
+delimiter; `dns_records` uses its own `,`/`;` scheme (see
+[`dns_records`](#dns_records)). Every text cell, including the three new
+columns, passes through the spreadsheet-formula-injection neutralizer before
+export.
 
 ## API
 
