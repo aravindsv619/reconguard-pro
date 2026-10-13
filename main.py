@@ -416,6 +416,16 @@ CLOUD_RESOURCE_PATTERNS = [
 ]
 
 
+# Verdict constants for the active takeover-VERIFICATION pass (FEAT-001).
+# These turn the heuristic VERIFY tier into a concrete, human-readable verdict.
+VERDICT_VULNERABLE = "VULNERABLE"
+VERDICT_NOT_VULNERABLE = "NOT_VULNERABLE"
+VERDICT_INCONCLUSIVE = "INCONCLUSIVE"
+# Dedicated (shorter) timeout for the single confirmation probe so a slow
+# target cannot stall the bounded verification pass.
+VERIFY_HTTP_TIMEOUT = 5.0
+
+
 def _match_cloud_resource(target: Optional[str]) -> Optional[str]:
     """Return the cloud provider name a CNAME target points at, else None.
 
@@ -449,6 +459,11 @@ class SubdomainResult(TypedDict):
     takeover_risk: str  # HIGH | VERIFY | MEDIUM | LOW | NONE
     takeover_service: Optional[str]
     takeover_detail: Optional[str]
+    # Active-verification verdict (FEAT-001): VULNERABLE | NOT_VULNERABLE |
+    # INCONCLUSIVE, or '' for rows that were not flagged (risk not in
+    # {VERIFY, HIGH}). takeover_evidence cites the exact observation.
+    takeover_verdict: str
+    takeover_evidence: str
     resolved: bool
     alive: bool
     dns_status: str  # RESOLVED | NXDOMAIN | NO_ANSWER | SERVFAIL | TIMEOUT | ERROR
@@ -1161,6 +1176,338 @@ def check_takeover(
     return "NONE", None, None
 
 
+async def verify_takeover(
+    result: SubdomainResult,
+    probe_client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+) -> dict:
+    """Active confirmation pass for a flagged (VERIFY/HIGH) takeover candidate.
+
+    Turns the heuristic risk tier into a concrete verdict with evidence:
+    {'verdict': VULNERABLE|NOT_VULNERABLE|INCONCLUSIVE, 'evidence': <str>}.
+    Non-flagged rows (risk not in {VERIFY, HIGH}) get {'verdict':'','evidence':''}.
+
+    Security invariants (identical to analyze_subdomain):
+      * Resolve-then-guard: resolve the final CNAME target's own DNS and only
+        probe when at least one resolved IP satisfies _is_safe_public_ip. If
+        the target resolved to IP(s) but none are public, the probe is SKIPPED
+        and the verdict is INCONCLUSIVE (SSRF guard).
+      * Every probe is bounded by the SAME semaphore passed in (no new
+        semaphore, no unbounded fan-out) and uses VERIFY_HTTP_TIMEOUT.
+      * The whole body is wrapped in try/except — this function NEVER raises;
+        any error becomes an INCONCLUSIVE verdict noting the error.
+
+    The per-provider decision follows the GENERAL RULE: VULNERABLE requires
+    either a provider "resource-does-not-exist"/claimable signature, or the
+    target hostname being NXDOMAIN for a user-chosen-name provider (S3, GitHub
+    Pages, Heroku, Azure sites, GCP, Fastly). ELB/CloudFront names are NOT
+    attacker-choosable, so they prefer NOT_VULNERABLE/INCONCLUSIVE.
+    """
+    risk = result.get("takeover_risk")
+    if risk not in ("VERIFY", "HIGH"):
+        return {"verdict": "", "evidence": ""}
+
+    try:
+        chain = result.get("cname_chain") or []
+        cname = result.get("cname")
+        final_target = chain[-1] if chain else cname
+        provider = _match_cloud_resource(final_target)
+        target_display = (final_target or "").strip().rstrip(".").lower()
+
+        # Resolve the TARGET's own DNS (NXDOMAIN-of-target is the key signal
+        # for user-chosen-name providers).
+        if final_target:
+            target_ips, target_dns_status = await resolve_dns_detailed(final_target)
+        else:
+            target_ips, target_dns_status = [], "ERROR"
+
+        target_nxdomain = target_dns_status == "NXDOMAIN"
+        target_resolved = target_dns_status == "RESOLVED"
+
+        # SSRF guard: if the target resolved to IP(s) and none are public, do
+        # NOT probe. Skip and report INCONCLUSIVE.
+        probe_blocked = bool(target_ips) and not any(
+            _is_safe_public_ip(ip) for ip in target_ips
+        )
+
+        http_status: Optional[int] = None
+        https_status: Optional[int] = None
+        body = ""
+        probed = False
+        if probe_blocked:
+            return {
+                "verdict": VERDICT_INCONCLUSIVE,
+                "evidence": (
+                    f"Probe of target {target_display or final_target} skipped by "
+                    "the SSRF guard (target resolves only to private/internal/"
+                    "metadata addresses); cannot confirm takeover remotely."
+                ),
+            }
+
+        # Probe the target endpoint, bounded by the shared semaphore. CNAME-only
+        # targets (no A/AAAA) are still probed; httpx re-resolves at connect.
+        if final_target:
+            async with sem:
+                http_status, https_status, body = await asyncio.wait_for(
+                    check_http(probe_client, final_target),
+                    timeout=VERIFY_HTTP_TIMEOUT,
+                )
+            probed = True
+
+        body_lower = (body or "").lower()
+        status = http_status if http_status is not None else https_status
+        obs = (
+            f"target={target_display or final_target}, "
+            f"dns={target_dns_status}, "
+            f"http_status={http_status}, https_status={https_status}"
+        )
+
+        # ---- Per-provider decision ------------------------------------
+        if provider == "AWS S3":
+            if "nosuchbucket" in body_lower:
+                return {
+                    "verdict": VERDICT_VULNERABLE,
+                    "evidence": (
+                        "AWS S3 bucket returned 'NoSuchBucket' — the bucket name "
+                        f"is unclaimed and attacker-registerable ({obs})."
+                    ),
+                }
+            if "accessdenied" in body_lower or status == 200:
+                return {
+                    "verdict": VERDICT_NOT_VULNERABLE,
+                    "evidence": (
+                        "AWS S3 target serves content/AccessDenied — the bucket "
+                        f"exists and is owned ({obs})."
+                    ),
+                }
+            if target_nxdomain:
+                return {
+                    "verdict": VERDICT_VULNERABLE,
+                    "evidence": (
+                        "AWS S3 target hostname is NXDOMAIN for a user-chosen "
+                        f"bucket name — re-registerable by an attacker ({obs})."
+                    ),
+                }
+            return {
+                "verdict": VERDICT_INCONCLUSIVE,
+                "evidence": (
+                    "AWS S3 target gave no decisive NoSuchBucket/AccessDenied/200 "
+                    f"signal — confirm bucket ownership in AWS ({obs})."
+                ),
+            }
+
+        if provider == "AWS ELB":
+            if target_resolved:
+                return {
+                    "verdict": VERDICT_NOT_VULNERABLE,
+                    "evidence": (
+                        "AWS ELB target still resolves. An ELB DNS name is NOT "
+                        "attacker-choosable (unlike S3/GitHub) — it is assigned by "
+                        "AWS, so a dangling CNAME to it is likely an internal/down "
+                        "service (503 = no healthy targets), not a takeover. "
+                        f"Confirm ownership in AWS ({obs})."
+                    ),
+                }
+            if target_nxdomain:
+                return {
+                    "verdict": VERDICT_INCONCLUSIVE,
+                    "evidence": (
+                        "ELB target no longer resolves; cannot be re-registered by "
+                        "an attacker via a chosen name, but confirm in AWS "
+                        f"({obs})."
+                    ),
+                }
+            return {
+                "verdict": VERDICT_INCONCLUSIVE,
+                "evidence": (
+                    "AWS ELB target gave an indeterminate signal; ELB names are not "
+                    f"attacker-claimable — confirm ownership in AWS ({obs})."
+                ),
+            }
+
+        if provider == "AWS CloudFront":
+            if (
+                "bad request" in body_lower
+                or "the request could not be satisfied" in body_lower
+                or status in (403, 404)
+            ):
+                return {
+                    "verdict": VERDICT_INCONCLUSIVE,
+                    "evidence": (
+                        "AWS CloudFront returned a Bad Request / 'request could not "
+                        "be satisfied' error. A CloudFront distribution domain is "
+                        "not freely attacker-choosable, so this is not a confirmed "
+                        f"takeover — verify the distribution in AWS ({obs})."
+                    ),
+                }
+            return {
+                "verdict": VERDICT_INCONCLUSIVE,
+                "evidence": (
+                    "AWS CloudFront target gave no decisive signal; CloudFront "
+                    f"domains are not attacker-claimable — confirm in AWS ({obs})."
+                ),
+            }
+
+        if provider == "GitHub Pages":
+            if "there isn't a github pages site here" in body_lower:
+                return {
+                    "verdict": VERDICT_VULNERABLE,
+                    "evidence": (
+                        "GitHub Pages returned \"There isn't a GitHub Pages site "
+                        "here\" — the repository/pages name is unclaimed and "
+                        f"attacker-registerable ({obs})."
+                    ),
+                }
+            if target_nxdomain:
+                return {
+                    "verdict": VERDICT_VULNERABLE,
+                    "evidence": (
+                        "GitHub Pages target hostname is NXDOMAIN for a user-chosen "
+                        f"name — claimable by an attacker ({obs})."
+                    ),
+                }
+            return {
+                "verdict": VERDICT_NOT_VULNERABLE,
+                "evidence": (
+                    "GitHub Pages target serves a site (no 'no site here' "
+                    f"signature) — appears owned ({obs})."
+                ),
+            }
+
+        if provider == "Heroku":
+            if "no such app" in body_lower:
+                return {
+                    "verdict": VERDICT_VULNERABLE,
+                    "evidence": (
+                        "Heroku returned 'No such app' — the app name is unclaimed "
+                        f"and attacker-registerable ({obs})."
+                    ),
+                }
+            if target_nxdomain:
+                return {
+                    "verdict": VERDICT_VULNERABLE,
+                    "evidence": (
+                        "Heroku target hostname is NXDOMAIN for a user-chosen app "
+                        f"name — claimable by an attacker ({obs})."
+                    ),
+                }
+            return {
+                "verdict": VERDICT_NOT_VULNERABLE,
+                "evidence": (
+                    "Heroku target responded without a 'No such app' signature — "
+                    f"appears owned ({obs})."
+                ),
+            }
+
+        if provider in (
+            "Azure Web Apps",
+            "Azure Cloud App",
+            "Azure Traffic Manager",
+            "Azure Blob Storage",
+        ):
+            azure_404_sig = (
+                "404 web site not found" in body_lower
+                or "error 404 - web app not found" in body_lower
+                or "the specified blob does not exist" in body_lower
+                or "web app not found" in body_lower
+            )
+            if target_nxdomain and (azure_404_sig or status == 404):
+                return {
+                    "verdict": VERDICT_VULNERABLE,
+                    "evidence": (
+                        f"{provider} target is NXDOMAIN for a user-chosen name and "
+                        "returns a known not-found signature — claimable by an "
+                        f"attacker ({obs})."
+                    ),
+                }
+            if azure_404_sig or status == 404:
+                return {
+                    "verdict": VERDICT_INCONCLUSIVE,
+                    "evidence": (
+                        f"{provider} returned a not-found signature but the target "
+                        "name still resolves — confirm the resource exists and is "
+                        f"owned in Azure ({obs})."
+                    ),
+                }
+            return {
+                "verdict": VERDICT_NOT_VULNERABLE,
+                "evidence": (
+                    f"{provider} target responded without a claimable not-found "
+                    f"signature — appears owned ({obs})."
+                ),
+            }
+
+        if provider in ("Google Cloud Storage", "Google App Engine"):
+            gcp_sig = (
+                "nosuchbucket" in body_lower
+                or "the specified bucket does not exist" in body_lower
+                or "requested url was not found" in body_lower
+            )
+            if gcp_sig:
+                return {
+                    "verdict": VERDICT_VULNERABLE,
+                    "evidence": (
+                        f"{provider} returned a resource-not-found signature — the "
+                        f"name is unclaimed and attacker-registerable ({obs})."
+                    ),
+                }
+            if target_nxdomain:
+                return {
+                    "verdict": VERDICT_VULNERABLE,
+                    "evidence": (
+                        f"{provider} target hostname is NXDOMAIN for a user-chosen "
+                        f"name — claimable by an attacker ({obs})."
+                    ),
+                }
+            return {
+                "verdict": VERDICT_NOT_VULNERABLE,
+                "evidence": (
+                    f"{provider} target responded without a not-found signature — "
+                    f"appears owned ({obs})."
+                ),
+            }
+
+        if provider == "Fastly":
+            if "fastly error: unknown domain" in body_lower:
+                return {
+                    "verdict": VERDICT_VULNERABLE,
+                    "evidence": (
+                        "Fastly returned 'Fastly error: unknown domain' — the "
+                        f"domain is unconfigured and attacker-claimable ({obs})."
+                    ),
+                }
+            if target_nxdomain:
+                return {
+                    "verdict": VERDICT_VULNERABLE,
+                    "evidence": (
+                        "Fastly target hostname is NXDOMAIN for a user-chosen name "
+                        f"— claimable by an attacker ({obs})."
+                    ),
+                }
+            return {
+                "verdict": VERDICT_NOT_VULNERABLE,
+                "evidence": (
+                    "Fastly target responded without an 'unknown domain' signature "
+                    f"— appears owned ({obs})."
+                ),
+            }
+
+        # default / unknown provider: list observations only.
+        probe_note = "probed target" if probed else "no target probed"
+        return {
+            "verdict": VERDICT_INCONCLUSIVE,
+            "evidence": (
+                f"No provider-specific takeover signature available ({probe_note}). "
+                f"Observations: {obs}. Manually confirm resource ownership."
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "verdict": VERDICT_INCONCLUSIVE,
+            "evidence": f"Verification could not complete (error: {exc}).",
+        }
+
+
 async def analyze_subdomain(
     probe_client: httpx.AsyncClient, sub: str, sources: list[str], sem: asyncio.Semaphore
 ) -> SubdomainResult:
@@ -1177,6 +1524,8 @@ async def analyze_subdomain(
             takeover_risk="NONE",
             takeover_service=None,
             takeover_detail=None,
+            takeover_verdict="",
+            takeover_evidence="",
             resolved=False,
             alive=False,
             dns_status="ERROR",
@@ -1214,6 +1563,43 @@ async def analyze_subdomain(
         cname_chain=cname_chain,
     )
 
+    # Active verification pass: only for flagged candidates (VERIFY/HIGH). Reuse
+    # the SAME semaphore already in scope (no new semaphore, no unbounded
+    # fan-out) and the SSRF-guarded probe_client. verify_takeover never raises.
+    takeover_verdict = ""
+    takeover_evidence = ""
+    if risk in ("VERIFY", "HIGH"):
+        verdict_result = await verify_takeover(
+            SubdomainResult(
+                subdomain=sub,
+                ip_addresses=ip_addresses,
+                cname=cname,
+                http_status=http_status,
+                https_status=https_status,
+                sources=sorted(sources),
+                takeover_risk=risk,
+                takeover_service=service,
+                takeover_detail=detail,
+                takeover_verdict="",
+                takeover_evidence="",
+                resolved=resolved,
+                alive=alive,
+                dns_status=dns_status,
+                cname_chain=cname_chain,
+            ),
+            probe_client,
+            sem,
+        )
+        takeover_verdict = verdict_result.get("verdict", "")
+        takeover_evidence = verdict_result.get("evidence", "")
+        # A confirmed VULNERABLE verdict may promote the risk to HIGH; note it.
+        if takeover_verdict == VERDICT_VULNERABLE and risk != "HIGH":
+            risk = "HIGH"
+            takeover_evidence = (
+                f"{takeover_evidence} [risk promoted VERIFY -> HIGH on confirmed "
+                "VULNERABLE verdict]"
+            )
+
     return SubdomainResult(
         subdomain=sub,
         ip_addresses=ip_addresses,
@@ -1224,6 +1610,8 @@ async def analyze_subdomain(
         takeover_risk=risk,
         takeover_service=service,
         takeover_detail=detail,
+        takeover_verdict=takeover_verdict,
+        takeover_evidence=takeover_evidence,
         resolved=resolved,
         alive=alive,
         dns_status=dns_status,
@@ -1607,12 +1995,14 @@ def _summarize(results: list) -> dict:
     high = sum(1 for r in results if r["takeover_risk"] == "HIGH")
     medium = sum(1 for r in results if r["takeover_risk"] == "MEDIUM")
     verify = sum(1 for r in results if r["takeover_risk"] == "VERIFY")
+    vulnerable = sum(1 for r in results if r.get("takeover_verdict") == "VULNERABLE")
     return {
         "resolved": resolved,
         "alive": alive,
         "high_risk": high,
         "medium_risk": medium,
         "verify": verify,
+        "vulnerable": vulnerable,
     }
 
 
@@ -1646,6 +2036,8 @@ CSV_COLUMNS = [
     "takeover_service",
     "takeover_detail",
     "dns_status",
+    "takeover_verdict",
+    "takeover_evidence",
 ]
 
 
@@ -1679,6 +2071,8 @@ async def download_csv(job_id: str):
             _csv_safe(r["takeover_service"] or ""),
             _csv_safe(r["takeover_detail"] or ""),
             _csv_safe(r["dns_status"]),
+            _csv_safe(r.get("takeover_verdict", "")),
+            _csv_safe(r.get("takeover_evidence", "")),
         ])
     buffer.seek(0)
     # Sanitize the filename so no CRLF/quote can break the Content-Disposition

@@ -1,0 +1,352 @@
+"""Tests for the active takeover-VERIFICATION pass (FEAT-001).
+
+verify_takeover turns the heuristic VERIFY/HIGH tier into a concrete verdict
+(VULNERABLE / NOT_VULNERABLE / INCONCLUSIVE) with human-readable evidence. It
+reuses the exact security invariants of analyze_subdomain: every target fetch
+routes through probe_client behind the _is_safe_public_ip SSRF guard, bounded
+by the passed Semaphore, and it NEVER raises (errors -> INCONCLUSIVE).
+
+All DNS/HTTP I/O is monkeypatched / respx-mocked so the suite stays offline and
+deterministic (same patterns as tests/test_active.py).
+"""
+
+import asyncio
+
+import httpx
+import pytest
+import respx
+
+import main
+
+
+@pytest.fixture(autouse=True)
+def clear_jobs():
+    main.JOBS.clear()
+    yield
+    main.JOBS.clear()
+
+
+def _result(risk="VERIFY", cname=None, chain=None):
+    return main.SubdomainResult(
+        subdomain="svc.example.com",
+        ip_addresses=[],
+        cname=cname,
+        http_status=None,
+        https_status=None,
+        sources=["crt.sh"],
+        takeover_risk=risk,
+        takeover_service=None,
+        takeover_detail=None,
+        takeover_verdict="",
+        takeover_evidence="",
+        resolved=False,
+        alive=False,
+        dns_status="NO_ANSWER",
+        cname_chain=chain if chain is not None else ([cname] if cname else []),
+    )
+
+
+# ---------------------------------------------------------------------------
+# (a) ELB target that still RESOLVES -> NOT_VULNERABLE
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_elb_target_resolves_not_vulnerable(monkeypatch):
+    # Probe would 503 (no healthy targets) but the ELB name still resolves.
+    respx.route().mock(return_value=httpx.Response(503, text="no healthy targets"))
+
+    async def fake_resolve_dns_detailed(host):
+        # The ELB target still resolves to a public IP.
+        return ["52.1.2.3"], "RESOLVED"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+
+    client = httpx.AsyncClient()
+    try:
+        out = await main.verify_takeover(
+            _result(cname="internal-lb.us-east-1.elb.amazonaws.com"),
+            client,
+            asyncio.Semaphore(5),
+        )
+    finally:
+        await client.aclose()
+
+    assert out["verdict"] == "NOT_VULNERABLE"
+    ev = out["evidence"].lower()
+    assert "elb" in ev
+    # Evidence must explain ELB names are not attacker-claimable.
+    assert "not" in ev and ("choosable" in ev or "claimable" in ev)
+
+
+# ---------------------------------------------------------------------------
+# (b) GitHub Pages "no site here" body -> VULNERABLE
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_github_pages_no_site_vulnerable(monkeypatch):
+    respx.route().mock(
+        return_value=httpx.Response(
+            404, text="There isn't a GitHub Pages site here."
+        )
+    )
+
+    async def fake_resolve_dns_detailed(host):
+        return ["185.199.108.153"], "RESOLVED"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+
+    client = httpx.AsyncClient()
+    try:
+        out = await main.verify_takeover(
+            _result(risk="HIGH", cname="user.github.io"),
+            client,
+            asyncio.Semaphore(5),
+        )
+    finally:
+        await client.aclose()
+
+    assert out["verdict"] == "VULNERABLE"
+    assert "github pages" in out["evidence"].lower()
+
+
+# ---------------------------------------------------------------------------
+# (c) S3 NoSuchBucket -> VULNERABLE; S3 200 listing -> NOT_VULNERABLE
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_s3_nosuchbucket_vulnerable(monkeypatch):
+    respx.route().mock(
+        return_value=httpx.Response(404, text="<Error><Code>NoSuchBucket</Code></Error>")
+    )
+
+    async def fake_resolve_dns_detailed(host):
+        return ["52.216.1.1"], "RESOLVED"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+
+    client = httpx.AsyncClient()
+    try:
+        out = await main.verify_takeover(
+            _result(cname="bucket.s3.amazonaws.com"),
+            client,
+            asyncio.Semaphore(5),
+        )
+    finally:
+        await client.aclose()
+
+    assert out["verdict"] == "VULNERABLE"
+    assert "s3" in out["evidence"].lower()
+
+
+@respx.mock
+async def test_s3_200_listing_not_vulnerable(monkeypatch):
+    respx.route().mock(
+        return_value=httpx.Response(200, text="<ListBucketResult>...</ListBucketResult>")
+    )
+
+    async def fake_resolve_dns_detailed(host):
+        return ["52.216.1.1"], "RESOLVED"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+
+    client = httpx.AsyncClient()
+    try:
+        out = await main.verify_takeover(
+            _result(cname="bucket.s3.amazonaws.com"),
+            client,
+            asyncio.Semaphore(5),
+        )
+    finally:
+        await client.aclose()
+
+    assert out["verdict"] == "NOT_VULNERABLE"
+
+
+# ---------------------------------------------------------------------------
+# (d) SSRF regression: target resolves to a private IP -> no probe, INCONCLUSIVE
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_private_ip_target_never_probed(monkeypatch):
+    probe_called = {"n": 0}
+
+    def _route(request):
+        probe_called["n"] += 1
+        return httpx.Response(200, text="should-not-happen")
+
+    respx.route().mock(side_effect=_route)
+
+    async def fake_resolve_dns_detailed(host):
+        # Target resolves ONLY to private/metadata addresses.
+        return ["127.0.0.1", "169.254.169.254"], "RESOLVED"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+
+    client = httpx.AsyncClient()
+    try:
+        out = await main.verify_takeover(
+            _result(cname="bucket.s3.amazonaws.com"),
+            client,
+            asyncio.Semaphore(5),
+        )
+    finally:
+        await client.aclose()
+
+    assert probe_called["n"] == 0
+    assert out["verdict"] == "INCONCLUSIVE"
+    assert "ssrf" in out["evidence"].lower()
+
+
+# ---------------------------------------------------------------------------
+# verify_takeover never raises: a resolver blowing up yields INCONCLUSIVE.
+# ---------------------------------------------------------------------------
+async def test_verify_never_raises(monkeypatch):
+    async def boom(host):
+        raise RuntimeError("resolver exploded")
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", boom)
+
+    out = await main.verify_takeover(
+        _result(cname="bucket.s3.amazonaws.com"),
+        None,
+        asyncio.Semaphore(5),
+    )
+    assert out["verdict"] == "INCONCLUSIVE"
+
+
+# Non-flagged risk gets an empty verdict without any resolution/probe.
+async def test_non_flagged_risk_empty_verdict():
+    out = await main.verify_takeover(
+        _result(risk="LOW", cname="bucket.s3.amazonaws.com"),
+        None,
+        asyncio.Semaphore(5),
+    )
+    assert out == {"verdict": "", "evidence": ""}
+
+
+# ---------------------------------------------------------------------------
+# (e) via analyze_subdomain: a non-flagged subdomain gets empty verdict/evidence
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_analyze_subdomain_non_flagged_empty_verdict(monkeypatch):
+    respx.route().mock(return_value=httpx.Response(200, text="welcome"))
+
+    async def fake_resolve_dns_detailed(host):
+        return ["93.184.216.34"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return []
+
+    async def fake_resolve_cname(host):
+        return None
+
+    async def fake_check_http(client, host):
+        return 200, 200, "welcome"
+
+    async def fake_resolve_ptrs(ips):
+        return []
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+
+    client = httpx.AsyncClient()
+    try:
+        res = await main.analyze_subdomain(
+            client, "www.example.com", ["crt.sh"], asyncio.Semaphore(5)
+        )
+    finally:
+        await client.aclose()
+
+    assert res["takeover_risk"] == "NONE"
+    assert res["takeover_verdict"] == ""
+    assert res["takeover_evidence"] == ""
+
+
+# A flagged (VERIFY) subdomain through analyze_subdomain gets a verdict set.
+@respx.mock
+async def test_analyze_subdomain_flagged_gets_verdict(monkeypatch):
+    # Dangling S3 CNAME: the subdomain probe is skipped (no public A record),
+    # check_takeover returns VERIFY, then verify_takeover confirms VULNERABLE.
+    respx.route().mock(
+        return_value=httpx.Response(404, text="<Error><Code>NoSuchBucket</Code></Error>")
+    )
+
+    async def fake_resolve_dns_detailed(host):
+        # The subdomain itself has no A record (CNAME-only); the S3 target
+        # resolves to a public IP so the verification probe runs.
+        if host.endswith("s3.amazonaws.com"):
+            return ["52.216.1.1"], "RESOLVED"
+        return [], "NO_ANSWER"
+
+    async def fake_resolve_cname_chain(host):
+        return ["bucket.s3.amazonaws.com"]
+
+    async def fake_resolve_cname(host):
+        return "bucket.s3.amazonaws.com"
+
+    async def fake_check_http(client, host):
+        return None, 404, "<Error><Code>NoSuchBucket</Code></Error>"
+
+    async def fake_resolve_ptrs(ips):
+        return []
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+
+    client = httpx.AsyncClient()
+    try:
+        res = await main.analyze_subdomain(
+            client, "svc.example.com", ["crt.sh"], asyncio.Semaphore(5)
+        )
+    finally:
+        await client.aclose()
+
+    # The S3 NoSuchBucket body makes check_takeover return HIGH directly, and
+    # the active pass then confirms the VULNERABLE verdict.
+    # The S3 NoSuchBucket body makes check_takeover return HIGH directly, and
+    # the active pass then confirms the VULNERABLE verdict.
+    assert res["takeover_verdict"] == "VULNERABLE"
+    assert res["takeover_risk"] == "HIGH"
+    assert "nosuchbucket" in res["takeover_evidence"].lower()
+
+
+# A VERIFY-tier row promoted to HIGH when the active pass confirms VULNERABLE.
+async def test_analyze_subdomain_verify_promoted_to_high(monkeypatch):
+    async def fake_resolve_dns_detailed(host):
+        # Subdomain resolves to a public IP (so it is probed), and the S3 target
+        # also resolves to a public IP (so the verification pass probes it).
+        return ["52.216.1.1"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return ["bucket.s3.amazonaws.com"]
+
+    async def fake_resolve_cname(host):
+        return "bucket.s3.amazonaws.com"
+
+    async def fake_resolve_ptrs(ips):
+        return []
+
+    async def fake_check_http(client, host):
+        # Subdomain probe: 503 with no body -> no fingerprint -> VERIFY tier.
+        # Target (S3) probe: NoSuchBucket -> VULNERABLE in the verify pass.
+        if host.endswith("s3.amazonaws.com"):
+            return None, 404, "<Error><Code>NoSuchBucket</Code></Error>"
+        return 503, None, ""
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+
+    res = await main.analyze_subdomain(
+        None, "svc.example.com", ["crt.sh"], asyncio.Semaphore(5)
+    )
+
+    # check_takeover returns VERIFY (503, no fingerprint); the active pass then
+    # confirms VULNERABLE and promotes the row VERIFY -> HIGH.
+    assert res["takeover_verdict"] == "VULNERABLE"
+    assert res["takeover_risk"] == "HIGH"
+    assert "promoted" in res["takeover_evidence"].lower()

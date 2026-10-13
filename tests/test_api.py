@@ -42,6 +42,8 @@ def client(monkeypatch):
                 takeover_risk="HIGH",
                 takeover_service="GitHub Pages",
                 takeover_detail="fingerprint matched",
+                takeover_verdict="VULNERABLE",
+                takeover_evidence="GitHub Pages 'no site here' signature",
                 resolved=True,
                 alive=True,
                 dns_status="RESOLVED",
@@ -97,11 +99,18 @@ def test_download_csv_header(client):
     reader = csv.reader(io.StringIO(resp.text))
     header = next(reader)
     assert header == main.CSV_COLUMNS
-    # 12-column contract: dns_status is the final column.
-    assert header[-1] == "dns_status"
-    assert len(header) == 12
+    # First 12 columns are the fixed backward-compatible contract; dns_status
+    # stays at index 11. The active-verification columns are appended after it.
+    assert header[11] == "dns_status"
+    assert header[12] == "takeover_verdict"
+    assert header[13] == "takeover_evidence"
+    # FEAT-001 grows the header to 14; FEAT-002 (dns_records) bumps it to 15.
+    assert len(header) == 14
     first = next(reader)
     assert first[0] == "a.example.com"
     assert "1.2.3.4" in first[1]
     # dns_status value lands in the 12th cell.
     assert first[11] == "RESOLVED"
+    # Appended verification cells.
+    assert first[12] == "VULNERABLE"
+    assert first[13] == "GitHub Pages 'no site here' signature"

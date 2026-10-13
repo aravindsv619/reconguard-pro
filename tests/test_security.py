@@ -263,6 +263,8 @@ def test_csv_download_neutralizes_injection(monkeypatch):
             takeover_risk="NONE",
             takeover_service=None,
             takeover_detail="-dangerous detail",
+            takeover_verdict="=cmdverdict",
+            takeover_evidence="@evidence",
             resolved=True,
             alive=True,
             dns_status="=cmd",
@@ -277,14 +279,18 @@ def test_csv_download_neutralizes_injection(monkeypatch):
 
     reader = csv.reader(io.StringIO(resp.text))
     header = next(reader)
-    assert header == main.CSV_COLUMNS  # column contract (now 12 columns)
-    assert header[-1] == "dns_status"
+    assert header == main.CSV_COLUMNS  # column contract
+    # First 12 columns are the fixed backward-compatible contract; dns_status
+    # stays at index 11 with the verification columns appended after it.
+    assert header[11] == "dns_status"
     row = next(reader)
     assert row[0].startswith("'")  # subdomain
     assert row[2].startswith("'")  # cname
     assert row[5].startswith("'")  # sources
     assert row[10].startswith("'")  # takeover_detail
     assert row[11].startswith("'")  # dns_status neutralized (12th column)
+    assert row[12].startswith("'")  # takeover_verdict neutralized
+    assert row[13].startswith("'")  # takeover_evidence neutralized
 
 
 def test_csv_filename_has_no_crlf(monkeypatch):

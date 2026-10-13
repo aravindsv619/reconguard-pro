@@ -156,6 +156,10 @@
           <div class="text-3xl font-bold text-emerald-400" id="cardAlive">0</div>
           <div class="text-xs text-gray-400 mt-1">Resolved &amp; Alive</div>
         </div>
+        <div class="bg-gray-900 border border-red-600/40 rounded-xl p-4">
+          <div class="text-3xl font-bold text-red-500" id="cardVulnerable">0</div>
+          <div class="text-xs text-gray-400 mt-1">Vulnerable (confirmed)</div>
+        </div>
         <div class="bg-gray-900 border border-red-500/30 rounded-xl p-4">
           <div class="text-3xl font-bold text-red-400" id="cardHigh">0</div>
           <div class="text-xs text-gray-400 mt-1">HIGH Risk</div>
@@ -191,6 +195,7 @@
       <div class="flex flex-wrap items-center gap-2 mb-4">
         <div class="flex flex-wrap gap-2" id="filterBtns">
           <button data-filter="all" class="filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm">All</button>
+          <button data-filter="vulnerable" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Vulnerable</button>
           <button data-filter="alive" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Alive Only</button>
           <button data-filter="high" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">HIGH Risk</button>
           <button data-filter="verify" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Verify</button>
@@ -220,6 +225,7 @@
               <th class="sortable py-3 px-3" onclick="sortResults('https_status')">HTTPS</th>
               <th class="py-3 px-3">Sources</th>
               <th class="sortable py-3 px-3" onclick="sortResults('takeover_risk')">Risk</th>
+              <th class="py-3 px-3">Verdict</th>
               <th class="sortable py-3 px-3" onclick="sortResults('alive')">Live</th>
             </tr>
           </thead>
@@ -410,6 +416,7 @@
 
       document.getElementById('cardTotal').textContent = data.total;
       document.getElementById('cardAlive').textContent = data.alive;
+      document.getElementById('cardVulnerable').textContent = data.vulnerable || 0;
       document.getElementById('cardHigh').textContent = data.high_risk;
       document.getElementById('cardVerify').textContent = data.verify || 0;
       document.getElementById('cardMedium').textContent = data.medium_risk;
@@ -453,6 +460,7 @@
         if (search && !r.subdomain.toLowerCase().includes(search)) return false;
         switch (activeFilter) {
           case 'alive': return r.alive;
+          case 'vulnerable': return r.takeover_verdict === 'VULNERABLE';
           case 'high': return r.takeover_risk === 'HIGH';
           case 'verify': return r.takeover_risk === 'VERIFY';
           case 'medium': return r.takeover_risk === 'MEDIUM';
@@ -507,6 +515,23 @@
       return `<span class="${cls} ${text} text-xs font-semibold px-2 py-0.5 rounded">${label}</span>`;
     }
 
+    function verdictBadge(v) {
+      // Active-verification verdict. Like riskBadge, whitelist the value before
+      // it reaches innerHTML — this data derives from attacker-poisonable
+      // third-party sources, so never trust it raw. Any value outside the
+      // fixed whitelist (including '') renders blank.
+      if (v === 'VULNERABLE') {
+        return `<span class="bg-red-600 text-white text-xs font-semibold px-2 py-0.5 rounded">Vulnerable</span>`;
+      }
+      if (v === 'NOT_VULNERABLE') {
+        return `<span class="bg-emerald-600 text-white text-xs font-semibold px-2 py-0.5 rounded">Not vulnerable</span>`;
+      }
+      if (v === 'INCONCLUSIVE') {
+        return `<span class="bg-gray-600 text-white text-xs font-semibold px-2 py-0.5 rounded">Inconclusive</span>`;
+      }
+      return '';
+    }
+
     function statusCell(v) {
       // Coerce HTTP status codes to integers before injecting into the DOM so
       // only a number (or an em dash) can ever reach innerHTML.
@@ -546,6 +571,9 @@
           ? '<span class="text-green-400">●</span>'
           : '<span class="text-gray-600">●</span>';
         const title = r.takeover_detail ? ` title="${escapeHtml(r.takeover_detail)}"` : '';
+        // Verdict evidence surfaced on hover, escapeHtml-ed so hostile evidence
+        // text stays inert (never innerHTML of raw server data).
+        const verdictTitle = r.takeover_evidence ? ` title="${escapeHtml(r.takeover_evidence)}"` : '';
         // Full CNAME chain (additive JSON from the backend) is surfaced as a
         // title attribute, joined with ' -> ' and escapeHtml-ed so hostile
         // chain entries stay inert; the cell text keeps the single-cname value.
@@ -560,6 +588,7 @@
           <td class="py-2 px-3">${statusCell(r.https_status)}</td>
           <td class="py-2 px-3 text-gray-500 text-xs">${escapeHtml((r.sources||[]).join(', '))}${sourceChips(r.sources)}</td>
           <td class="py-2 px-3"${title}>${riskBadge(r.takeover_risk)}</td>
+          <td class="py-2 px-3"${verdictTitle}>${verdictBadge(r.takeover_verdict)}</td>
           <td class="py-2 px-3 text-center">${dot}</td>
         </tr>`;
       }).join('');
