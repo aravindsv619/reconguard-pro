@@ -48,6 +48,7 @@ def client(monkeypatch):
                 alive=True,
                 dns_status="RESOLVED",
                 cname_chain=["a.github.io"],
+                dns_records={"A": ["1.2.3.4"], "CNAME": ["a.github.io"]},
             )
         ]
 
@@ -104,8 +105,25 @@ def test_download_csv_header(client):
     assert header[11] == "dns_status"
     assert header[12] == "takeover_verdict"
     assert header[13] == "takeover_evidence"
-    # FEAT-001 grows the header to 14; FEAT-002 (dns_records) bumps it to 15.
-    assert len(header) == 14
+    assert header[14] == "dns_records"
+    # Full 15-column header: FEAT-001 added verdict/evidence (12/13) and
+    # FEAT-002 appends dns_records at index 14 (the last column).
+    assert len(header) == 15
+    # The first 12 columns are the fixed backward-compatible contract.
+    assert header[:12] == [
+        "subdomain",
+        "ip_addresses",
+        "cname",
+        "http_status",
+        "https_status",
+        "sources",
+        "resolved",
+        "alive",
+        "takeover_risk",
+        "takeover_service",
+        "takeover_detail",
+        "dns_status",
+    ]
     first = next(reader)
     assert first[0] == "a.example.com"
     assert "1.2.3.4" in first[1]
@@ -114,3 +132,6 @@ def test_download_csv_header(client):
     # Appended verification cells.
     assert first[12] == "VULNERABLE"
     assert first[13] == "GitHub Pages 'no site here' signature"
+    # dns_records compact serialization in the trailing cell.
+    assert first[14].startswith("A=1.2.3.4")
+    assert "CNAME=a.github.io" in first[14]

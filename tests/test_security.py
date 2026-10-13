@@ -269,6 +269,9 @@ def test_csv_download_neutralizes_injection(monkeypatch):
             alive=True,
             dns_status="=cmd",
             cname_chain=["+evil.github.io"],
+            # A record-type key beginning with a formula trigger makes the
+            # serialized dns_records cell start with '=', exercising _csv_safe.
+            dns_records={"=EVIL": ["payload"]},
         )
     ]
     main.JOBS["csvjob"] = job
@@ -291,6 +294,7 @@ def test_csv_download_neutralizes_injection(monkeypatch):
     assert row[11].startswith("'")  # dns_status neutralized (12th column)
     assert row[12].startswith("'")  # takeover_verdict neutralized
     assert row[13].startswith("'")  # takeover_evidence neutralized
+    assert row[14].startswith("'")  # dns_records cell neutralized (15th column)
 
 
 def test_csv_filename_has_no_crlf(monkeypatch):

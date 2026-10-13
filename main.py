@@ -468,6 +468,10 @@ class SubdomainResult(TypedDict):
     alive: bool
     dns_status: str  # RESOLVED | NXDOMAIN | NO_ANSWER | SERVFAIL | TIMEOUT | ERROR
     cname_chain: list[str]
+    # Additive (FEAT-002): ALL DNS records keyed by type (A/AAAA/CNAME/MX/NS/
+    # TXT/SOA). Does NOT change ip_addresses/cname/cname_chain. {} when the host
+    # is invalid or resolution failed.
+    dns_records: dict
 
 
 @dataclass
@@ -779,6 +783,11 @@ async def resolve_dns(host: str) -> list[str]:
     return ips
 
 
+# Record types enumerated for the per-subdomain DNS records listing (FEAT-002).
+# Order is the display/serialization order used in the CSV cell and UI panel.
+DNS_RECORD_TYPES = ["A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA"]
+
+
 # dns_status vocabulary and the risk-ordering note live together here:
 # dns_status in {RESOLVED, NXDOMAIN, NO_ANSWER, SERVFAIL, TIMEOUT, ERROR}.
 # Risk ordering used across the app: HIGH > VERIFY > MEDIUM > LOW > NONE
@@ -1014,6 +1023,103 @@ async def resolve_cname_chain(host: str) -> list[str]:
         return await loop.run_in_executor(None, _resolve_cname_chain_sync, host)
     except Exception:  # noqa: BLE001
         return []
+
+
+def _dig_records(host: str) -> dict[str, list[str]]:
+    """Return all DNS records for ``host`` keyed by record type (FEAT-002).
+
+    For every type in ``DNS_RECORD_TYPES`` a ``dig +short <TYPE> <host>`` query
+    is run and its answer lines are parsed into a list. Only types that
+    produced at least one answer appear in the returned dict (purely additive;
+    never changes ip_addresses/cname/cname_chain).
+
+    Security: the subprocess is invoked with an argument LIST (never a shell
+    string, never ``shell=True``) and ``host`` is gated by
+    ``is_valid_hostname`` here (returns {} for invalid hosts) with a hard 5s
+    timeout per query.
+
+    dig-absent fallback: on ``FileNotFoundError`` the stdlib resolver fills A/
+    AAAA (socket.getaddrinfo) and CNAME (_socket_cname); MX/NS/TXT/SOA are left
+    empty (documented stdlib limitation). This function never raises — on any
+    other exception it returns whatever was gathered so far.
+    """
+    if not is_valid_hostname(host):
+        return {}
+
+    records: dict[str, list[str]] = {}
+    try:
+        for rtype in DNS_RECORD_TYPES:
+            try:
+                out = subprocess.run(
+                    ["dig", "+short", rtype, host],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except FileNotFoundError:
+                # dig not installed — stdlib fallback for the types it can do.
+                return _socket_records(host)
+            except subprocess.TimeoutExpired:
+                continue
+            values: list[str] = []
+            for line in (out.stdout or "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                # CNAME/NS/SOA/MX targets are hostnames with a trailing dot;
+                # strip it for a clean display. A/AAAA/TXT are left as-is
+                # (except the trailing dot which never appears on them).
+                cleaned = line.rstrip(".") if rtype != "TXT" else line
+                if cleaned and cleaned not in values:
+                    values.append(cleaned)
+            if values:
+                records[rtype] = values
+    except Exception:  # noqa: BLE001 — never raise; return partial results.
+        return records
+    return records
+
+
+def _socket_records(host: str) -> dict[str, list[str]]:
+    """stdlib fallback for _dig_records: A/AAAA via getaddrinfo, CNAME via
+    _socket_cname. MX/NS/TXT/SOA are unavailable without a resolver library and
+    are therefore omitted (documented limitation)."""
+    records: dict[str, list[str]] = {}
+    a: list[str] = []
+    aaaa: list[str] = []
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for info in infos:
+            family = info[0]
+            addr = info[4][0]
+            if family == socket.AF_INET6:
+                if addr not in aaaa:
+                    aaaa.append(addr)
+            else:
+                if addr not in a:
+                    a.append(addr)
+    except Exception:  # noqa: BLE001
+        pass
+    if a:
+        records["A"] = a
+    if aaaa:
+        records["AAAA"] = aaaa
+    try:
+        cname = _socket_cname(host)
+    except Exception:  # noqa: BLE001
+        cname = None
+    if cname:
+        records["CNAME"] = [cname]
+    return records
+
+
+async def resolve_dns_records(host: str) -> dict[str, list[str]]:
+    """Async wrapper around _dig_records, running the blocking subprocess work
+    off the event loop. Returns {} on any error (never raises)."""
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _dig_records, host)
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 async def check_http(client: httpx.AsyncClient, host: str) -> tuple[Optional[int], Optional[int], str]:
@@ -1530,12 +1636,16 @@ async def analyze_subdomain(
             alive=False,
             dns_status="ERROR",
             cname_chain=[],
+            dns_records={},
         )
 
     async with sem:
         ip_addresses, dns_status = await resolve_dns_detailed(sub)
         cname_chain = await resolve_cname_chain(sub)
         cname = cname_chain[0] if cname_chain else await resolve_cname(sub)
+        # Additive (FEAT-002): enumerate ALL DNS record types for this host,
+        # reusing the SAME semaphore-bound block (no new concurrency).
+        dns_records = await resolve_dns_records(sub)
         # SSRF guard: never probe a host that resolves to a private/internal/
         # loopback/link-local/metadata address. If the host resolved to IP(s)
         # but none are public, skip the HTTP probe entirely (status stays None,
@@ -1586,6 +1696,7 @@ async def analyze_subdomain(
                 alive=alive,
                 dns_status=dns_status,
                 cname_chain=cname_chain,
+                dns_records=dns_records,
             ),
             probe_client,
             sem,
@@ -1616,6 +1727,7 @@ async def analyze_subdomain(
         alive=alive,
         dns_status=dns_status,
         cname_chain=cname_chain,
+        dns_records=dns_records,
     )
 
 
@@ -2023,6 +2135,28 @@ async def job_results(job_id: str):
     }
 
 
+def _dns_records_to_cell(records: dict) -> str:
+    """Serialize a dns_records dict into one compact CSV-safe line (FEAT-002).
+
+    Values within a record type are joined by ',' and types by ';', in
+    DNS_RECORD_TYPES order, e.g. ``A=1.2.3.4;MX=10 mail.x;NS=ns1.x,ns2.x``.
+    The ';' type-delimiter keeps the whole thing inside a single comma-CSV
+    cell. The caller passes the result through _csv_safe. Returns '' for an
+    empty/missing dict.
+    """
+    if not records:
+        return ""
+    parts: list[str] = []
+    ordered = DNS_RECORD_TYPES + [t for t in records if t not in DNS_RECORD_TYPES]
+    for rtype in ordered:
+        values = records.get(rtype)
+        if not values:
+            continue
+        joined = ",".join(str(v) for v in values)
+        parts.append(f"{rtype}={joined}")
+    return ";".join(parts)
+
+
 CSV_COLUMNS = [
     "subdomain",
     "ip_addresses",
@@ -2038,6 +2172,7 @@ CSV_COLUMNS = [
     "dns_status",
     "takeover_verdict",
     "takeover_evidence",
+    "dns_records",
 ]
 
 
@@ -2073,6 +2208,7 @@ async def download_csv(job_id: str):
             _csv_safe(r["dns_status"]),
             _csv_safe(r.get("takeover_verdict", "")),
             _csv_safe(r.get("takeover_evidence", "")),
+            _csv_safe(_dns_records_to_cell(r.get("dns_records", {}))),
         ])
     buffer.seek(0)
     # Sanitize the filename so no CRLF/quote can break the Content-Disposition
