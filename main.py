@@ -2591,13 +2591,19 @@ app.add_middleware(
 
 @app.middleware("http")
 async def security_headers_middleware(request: Request, call_next):
-    """Attach hardening headers to EVERY response (A05/A08).
+    """Attach hardening headers to every handled response (A05/A08).
 
-    Applies to API, static-file, and error responses alike: nosniff defeats
-    content-type sniffing, DENY blocks framing/clickjacking, no-referrer stops
-    referrer leakage, and SECURITY_CSP constrains resource origins. Headers are
-    set via setdefault so a response that already specified one is not
-    overridden.
+    Applies to API, static-file, and handled-error responses (404/422/429)
+    alike: nosniff defeats content-type sniffing, DENY blocks
+    framing/clickjacking, no-referrer stops referrer leakage, and SECURITY_CSP
+    constrains resource origins. Headers are set via setdefault so a response
+    that already specified one is not overridden.
+
+    Note: this ``@app.middleware("http")`` runs *inside* Starlette's
+    ServerErrorMiddleware, so a genuinely-unhandled 500 is produced above this
+    layer and does not carry these headers. That path returns only a static
+    ``{"detail": "Internal Server Error"}`` JSON body with no reflected or
+    sniffable content, so the practical risk is negligible.
     """
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")

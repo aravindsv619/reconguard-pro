@@ -383,9 +383,9 @@ are capped to limit resource exhaustion.
 
 ### Security headers and Content-Security-Policy
 
-Every HTTP response (API, static, and error) carries `X-Content-Type-Options:
-nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and a strict
-`Content-Security-Policy`:
+Every handled HTTP response (API, static, and handled errors — 404/422/429)
+carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+`Referrer-Policy: no-referrer`, and a strict `Content-Security-Policy`:
 
 ```
 default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
