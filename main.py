@@ -445,6 +445,38 @@ def _match_cloud_resource(target: Optional[str]) -> Optional[str]:
     return None
 
 
+def _recommended_action(risk: str, verdict: str, service: Optional[str]) -> str:
+    """Return a short, concrete next step for a flagged subdomain.
+
+    Derived purely from the post-verify risk/verdict/service so a flagged row
+    (VERIFY/HIGH) ALWAYS has an actionable next step — never a dead end, even
+    for an INCONCLUSIVE verdict. Returns '' for non-flagged rows.
+    """
+    svc = f" ({service})" if service else ""
+    if verdict == VERDICT_VULNERABLE:
+        return (
+            f"Takeover confirmed{svc}: remove the dangling DNS record or reclaim "
+            "the resource immediately."
+        )
+    if verdict == VERDICT_NOT_VULNERABLE:
+        return (
+            f"No takeover detected{svc}; the target appears owned. Remove the "
+            "record only if the service is intentionally decommissioned."
+        )
+    if verdict == VERDICT_INCONCLUSIVE:
+        return (
+            f"Inconclusive{svc}: manually verify resource ownership in the "
+            "provider console and remove the record if it is dangling."
+        )
+    # Flagged (VERIFY/HIGH) but no verdict text yet — still give a next step.
+    if risk in ("VERIFY", "HIGH"):
+        return (
+            f"Investigate and verify resource ownership urgently{svc}; confirm "
+            "whether the CNAME target is claimable."
+        )
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Typing
 # ---------------------------------------------------------------------------
@@ -472,6 +504,11 @@ class SubdomainResult(TypedDict):
     # TXT/SOA). Does NOT change ip_addresses/cname/cname_chain. {} when the host
     # is invalid or resolution failed.
     dns_records: dict
+    # Additive (PART 4): a concrete next step derived from the final
+    # risk + verdict + service, so a flagged row is never a dead end (always
+    # populated for VERIFY/HIGH rows, including INCONCLUSIVE verdicts). Empty
+    # for non-flagged rows.
+    recommended_action: str
 
 
 @dataclass
@@ -534,16 +571,96 @@ async def _get(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
 async def query_crtsh(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
     out: set[str] = set()
     try:
-        resp = await _get(client, f"https://crt.sh/?q=%25.{domain}&output=json")
-        data = resp.json()
-        for entry in data:
-            name_value = entry.get("name_value", "")
+        # crt.sh occasionally returns an empty body or an HTML error page
+        # instead of JSON under load; retry ONCE on empty/non-JSON before
+        # giving up. Parse BOTH name_value (newline-delimited SAN list) AND
+        # common_name from EVERY entry so the discovery is exhaustive.
+        data = None
+        for attempt in range(2):
+            resp = await _get(client, f"https://crt.sh/?q=%25.{domain}&output=json")
+            try:
+                parsed = resp.json()
+            except Exception:  # noqa: BLE001 — empty body / HTML error page
+                parsed = None
+            if parsed:
+                data = parsed
+                break
+        for entry in data or []:
+            if not isinstance(entry, dict):
+                continue
+            name_value = entry.get("name_value", "") or ""
             for name in name_value.split("\n"):
                 norm = _normalize_host(name, domain)
                 if norm:
                     out.add(norm)
+            norm_cn = _normalize_host(entry.get("common_name", "") or "", domain)
+            if norm_cn:
+                out.add(norm_cn)
     except Exception as exc:  # noqa: BLE001
         logger.debug("crtsh failed: %s", exc)
+    return out
+
+
+async def query_certspotter(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
+    """SSLMate Cert Spotter issuances (KEYLESS, lower rate limit, no key).
+
+    Parses the v1 issuances JSON array; each issuance object carries a
+    ``dns_names`` list of covered hostnames. Content was rephrased for
+    compliance with licensing restrictions.
+    """
+    out: set[str] = set()
+    try:
+        resp = await _get(
+            client,
+            "https://api.certspotter.com/v1/issuances"
+            f"?domain={domain}&include_subdomains=true&expand=dns_names",
+        )
+        data = resp.json()
+        if isinstance(data, list):
+            for entry in data:
+                if not isinstance(entry, dict):
+                    continue
+                for name in entry.get("dns_names", []) or []:
+                    norm = _normalize_host(name, domain)
+                    if norm:
+                        out.add(norm)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("certspotter failed: %s", exc)
+    return out
+
+
+async def query_threatminer(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
+    """ThreatMiner passive-DNS subdomains (KEYLESS). rt=5 returns subdomains."""
+    out: set[str] = set()
+    try:
+        resp = await _get(
+            client,
+            f"https://api.threatminer.org/v2/domain.php?q={domain}&rt=5",
+        )
+        data = resp.json()
+        if isinstance(data, dict):
+            for host in data.get("results", []) or []:
+                norm = _normalize_host(str(host), domain)
+                if norm:
+                    out.add(norm)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("threatminer failed: %s", exc)
+    return out
+
+
+async def query_subdomaincenter(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
+    """subdomain.center passive discovery (KEYLESS). Returns a JSON array."""
+    out: set[str] = set()
+    try:
+        resp = await _get(client, f"https://api.subdomain.center/?domain={domain}")
+        data = resp.json()
+        if isinstance(data, list):
+            for host in data:
+                norm = _normalize_host(str(host), domain)
+                if norm:
+                    out.add(norm)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("subdomaincenter failed: %s", exc)
     return out
 
 
@@ -764,6 +881,10 @@ SOURCES = {
     "Wayback": query_wayback,
     "Anubis": query_anubis,
     "BufferOver": query_bufferover,
+    # New keyless sources (always run, no key/toggle).
+    "CertSpotter": query_certspotter,
+    "ThreatMiner": query_threatminer,
+    "SubdomainCenter": query_subdomaincenter,
     "SecurityTrails": query_securitytrails,
     "Shodan": query_shodan,
     "c99": query_c99,
@@ -1318,12 +1439,17 @@ async def verify_takeover(
         cname = result.get("cname")
         final_target = chain[-1] if chain else cname
         provider = _match_cloud_resource(final_target)
-        target_display = (final_target or "").strip().rstrip(".").lower()
+        # Strip the trailing dot (and whitespace) ONCE up front and resolve/
+        # probe the clean name. A trailing-dotted CNAME target (e.g.
+        # "...elb.amazonaws.com.") otherwise fails resolution and never maps to
+        # RESOLVED — the ELB-verdict bug. _match_cloud_resource already strips.
+        final_target_norm = (final_target or "").strip().rstrip(".")
+        target_display = final_target_norm.lower()
 
         # Resolve the TARGET's own DNS (NXDOMAIN-of-target is the key signal
         # for user-chosen-name providers).
-        if final_target:
-            target_ips, target_dns_status = await resolve_dns_detailed(final_target)
+        if final_target_norm:
+            target_ips, target_dns_status = await resolve_dns_detailed(final_target_norm)
         else:
             target_ips, target_dns_status = [], "ERROR"
 
@@ -1344,7 +1470,7 @@ async def verify_takeover(
             return {
                 "verdict": VERDICT_INCONCLUSIVE,
                 "evidence": (
-                    f"Probe of target {target_display or final_target} skipped by "
+                    f"Probe of target {target_display or final_target_norm} skipped by "
                     "the SSRF guard (target resolves only to private/internal/"
                     "metadata addresses); cannot confirm takeover remotely."
                 ),
@@ -1352,10 +1478,10 @@ async def verify_takeover(
 
         # Probe the target endpoint, bounded by the shared semaphore. CNAME-only
         # targets (no A/AAAA) are still probed; httpx re-resolves at connect.
-        if final_target:
+        if final_target_norm:
             async with sem:
                 http_status, https_status, body = await asyncio.wait_for(
-                    check_http(probe_client, final_target),
+                    check_http(probe_client, final_target_norm),
                     timeout=VERIFY_HTTP_TIMEOUT,
                 )
             probed = True
@@ -1363,7 +1489,7 @@ async def verify_takeover(
         body_lower = (body or "").lower()
         status = http_status if http_status is not None else https_status
         obs = (
-            f"target={target_display or final_target}, "
+            f"target={target_display or final_target_norm}, "
             f"dns={target_dns_status}, "
             f"http_status={http_status}, https_status={https_status}"
         )
@@ -1432,25 +1558,68 @@ async def verify_takeover(
             }
 
         if provider == "AWS CloudFront":
-            if (
-                "bad request" in body_lower
-                or "the request could not be satisfied" in body_lower
-                or status in (403, 404)
-            ):
+            # Active no-distribution detection. CloudFront serves a distinctive
+            # error page ("The request could not be satisfied") when the CNAME
+            # points at *.cloudfront.net but NO distribution claims that alias —
+            # the dangling alias is then attacker-claimable. check_http discards
+            # response headers, so we detect from the BODY signature + status
+            # (the X-Cache/Via header path is intentionally not plumbed here).
+            no_distribution_sig = (
+                "the request could not be satisfied" in body_lower
+                or (
+                    "bad request" in body_lower
+                    and status in (400, 403, 404)
+                )
+            )
+            if not probed:
                 return {
                     "verdict": VERDICT_INCONCLUSIVE,
                     "evidence": (
-                        "AWS CloudFront returned a Bad Request / 'request could not "
-                        "be satisfied' error. A CloudFront distribution domain is "
-                        "not freely attacker-choosable, so this is not a confirmed "
-                        f"takeover — verify the distribution in AWS ({obs})."
+                        "AWS CloudFront target could not be probed (no final "
+                        "target) — manually verify the distribution in the AWS "
+                        f"CloudFront console ({obs})."
                     ),
                 }
+            if no_distribution_sig:
+                return {
+                    "verdict": VERDICT_VULNERABLE,
+                    "evidence": (
+                        f"AWS CloudFront no-distribution signature observed "
+                        f"(status={status}, body: 'The request could not be "
+                        "satisfied'). The CNAME points at a *.cloudfront.net alias "
+                        "that no distribution claims — an attacker can create a "
+                        "CloudFront distribution with this alias and take it over. "
+                        "Recommended action: remove the dangling CNAME or claim "
+                        f"the alias on an owned distribution immediately ({obs})."
+                    ),
+                }
+            if status in (200, 301, 302):
+                return {
+                    "verdict": VERDICT_NOT_VULNERABLE,
+                    "evidence": (
+                        "AWS CloudFront target served a healthy response "
+                        f"(status={status}) — the distribution exists and is "
+                        f"owned ({obs})."
+                    ),
+                }
+            if status is None:
+                return {
+                    "verdict": VERDICT_INCONCLUSIVE,
+                    "evidence": (
+                        "AWS CloudFront probe timed out / was blocked with no "
+                        "status. Recommended action: manually verify the "
+                        f"distribution alias in the AWS CloudFront console ({obs})."
+                    ),
+                }
+            # A bare 403/404 (or other app error) WITHOUT the no-distribution
+            # signature is NOT a takeover — do not false-positive.
             return {
                 "verdict": VERDICT_INCONCLUSIVE,
                 "evidence": (
-                    "AWS CloudFront target gave no decisive signal; CloudFront "
-                    f"domains are not attacker-claimable — confirm in AWS ({obs})."
+                    f"AWS CloudFront returned status={status} without the "
+                    "no-distribution signature — not a confirmed takeover. "
+                    "Recommended action: manually verify the distribution in the "
+                    f"AWS CloudFront console ({obs})."
                 ),
             }
 
@@ -1637,6 +1806,7 @@ async def analyze_subdomain(
             dns_status="ERROR",
             cname_chain=[],
             dns_records={},
+            recommended_action="",
         )
 
     async with sem:
@@ -1697,6 +1867,7 @@ async def analyze_subdomain(
                 dns_status=dns_status,
                 cname_chain=cname_chain,
                 dns_records=dns_records,
+                recommended_action="",
             ),
             probe_client,
             sem,
@@ -1728,6 +1899,7 @@ async def analyze_subdomain(
         dns_status=dns_status,
         cname_chain=cname_chain,
         dns_records=dns_records,
+        recommended_action=_recommended_action(risk, takeover_verdict, service),
     )
 
 
@@ -2173,6 +2345,8 @@ CSV_COLUMNS = [
     "takeover_verdict",
     "takeover_evidence",
     "dns_records",
+    # PART 4: appended LAST (16th) — columns 1-15 above are unchanged.
+    "recommended_action",
 ]
 
 
@@ -2190,9 +2364,9 @@ async def download_csv(job_id: str):
     for r in job.results:
         # Text columns are passed through _csv_safe to neutralize spreadsheet
         # formula/injection (values from attacker-poisonable cert logs). The
-        # first 11 columns keep their exact order; dns_status is appended as
-        # the 12th (also _csv_safe'd). Numeric/bool columns (http_status,
-        # https_status, resolved, alive) pass through as-is.
+        # first 15 columns keep their exact order; recommended_action is
+        # appended LAST as the 16th (also _csv_safe'd). Numeric/bool columns
+        # (http_status, https_status, resolved, alive) pass through as-is.
         writer.writerow([
             _csv_safe(r["subdomain"]),
             _csv_safe(";".join(r["ip_addresses"])),
@@ -2209,6 +2383,7 @@ async def download_csv(job_id: str):
             _csv_safe(r.get("takeover_verdict", "")),
             _csv_safe(r.get("takeover_evidence", "")),
             _csv_safe(_dns_records_to_cell(r.get("dns_records", {}))),
+            _csv_safe(r.get("recommended_action", "")),
         ])
     buffer.seek(0)
     # Sanitize the filename so no CRLF/quote can break the Content-Disposition

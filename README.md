@@ -1,18 +1,21 @@
 # SubRecon Pro
 
 Subdomain enumeration and subdomain-takeover risk analysis in a single
-self-contained web tool. SubRecon Pro aggregates subdomains from 11 public
-passive-DNS sources, resolves and HTTP-probes each one, scores takeover risk
-against a library of service fingerprints, and lets you export everything to
-CSV — all from a dark-themed browser dashboard.
+self-contained web tool. SubRecon Pro aggregates subdomains from 12 keyless
+public passive-DNS sources (no API key needed for any of them), resolves and
+HTTP-probes each one, scores takeover risk against a library of service
+fingerprints, and lets you export everything to CSV — all from a dark-themed
+browser dashboard.
 
 > ⚠️ **For authorized security testing only. Unauthorized use is illegal.**
 > Only scan domains you own or have explicit permission to test.
 
 ## Features
 
-- Passive subdomain discovery from 11 independent public sources (no scanning
-  of the target is required for discovery).
+- Passive subdomain discovery from 12 independent **keyless** public sources
+  (no API key required for any of them), including the exhaustive crt.sh parser
+  plus CertSpotter, ThreatMiner, and SubdomainCenter (no scanning of the target
+  is required for discovery).
 - **Active DNS discovery (optional, OFF by default):** wordlist brute-forcing
   against a bundled 2,400+ label list plus altdns-style permutation generation.
   See [Active DNS discovery](#active-dns-discovery) below.
@@ -53,6 +56,9 @@ CSV — all from a dark-themed browser dashboard.
 | Wayback Machine (CDX) | no |
 | Anubis (jldc.me) | no |
 | BufferOver | no |
+| CertSpotter (SSLMate) | no |
+| ThreatMiner | no |
+| SubdomainCenter | no |
 | SecurityTrails | optional |
 | Shodan | optional |
 | c99.nl | optional (paid) |
@@ -224,20 +230,31 @@ and a verdict badge in the dashboard. The verdict is one of:
 | --- | --- |
 | `VULNERABLE` | The target shows a resource-not-found signature (or is NXDOMAIN for a user-chosen-name provider). The dangling pointer is likely claimable — **act now.** A confirmed `VULNERABLE` verdict also promotes the row's risk tier from VERIFY to HIGH. |
 | `NOT_VULNERABLE` | The target still serves content or is an AWS-assigned (non-claimable) name. The record is dangling but not takeover-able as observed. |
-| `INCONCLUSIVE` | No decisive signal (indeterminate response, CloudFront, SSRF-skipped probe, or any error). **Manual confirmation required.** |
+| `INCONCLUSIVE` | No decisive signal (indeterminate response, SSRF-skipped probe, timeout, or any error). **Manual confirmation required.** |
 
 ### Who is claimable — the ELB/CloudFront vs S3/GitHub distinction
 
 Not every cloud DNS name can be re-registered by an attacker, and the verdict
 logic treats the two groups differently:
 
-- **AWS-assigned names are NOT attacker-claimable.** Elastic Load Balancing
-  (`*.elb.amazonaws.com`) and CloudFront (`*.cloudfront.net`) DNS names are
-  issued by AWS, not chosen by the account owner, so an attacker cannot create
-  a replacement with the same name. A dangling CNAME to one of these is usually
-  a down/internal service (an ELB 503 means "no healthy targets"), not a
-  takeover. ELB therefore reports `NOT_VULNERABLE` while it still resolves, and
-  CloudFront is capped at `INCONCLUSIVE` and **never** returns `VULNERABLE`.
+- **AWS ELB names are NOT attacker-claimable.** Elastic Load Balancing
+  (`*.elb.amazonaws.com`) DNS names are issued by AWS, not chosen by the account
+  owner, so an attacker cannot create a replacement with the same name. A
+  dangling CNAME to one is usually a down/internal service (an ELB 503 means
+  "no healthy targets"), not a takeover. The verifier resolves the CNAME-chain
+  **final** target (with any trailing dot stripped before resolving, so a
+  dotted name no longer silently fails to resolve): a target that still resolves
+  reports `NOT_VULNERABLE`, and an NXDOMAIN target reports `INCONCLUSIVE`. A
+  resolution error or timeout no longer falls through to a default verdict.
+- **CloudFront now has an active no-distribution check.** When the CNAME points
+  at `*.cloudfront.net`, the verifier probes the stripped target through the
+  same SSRF guard and bounded semaphore (private IPs are never probed). If
+  CloudFront returns its no-distribution signature — a 403/404 (or `Bad
+  request`) whose body contains `The request could not be satisfied` — the alias
+  is unclaimed and attacker-registerable, so the verdict is `VULNERABLE` and the
+  risk is promoted VERIFY → HIGH. A healthy 200/301/302 is `NOT_VULNERABLE`; a
+  timeout or blocked probe is `INCONCLUSIVE`. A **bare** 403 without the
+  no-distribution signature is treated as `INCONCLUSIVE` (no false positive).
 - **User-chosen names ARE attacker-claimable.** S3 buckets, GitHub Pages,
   Heroku apps, Azure sites, Google Cloud, and Fastly services use names the
   original owner picked. If that resource is deleted the name becomes free, so
@@ -254,6 +271,17 @@ probe is **skipped** and the verdict is `INCONCLUSIVE`. The single probe is
 bounded by the same `asyncio.Semaphore` as the rest of analysis (no new
 fan-out) and uses a dedicated short timeout, and the whole verification body is
 wrapped so it can never raise — any failure degrades to `INCONCLUSIVE`.
+
+### `recommended_action`
+
+Every flagged (VERIFY/HIGH) subdomain also carries a `recommended_action`
+string derived from its final risk, verdict, and provider, so there is **always
+a concrete next step** — never a dead end, including for an `INCONCLUSIVE`
+verdict (which prompts manual ownership verification in the provider console). A
+`VULNERABLE` row recommends removing the dangling record or reclaiming the
+resource immediately. It is surfaced XSS-safe in the dashboard (the
+per-subdomain Records panel, `escapeHtml`-ed) and exported as the 16th CSV
+column (see [CSV report format](#csv-report-format)).
 
 ## DNS reporting
 
@@ -304,20 +332,21 @@ with `;` so the whole listing stays inside a single comma-CSV cell, e.g.
 
 ## CSV report format
 
-The downloaded CSV contains one row per subdomain with these 15 columns:
+The downloaded CSV contains one row per subdomain with these 16 columns:
 
 ```
 subdomain, ip_addresses, cname, http_status, https_status, sources,
 resolved, alive, takeover_risk, takeover_service, takeover_detail, dns_status,
-takeover_verdict, takeover_evidence, dns_records
+takeover_verdict, takeover_evidence, dns_records, recommended_action
 ```
 
-The first 12 columns keep their exact order and meaning (`dns_status` is the
-12th). Columns 13-15 — `takeover_verdict`, `takeover_evidence`, and
-`dns_records` — are appended at the end. List fields (`ip_addresses`,
+The first 15 columns keep their exact order and meaning (`dns_status` is the
+12th, `dns_records` the 15th). Column 16 — `recommended_action` — is appended
+LAST, after `dns_records`; the first 15 columns are unchanged (no column was
+reordered or removed). List fields (`ip_addresses`,
 `sources`) are joined with `;` so they don't collide with the CSV comma
 delimiter; `dns_records` uses its own `,`/`;` scheme (see
-[`dns_records`](#dns_records)). Every text cell, including the three new
+[`dns_records`](#dns_records)). Every text cell, including the new
 columns, passes through the spreadsheet-formula-injection neutralizer before
 export.
 

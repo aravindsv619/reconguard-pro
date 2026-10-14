@@ -78,6 +78,220 @@ async def test_elb_target_resolves_not_vulnerable(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# (a2) ELB target with a TRAILING DOT still resolves -> NOT_VULNERABLE.
+# Proves verify_takeover strips the trailing dot before resolving; a raw
+# dotted name would otherwise fail to resolve and never hit NOT_VULNERABLE.
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_elb_trailing_dot_target_resolves_not_vulnerable(monkeypatch):
+    respx.route().mock(return_value=httpx.Response(503, text="no healthy targets"))
+
+    seen = {"host": None}
+
+    async def fake_resolve_dns_detailed(host):
+        seen["host"] = host
+        # Only resolve the trailing-dot-STRIPPED name; a raw dotted name does not.
+        if host.endswith("."):
+            return [], "NXDOMAIN"
+        return ["52.1.2.3"], "RESOLVED"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+
+    client = httpx.AsyncClient()
+    try:
+        out = await main.verify_takeover(
+            _result(cname="internal-lb.us-east-1.elb.amazonaws.com."),
+            client,
+            asyncio.Semaphore(5),
+        )
+    finally:
+        await client.aclose()
+
+    assert out["verdict"] == "NOT_VULNERABLE"
+    # The resolver was called with the trailing dot stripped.
+    assert seen["host"] == "internal-lb.us-east-1.elb.amazonaws.com"
+
+
+# ---------------------------------------------------------------------------
+# (f) CloudFront no-distribution signature -> VULNERABLE
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_cloudfront_no_distribution_signature_vulnerable(monkeypatch):
+    respx.route().mock(
+        return_value=httpx.Response(403, text="ERROR: The request could not be satisfied.")
+    )
+
+    async def fake_resolve_dns_detailed(host):
+        return ["13.33.1.2"], "RESOLVED"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+
+    client = httpx.AsyncClient()
+    try:
+        out = await main.verify_takeover(
+            _result(cname="d123abc.cloudfront.net"),
+            client,
+            asyncio.Semaphore(5),
+        )
+    finally:
+        await client.aclose()
+
+    assert out["verdict"] == "VULNERABLE"
+    assert "cloudfront" in out["evidence"].lower()
+
+
+# CloudFront healthy 200 -> NOT_VULNERABLE
+@respx.mock
+async def test_cloudfront_healthy_not_vulnerable(monkeypatch):
+    respx.route().mock(return_value=httpx.Response(200, text="ok"))
+
+    async def fake_resolve_dns_detailed(host):
+        return ["13.33.1.2"], "RESOLVED"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+
+    client = httpx.AsyncClient()
+    try:
+        out = await main.verify_takeover(
+            _result(cname="d123abc.cloudfront.net"),
+            client,
+            asyncio.Semaphore(5),
+        )
+    finally:
+        await client.aclose()
+
+    assert out["verdict"] == "NOT_VULNERABLE"
+
+
+# CloudFront bare 403 WITHOUT the no-distribution signature -> INCONCLUSIVE
+# (no false positive on a plain 403).
+@respx.mock
+async def test_cloudfront_bare_403_inconclusive(monkeypatch):
+    respx.route().mock(return_value=httpx.Response(403, text="Forbidden"))
+
+    async def fake_resolve_dns_detailed(host):
+        return ["13.33.1.2"], "RESOLVED"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+
+    client = httpx.AsyncClient()
+    try:
+        out = await main.verify_takeover(
+            _result(cname="d123abc.cloudfront.net"),
+            client,
+            asyncio.Semaphore(5),
+        )
+    finally:
+        await client.aclose()
+
+    assert out["verdict"] == "INCONCLUSIVE"
+
+
+# CloudFront timeout (no status) -> INCONCLUSIVE with a recommended action.
+async def test_cloudfront_timeout_inconclusive(monkeypatch):
+    async def fake_resolve_dns_detailed(host):
+        return ["13.33.1.2"], "RESOLVED"
+
+    async def fake_check_http(client, host):
+        # Simulate a timeout: no status obtained from either scheme.
+        return None, None, ""
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+
+    out = await main.verify_takeover(
+        _result(cname="d123abc.cloudfront.net"),
+        None,
+        asyncio.Semaphore(5),
+    )
+    assert out["verdict"] == "INCONCLUSIVE"
+    assert "cloudfront" in out["evidence"].lower()
+
+
+# CloudFront VULNERABLE through analyze_subdomain promotes VERIFY -> HIGH.
+async def test_analyze_subdomain_cloudfront_promoted_to_high(monkeypatch):
+    async def fake_resolve_dns_detailed(host):
+        return ["13.33.1.2"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return ["d123abc.cloudfront.net"]
+
+    async def fake_resolve_cname(host):
+        return "d123abc.cloudfront.net"
+
+    async def fake_resolve_ptrs(ips):
+        return []
+
+    async def fake_check_http(client, host):
+        # Subdomain probe: 503 no body -> VERIFY tier. CloudFront target probe:
+        # no-distribution signature -> VULNERABLE in the verify pass.
+        if host.endswith("cloudfront.net"):
+            return 403, None, "ERROR: The request could not be satisfied."
+        return 503, None, ""
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+
+    res = await main.analyze_subdomain(
+        None, "cdn.example.com", ["crt.sh"], asyncio.Semaphore(5)
+    )
+
+    assert res["takeover_verdict"] == "VULNERABLE"
+    assert res["takeover_risk"] == "HIGH"
+    # recommended_action must be populated for a VULNERABLE row.
+    assert res["recommended_action"]
+    assert "remove" in res["recommended_action"].lower() or "reclaim" in res["recommended_action"].lower()
+
+
+# recommended_action is populated per verdict class for flagged rows.
+async def test_recommended_action_populated_per_verdict_class(monkeypatch):
+    async def fake_resolve_dns_detailed(host):
+        return ["13.33.1.2"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return ["d123abc.cloudfront.net"]
+
+    async def fake_resolve_cname(host):
+        return "d123abc.cloudfront.net"
+
+    async def fake_resolve_ptrs(ips):
+        return []
+
+    async def fake_check_http(client, host):
+        # CloudFront bare 403 (no signature) -> INCONCLUSIVE; subdomain 503 -> VERIFY.
+        if host.endswith("cloudfront.net"):
+            return 403, None, "Forbidden"
+        return 503, None, ""
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+
+    res = await main.analyze_subdomain(
+        None, "cdn.example.com", ["crt.sh"], asyncio.Semaphore(5)
+    )
+
+    # INCONCLUSIVE verdict must STILL carry a concrete next step (no dead end).
+    assert res["takeover_verdict"] == "INCONCLUSIVE"
+    assert res["recommended_action"]
+
+
+def test_recommended_action_helper_covers_every_verdict_class():
+    # Pure-helper coverage: each verdict class yields a non-empty action; a
+    # non-flagged row yields ''.
+    assert main._recommended_action("HIGH", main.VERDICT_VULNERABLE, "AWS CloudFront")
+    assert main._recommended_action("VERIFY", main.VERDICT_NOT_VULNERABLE, "AWS ELB")
+    assert main._recommended_action("VERIFY", main.VERDICT_INCONCLUSIVE, "AWS S3")
+    assert main._recommended_action("VERIFY", "", None)  # flagged, no verdict yet
+    assert main._recommended_action("NONE", "", None) == ""
+
+
+# ---------------------------------------------------------------------------
 # (b) GitHub Pages "no site here" body -> VULNERABLE
 # ---------------------------------------------------------------------------
 @respx.mock

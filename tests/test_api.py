@@ -49,6 +49,7 @@ def client(monkeypatch):
                 dns_status="RESOLVED",
                 cname_chain=["a.github.io"],
                 dns_records={"A": ["1.2.3.4"], "CNAME": ["a.github.io"]},
+                recommended_action="Takeover confirmed: remove the dangling DNS record.",
             )
         ]
 
@@ -106,9 +107,10 @@ def test_download_csv_header(client):
     assert header[12] == "takeover_verdict"
     assert header[13] == "takeover_evidence"
     assert header[14] == "dns_records"
-    # Full 15-column header: FEAT-001 added verdict/evidence (12/13) and
-    # FEAT-002 appends dns_records at index 14 (the last column).
-    assert len(header) == 15
+    # PART 4: recommended_action is appended LAST as the 16th column; the first
+    # 15 columns stay byte-for-byte in order (no reorder/removal).
+    assert header[15] == "recommended_action"
+    assert len(header) == 16
     # The first 12 columns are the fixed backward-compatible contract.
     assert header[:12] == [
         "subdomain",
@@ -132,6 +134,49 @@ def test_download_csv_header(client):
     # Appended verification cells.
     assert first[12] == "VULNERABLE"
     assert first[13] == "GitHub Pages 'no site here' signature"
-    # dns_records compact serialization in the trailing cell.
+    # dns_records compact serialization at index 14 (unchanged).
     assert first[14].startswith("A=1.2.3.4")
     assert "CNAME=a.github.io" in first[14]
+    # The 16th cell is the recommended_action, _csv_safe'd.
+    assert first[15] == "Takeover confirmed: remove the dangling DNS record."
+
+
+def test_download_csv_recommended_action_csv_safe(client, monkeypatch):
+    # A recommended_action beginning with a formula trigger is _csv_safe'd
+    # (prefixed with a single quote) in the 16th cell. (Defensive — the value
+    # is server-derived today, but the column must stay neutralized.)
+    async def fake_run(job_id, domain, keys, **kwargs):
+        job = main.JOBS[job_id]
+        job.status = "done"
+        job.progress = 100
+        job.subdomains_found = 1
+        job.source_statuses = {name: "done" for name in main.SOURCES}
+        job.results = [
+            main.SubdomainResult(
+                subdomain="b.example.com",
+                ip_addresses=[],
+                cname=None,
+                http_status=None,
+                https_status=None,
+                sources=["crt.sh"],
+                takeover_risk="NONE",
+                takeover_service=None,
+                takeover_detail=None,
+                takeover_verdict="",
+                takeover_evidence="",
+                resolved=False,
+                alive=False,
+                dns_status="ERROR",
+                cname_chain=[],
+                dns_records={},
+                recommended_action="=cmd|' /C calc'!A0",
+            )
+        ]
+
+    monkeypatch.setattr(main, "run_enumeration", fake_run)
+    job_id = client.post("/api/enumerate", json={"domain": "example.com"}).json()["job_id"]
+    resp = client.get(f"/api/download/{job_id}")
+    reader = csv.reader(io.StringIO(resp.text))
+    next(reader)  # header
+    first = next(reader)
+    assert first[15].startswith("'=cmd")

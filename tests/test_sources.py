@@ -221,3 +221,89 @@ async def test_source_failure_returns_empty_not_raises(client):
     respx.get("https://crt.sh/").mock(side_effect=httpx.ConnectError("boom"))
     out = await main.query_crtsh(client, DOMAIN, {})
     assert out == set()
+
+
+# ---------------------------------------------------------------------------
+# New KEYLESS sources (PART 1) + crt.sh common_name exhaustiveness
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_crtsh_reads_common_name_and_multiline_name_value(client):
+    respx.get("https://crt.sh/", params={"q": f"%.{DOMAIN}", "output": "json"}).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                # only common_name set
+                {"name_value": "", "common_name": "cn.example.com"},
+                # multi-line name_value with a wildcard entry
+                {"name_value": "multi1.example.com\n*.multi2.example.com"},
+                # out-of-scope common_name is dropped
+                {"name_value": "", "common_name": "evil.org"},
+            ],
+        )
+    )
+    out = await main.query_crtsh(client, DOMAIN, {})
+    assert out == {"cn.example.com", "multi1.example.com", "multi2.example.com"}
+
+
+@respx.mock
+async def test_certspotter_parses_dns_names(client):
+    respx.get("https://api.certspotter.com/v1/issuances").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"dns_names": ["a.example.com", "*.example.com"]},
+                {"dns_names": ["b.example.com", "out.org"]},
+            ],
+        )
+    )
+    out = await main.query_certspotter(client, DOMAIN, {})
+    # wildcard collapses to bare domain; out-of-scope dropped.
+    assert out == {"a.example.com", "example.com", "b.example.com"}
+
+
+@respx.mock
+async def test_threatminer_parses_results(client):
+    respx.get("https://api.threatminer.org/v2/domain.php").mock(
+        return_value=httpx.Response(
+            200,
+            json={"results": ["c.example.com", "d.example.com", "nope.net"]},
+        )
+    )
+    out = await main.query_threatminer(client, DOMAIN, {})
+    assert out == {"c.example.com", "d.example.com"}
+
+
+@respx.mock
+async def test_subdomaincenter_parses_json_array(client):
+    respx.get("https://api.subdomain.center/").mock(
+        return_value=httpx.Response(
+            200,
+            json=["e.example.com", "*.example.com", "elsewhere.org"],
+        )
+    )
+    out = await main.query_subdomaincenter(client, DOMAIN, {})
+    assert out == {"e.example.com", "example.com"}
+
+
+@respx.mock
+async def test_certspotter_connect_error_returns_empty(client):
+    respx.get("https://api.certspotter.com/v1/issuances").mock(
+        side_effect=httpx.ConnectError("boom")
+    )
+    out = await main.query_certspotter(client, DOMAIN, {})
+    assert out == set()
+
+
+def test_sources_registry_contains_new_keyless_sources():
+    for name in ("CertSpotter", "ThreatMiner", "SubdomainCenter"):
+        assert name in main.SOURCES
+        assert callable(main.SOURCES[name])
+    # the three new sources are KEYLESS: they must still return data without
+    # any keys (not gated behind a key early-return like the keyed sources).
+    # All 12 original sources remain registered.
+    for name in (
+        "crt.sh", "HackerTarget", "AlienVault", "RapidDNS", "URLScan",
+        "ThreatCrowd", "Wayback", "Anubis", "BufferOver",
+        "SecurityTrails", "Shodan", "c99",
+    ):
+        assert name in main.SOURCES
