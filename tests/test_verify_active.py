@@ -912,3 +912,40 @@ def test_check_takeover_arecord_cloudfront_ptr_is_verify():
     )
     assert risk_s3 == "LOW"
     assert service_s3 == "AWS S3"
+
+
+def test_check_takeover_http_alive_elb_cname_is_verify():
+    # Regression for the live-scan misclassification: an HTTP-alive (200/200)
+    # ELB/ALB CNAME must be classified AWS ELB -> VERIFY and reach the verify
+    # pass, NOT held at AWS S3 / LOW by the broad "amazonaws.com" fingerprint.
+    for target in (
+        "demo-alb-1234567890.us-east-1.elb.amazonaws.com",
+        "demo-common-1234567890.us-east-1.elb.amazonaws.com",
+        "app-abcdef0123456789.elb.us-east-1.amazonaws.com",
+    ):
+        risk, service, detail = main.check_takeover(
+            subdomain="docs.example.com",
+            cname=target,
+            a_records=["52.54.156.108"],
+            http_body="<html>welcome</html>",
+            ptr_hosts=[],
+            http_status=200,
+            https_status=200,
+            cname_chain=[target],
+        )
+        assert risk == "VERIFY", f"{target} should be VERIFY, got {risk}"
+        assert service == "AWS ELB", f"{target} should be AWS ELB, got {service}"
+        assert detail
+
+    # A trailing-dotted ELB CNAME (as returned by dig) must still match.
+    risk_dot, service_dot, _ = main.check_takeover(
+        subdomain="docs.example.com",
+        cname="demo-alb-1234567890.us-east-1.elb.amazonaws.com.",
+        a_records=["52.54.156.108"],
+        http_body="<html>welcome</html>",
+        http_status=200,
+        https_status=200,
+        cname_chain=["demo-alb-1234567890.us-east-1.elb.amazonaws.com."],
+    )
+    assert risk_dot == "VERIFY"
+    assert service_dot == "AWS ELB"

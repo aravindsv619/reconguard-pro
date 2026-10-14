@@ -1399,6 +1399,24 @@ def check_takeover(
             and https_status is None
             and not (http_body or "").strip()
         )
+        # AWS ELB/ALB CNAMEs must ALWAYS reach the verify pass, regardless of
+        # HTTP liveness. The broad "amazonaws.com" -> AWS S3 fingerprint above
+        # matches any "...elb.amazonaws.com" CNAME and would otherwise hold a
+        # live (200) ELB at LOW/AWS S3 — a misclassification, since the anchored
+        # CLOUD_RESOURCE_PATTERNS match identified it as an ELB whose name is
+        # AWS-assigned (not attacker-claimable). Routing it into verify_takeover
+        # yields the correct NOT_VULNERABLE (resolving target) verdict instead of
+        # a wrong LOW with an empty verdict. This anchored match takes precedence
+        # over the broad S3 fingerprint hold.
+        if provider == "AWS ELB":
+            target_display = (final_target or "").strip().rstrip(".").lower()
+            detail = (
+                f"CNAME points to an AWS ELB/ALB ({target_display}). The ELB name "
+                "is AWS-assigned (not attacker-claimable); confirm the load "
+                "balancer still exists and is owned by you before assuming it is "
+                "safe."
+            )
+            return "VERIFY", provider, detail
         if gone_signal or no_response:
             if gone_signal:
                 status_val = (

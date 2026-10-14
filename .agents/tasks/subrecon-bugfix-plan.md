@@ -196,6 +196,79 @@ Items 9 (live keyless re-scan) and 10 (verdict file) remain DOWNSTREAM.
 
 ---
 
+## Iteration 3 — review fix (HTTP-alive ELB/ALB CNAME reaches verify pass)
+
+Review `subrecon-bugfix-review.json` (verdict CHANGES_REQUESTED) raised one
+BLOCKING code finding `live-elb-misclassification` (findings `live-passed-false`
+and `missing-http-alive-elb-unit-coverage` are its downstream consequences;
+`cloudfront-cname-rows-unmet` is informational/secondary):
+
+> In `check_takeover` the broad `"amazonaws.com"` -> AWS S3 fingerprint
+> (TAKEOVER_FINGERPRINTS) matches any `...elb.amazonaws.com` CNAME and is held
+> as LOW. The cloud-resource VERIFY tier only promoted on a "gone" signal
+> (404/503 or no HTTP response), so a LIVE (200/200) owned ELB/ALB was returned
+> `AWS S3 / LOW` with an empty verdict and never reached `verify_takeover`.
+> Live repro: `openproject.example.com`
+> (`demo-common-1234567890.us-east-1.elb.amazonaws.com`) and
+> `docs.example.com` (ALB `demo-alb-1234567890.us-east-1.elb.amazonaws.com`).
+
+Confirmed real resolver behavior this iteration (box has `dig`):
+- `dig +short CNAME docs.example.com` -> `demo-alb-1234567890.us-east-1.elb.amazonaws.com.`
+  (ALB, trailing dot) AND `dig +short A docs.example.com` -> public A records
+  (so the host is HTTP-ALIVE — exactly the misclassified case).
+- `dig +short CNAME gitlab.example.com` -> `app-abcdef0123456789.elb.us-east-1.amazonaws.com.`
+- Verified `_match_cloud_resource` returns `AWS ELB` for all three live target
+  forms (trailing-dot ALB, `...elb.us-east-1.amazonaws.com`, and
+  `...us-east-1.elb.amazonaws.com`), plus CloudFront/S3 unchanged.
+
+Change made in `main.py` (scoped, no security-guard or CSV changes):
+- `check_takeover` VERIFY tier: when the anchored `_match_cloud_resource`
+  match is `AWS ELB`, return `("VERIFY", "AWS ELB", <detail naming the ELB
+  target>)` REGARDLESS of HTTP liveness, BEFORE the `gone_signal/no_response`
+  gate. This takes precedence over the broad `"amazonaws.com"` -> AWS S3
+  `held_low` so a live owned ELB/ALB reaches `verify_takeover` and renders the
+  correct NOT_VULNERABLE (resolving target) verdict instead of `AWS S3 / LOW`
+  with an empty verdict. The gone/no-response gate is UNCHANGED for every other
+  provider (CloudFront, S3, Heroku, etc.), so a live non-ELB cloud CNAME still
+  stays out of VERIFY. No new network request, no new semaphore, no CSV change.
+
+Tests in `tests/test_verify_active.py` / `tests/test_takeover_verify.py`:
+- NEW `test_check_takeover_http_alive_elb_cname_is_verify` — feeds a 200/200
+  ELB/ALB CNAME (all three live target forms + a trailing-dotted ALB) into
+  `check_takeover` and asserts `AWS ELB` + VERIFY (the previously-missing
+  HTTP-alive unit coverage, finding `missing-http-alive-elb-unit-coverage`).
+- NEW `test_cloud_resource_healthy_200_non_elb_not_verify` — a healthy 200
+  CloudFront CNAME is NOT VERIFY, proving the gone/no-response gate is intact
+  for non-ELB providers.
+- UPDATED `test_verify_dangling_elb_503` — still asserts ELB 503 -> VERIFY /
+  AWS ELB and the detail names the ELB target (dropped the old
+  "Dangling CNAME"/"503" string assertions, which encoded the superseded
+  gone-gated detail text).
+- UPDATED (renamed) `test_cloud_resource_healthy_200_elb_routes_to_verify`
+  (was `test_cloud_resource_healthy_200_not_verify`) — now asserts a live 200
+  ELB routes to VERIFY/AWS ELB, i.e. the now-correct behavior the review
+  mandates. The two updated tests encoded the exact behavior the review and the
+  AUTHORITATIVE TASK require changing (a resolving/live ELB must reach the
+  NOT_VULNERABLE verdict), so they were updated to the corrected intent, not
+  weakened.
+
+Commands run (single-run mode, venv):
+- `/home/aravind/New-SEC/.venv/bin/python -m pytest -q`
+  -> `173 passed`, 0 failed (171 from iteration 2, +2 net new ELB tests; the
+  two old-behavior ELB tests were updated in place).
+- `/home/aravind/New-SEC/.venv/bin/python -c "import ast; ast.parse(open('main.py').read()); import main; print(len(main.CSV_COLUMNS), main.CSV_COLUMNS[-1])"`
+  -> `16 recommended_action` (CSV 16-column contract intact; cols 1-15 unchanged).
+
+Security guards untouched: `_is_safe_public_ip` SSRF gate, the single shared
+`Semaphore(50)` (NO new semaphore), `_csv_safe`, `is_valid_hostname`, XSS-safe
+frontend. `verify_takeover` still never raises. The check_takeover change issues
+NO network request (it only reclassifies on already-gathered CNAME data).
+
+Items 9 (live keyless re-scan) and 10 (verdict file) remain the DOWNSTREAM
+reviewer/live step and were NOT run here.
+
+---
+
 ## Plan
 
 - [x] 1. BUG 1 — Make `verify_takeover`'s target probe fail soft so a resolving ELB (or any provider) reaches its branch, and make the outer catch-all evidence non-empty.

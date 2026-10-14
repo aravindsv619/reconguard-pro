@@ -36,8 +36,8 @@ def test_verify_dangling_elb_503():
     )
     assert risk == "VERIFY"
     assert service == "AWS ELB"
-    assert "Dangling CNAME" in detail
-    assert "503" in detail
+    # An anchored ELB CNAME always routes into the verify pass; the detail
+    # names the ELB target so the verdict is diagnosable.
     assert "foo.us-east-1.elb.amazonaws.com" in detail
 
 
@@ -91,11 +91,12 @@ def test_verify_does_not_override_high():
     assert service == "GitHub Pages"
 
 
-def test_cloud_resource_healthy_200_not_verify():
-    # Healthy 200 response with real body → NOT a dangling resource, so no
-    # VERIFY. (The broad "amazonaws.com" fingerprint key still yields a LOW
-    # service-match note, as it did before this feature — the point is only
-    # that VERIFY must not fire for a live resource.)
+def test_cloud_resource_healthy_200_elb_routes_to_verify():
+    # A healthy 200 ELB/ALB CNAME must STILL route into the verify pass (so
+    # verify_takeover can render NOT_VULNERABLE from the resolving target),
+    # rather than being held at AWS S3 / LOW by the broad "amazonaws.com"
+    # fingerprint. The anchored ELB CLOUD_RESOURCE_PATTERNS match takes
+    # precedence over the broad S3 fingerprint regardless of HTTP liveness.
     risk, service, detail = main.check_takeover(
         subdomain="live.example.com",
         cname="app.us-east-1.elb.amazonaws.com",
@@ -105,6 +106,24 @@ def test_cloud_resource_healthy_200_not_verify():
         http_status=200,
         https_status=200,
         cname_chain=["app.us-east-1.elb.amazonaws.com"],
+    )
+    assert risk == "VERIFY"
+    assert service == "AWS ELB"
+
+
+def test_cloud_resource_healthy_200_non_elb_not_verify():
+    # A healthy 200 on a NON-ELB cloud CNAME (CloudFront) is a live resource,
+    # so VERIFY must not fire from a "gone" signal — the gone/no-response gate
+    # is unchanged for providers other than ELB.
+    risk, service, detail = main.check_takeover(
+        subdomain="live.example.com",
+        cname="d123.cloudfront.net",
+        a_records=[],
+        http_body="welcome",
+        ptr_hosts=[],
+        http_status=200,
+        https_status=200,
+        cname_chain=["d123.cloudfront.net"],
     )
     assert risk != "VERIFY"
 
