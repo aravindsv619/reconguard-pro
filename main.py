@@ -97,6 +97,61 @@ SECURITY_CSP = (
     "form-action 'self'"
 )
 
+
+class SecurityHeadersMiddleware:
+    """Pure-ASGI middleware that stamps hardening headers on EVERY response.
+
+    A plain ``@app.middleware("http")`` wrapper operates on the Starlette
+    ``Response`` object returned by the router, which is reliable for API
+    handlers but is NOT a dependable place to harden responses produced by a
+    mounted sub-app such as ``StaticFiles`` at ``/`` (the SPA index and the
+    vendored ``/tailwind.css``). A sub-app can stream its own ASGI messages
+    without ever surfacing a Starlette ``Response`` to the outer wrapper, so
+    the headers can silently go missing on the live server even while the
+    TestClient path (which exercises the router directly) still shows them.
+
+    Wrapping ``send`` at the ASGI layer closes that gap: we intercept the
+    ``http.response.start`` message for every response — API, StaticFiles, and
+    handled-error (400/404/422/429) alike — and add the four headers unless the
+    downstream app already set them (``setdefault`` semantics, case-insensitive
+    per RFC 7230). Because this is added via ``app.add_middleware`` it sits in
+    the outer ASGI stack and runs after CORS, so CORS headers are preserved and
+    none of the security headers are duplicated.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = message.setdefault("headers", [])
+                # ASGI header names are raw bytes; compare case-insensitively.
+                present = {name.lower() for name, _ in headers}
+                for name, value in _SECURITY_HEADERS:
+                    if name.lower().encode("latin-1") not in present:
+                        headers.append(
+                            (name.encode("latin-1"), value.encode("latin-1"))
+                        )
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+# The exact header set applied by SecurityHeadersMiddleware (A05/A08):
+# nosniff defeats content-type sniffing, DENY blocks framing/clickjacking,
+# no-referrer stops referrer leakage, and SECURITY_CSP constrains origins.
+_SECURITY_HEADERS: list[tuple[str, str]] = [
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer"),
+    ("Content-Security-Policy", SECURITY_CSP),
+]
+
 # ---------------------------------------------------------------------------
 # Active DNS discovery (brute-force + permutation) — all OFF by default.
 # ---------------------------------------------------------------------------
@@ -2581,36 +2636,20 @@ _cors_origins = [
     for o in os.environ.get("SUBRECON_CORS_ORIGINS", _default_cors).split(",")
     if o.strip()
 ]
+# Security headers are applied by a pure-ASGI middleware (defined above) rather
+# than an ``@app.middleware("http")`` wrapper so the four hardening headers
+# reach EVERY response on the live uvicorn server — including the StaticFiles
+# SPA mount at ``/`` and the vendored ``/tailwind.css``, which a Response-level
+# wrapper can miss. It is added AFTER CORS so it sits outermost in the ASGI
+# stack: CORS headers are preserved and the security headers are never
+# duplicated (setdefault semantics inside the middleware).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.middleware("http")
-async def security_headers_middleware(request: Request, call_next):
-    """Attach hardening headers to every handled response (A05/A08).
-
-    Applies to API, static-file, and handled-error responses (404/422/429)
-    alike: nosniff defeats content-type sniffing, DENY blocks
-    framing/clickjacking, no-referrer stops referrer leakage, and SECURITY_CSP
-    constrains resource origins. Headers are set via setdefault so a response
-    that already specified one is not overridden.
-
-    Note: this ``@app.middleware("http")`` runs *inside* Starlette's
-    ServerErrorMiddleware, so a genuinely-unhandled 500 is produced above this
-    layer and does not carry these headers. That path returns only a static
-    ``{"detail": "Internal Server Error"}`` JSON body with no reflected or
-    sniffable content, so the practical risk is negligible.
-    """
-    response = await call_next(request)
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "DENY")
-    response.headers.setdefault("Referrer-Policy", "no-referrer")
-    response.headers.setdefault("Content-Security-Policy", SECURITY_CSP)
-    return response
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 # ---------------------------------------------------------------------------
