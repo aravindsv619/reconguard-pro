@@ -30,6 +30,21 @@
     @keyframes stripe { from { background-position: 1rem 0; } to { background-position: 0 0; } }
     th.sortable { cursor: pointer; user-select: none; }
     th.sortable:hover { color: #a5b4fc; }
+
+    /* Sticky first (Subdomain) column: stays visible while the table scrolls
+       horizontally. Uses an opaque background so scrolled cells never bleed
+       through, and a higher z-index than ordinary scrolling cells. */
+    .sticky-col {
+      position: sticky;
+      left: 0;
+      background-color: #111827; /* bg-gray-900 — matches table/header */
+      z-index: 20;
+    }
+    /* Body-cell variant: solid even over the semi-transparent row hover tint. */
+    td.sticky-col { background-color: #0b1220; } /* ~bg-gray-950, opaque row bg */
+    tr:hover > td.sticky-col { background-color: #1b2432; } /* opaque hover match */
+    /* Top-left corner (sticky header AND sticky column) must sit above both. */
+    th.sticky-col { z-index: 30; }
   </style>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
@@ -217,15 +232,14 @@
         <table class="w-full min-w-[1024px] text-sm">
           <thead>
             <tr class="text-gray-400 text-left border-b border-gray-800">
-              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('subdomain')">Subdomain</th>
+              <th class="sortable sticky-col py-3 px-3 whitespace-nowrap sticky top-0 z-10" onclick="sortResults('subdomain')">Subdomain</th>
               <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">IP Addresses</th>
               <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">CNAME</th>
               <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('dns_status')">DNS</th>
               <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('http_status')">HTTP</th>
               <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('https_status')">HTTPS</th>
               <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Sources</th>
-              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('takeover_risk')">Risk</th>
-              <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Verdict</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('takeover_risk')">Risk / Verdict</th>
               <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('alive')">Live</th>
             </tr>
           </thead>
@@ -630,7 +644,7 @@
               <span class="text-gray-300">${escapeHtml(String(r.recommended_action))}</span></div>`
           : '';
         return `<tr class="border-b border-gray-800/60 animate-fadein hover:bg-gray-800/40">
-          <td class="py-2 px-3 font-mono text-brand-300 whitespace-nowrap">
+          <td class="sticky-col py-2 px-3 font-mono text-brand-300 whitespace-nowrap">
             <button type="button" onclick="toggleRecords(${idx})" title="Show all DNS records"
               class="mr-1 text-gray-500 hover:text-brand-300 focus:outline-none" aria-label="Toggle DNS records">
               <span id="rectri-${idx}">▸</span>
@@ -641,12 +655,13 @@
           <td class="py-2 px-3 whitespace-nowrap">${statusCell(r.http_status)}</td>
           <td class="py-2 px-3 whitespace-nowrap">${statusCell(r.https_status)}</td>
           <td class="py-2 px-3 text-gray-500 text-xs whitespace-nowrap">${escapeHtml((r.sources||[]).join(', '))}${sourceChips(r.sources)}</td>
-          <td class="py-2 px-3 whitespace-nowrap"${title}>${riskBadge(r.takeover_risk)}</td>
-          <td class="py-2 px-3 whitespace-nowrap"${verdictTitle}>${verdictBadge(r.takeover_verdict)}</td>
+          <td class="py-2 px-3 whitespace-nowrap">
+            <span${title}>${riskBadge(r.takeover_risk)}</span><span class="ml-1"${verdictTitle}>${verdictBadge(r.takeover_verdict)}</span>
+          </td>
           <td class="py-2 px-3 text-center whitespace-nowrap">${dot}</td>
         </tr>
         <tr id="recrow-${idx}" class="hidden bg-gray-900/60 border-b border-gray-800/60">
-          <td colspan="10" class="py-2 px-6">
+          <td colspan="9" class="py-2 px-6">
             <div class="text-xs text-gray-400 mb-1 font-semibold">DNS records</div>
             ${recordsPanel}
             ${recAction}
