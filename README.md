@@ -381,6 +381,42 @@ link-local, or cloud-metadata address (SSRF guard); CSV export neutralizes
 spreadsheet formula injection; and the per-job work and concurrent-job counts
 are capped to limit resource exhaustion.
 
+### Security headers and Content-Security-Policy
+
+Every HTTP response (API, static, and error) carries `X-Content-Type-Options:
+nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and a strict
+`Content-Security-Policy`:
+
+```
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';
+base-uri 'none'; object-src 'none'; form-action 'self'
+```
+
+Because `script-src` is `'self'` with no third-party origins and no
+`'unsafe-inline'` for scripts, **Tailwind is vendored locally** in
+`static/tailwind.css` (hand-authored, offline — no CDN runtime script) and all
+UI interactivity is wired with `addEventListener` instead of inline `on*`
+handlers. `'unsafe-inline'` is granted to `style-src` **only**, for the page's
+small inline `<style>` block and dynamic class strings; it does not weaken
+script protection.
+
+### Bind address and rate limiting
+
+The server **binds to `127.0.0.1` by default** (overridable with the
+`SUBRECON_HOST` environment variable), so it is not exposed on all interfaces
+out of the box. `POST /api/enumerate` is protected by a per-client (IP)
+in-memory rate limit, configurable via `SUBRECON_RATE_LIMIT` (default
+`60`/minute); requests over the threshold receive HTTP 429. Outbound responses
+and request wordlists are byte-capped to bound memory use.
+
+### Deployment warning
+
+SubRecon Pro has **no authentication** — it is a single-user local tool. Run it
+on localhost (the default) or behind an authenticating reverse proxy. **Do not
+expose the raw API publicly.** Anyone who can reach the API can start scans and
+read any job's results.
+
 TLS handling uses two separate HTTP clients: a **verified** client (standard CA
 validation) for all data-source and authenticated API calls — so SecurityTrails
 and Shodan API keys are never sent over unverified TLS — and a separate client

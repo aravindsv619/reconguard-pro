@@ -4,23 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SubRecon Pro</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          colors: {
-            brand: { 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca' }
-          },
-          keyframes: {
-            fadein: { '0%': { opacity: 0, transform: 'translateY(4px)' }, '100%': { opacity: 1, transform: 'translateY(0)' } }
-          },
-          animation: { fadein: 'fadein 0.25s ease-out' }
-        }
-      }
-    }
-  </script>
+  <!-- Tailwind utilities are vendored locally (static/tailwind.css) instead of
+       the former Tailwind CDN runtime script. This keeps the app fully offline
+       and lets the server's Content-Security-Policy stay strict
+       (default-src 'self'; script-src 'self') with no third-party origins. -->
+  <link rel="stylesheet" href="/tailwind.css">
   <style>
     .progress-stripes {
       background-image: linear-gradient(45deg, rgba(255,255,255,0.15) 25%, transparent 25%, transparent 50%, rgba(255,255,255,0.15) 50%, rgba(255,255,255,0.15) 75%, transparent 75%, transparent);
@@ -64,7 +52,7 @@
       <div class="flex flex-col sm:flex-row gap-3">
         <input id="domainInput" type="text" placeholder="target.com" autocomplete="off"
           class="flex-1 bg-gray-950 border border-gray-700 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-brand-500" />
-        <button id="startBtn" onclick="startScan()"
+        <button id="startBtn"
           class="bg-brand-600 hover:bg-brand-700 transition-colors px-6 py-3 rounded-lg font-semibold text-white">
           Start Scan
         </button>
@@ -72,7 +60,7 @@
       <p id="domainError" class="text-red-400 text-sm mt-2 hidden">Please enter a valid domain (e.g. example.com).</p>
 
       <div class="mt-4">
-        <button onclick="toggleAdvanced()" class="text-sm text-gray-400 hover:text-gray-200">
+        <button id="advToggleBtn" class="text-sm text-gray-400 hover:text-gray-200">
           <span id="advChevron">▸</span> Advanced Options
         </button>
         <div id="advancedPanel" class="hidden mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -96,7 +84,7 @@
           <!-- Active DNS discovery -->
           <div class="sm:col-span-2 border-t border-gray-800 pt-3 mt-1">
             <label class="flex items-center gap-2 text-sm text-gray-200 cursor-pointer">
-              <input id="activeToggle" type="checkbox" class="accent-brand-600" onchange="toggleActive()" />
+              <input id="activeToggle" type="checkbox" class="accent-brand-600" />
               Enable active DNS brute-force
             </label>
             <p class="text-amber-400 text-xs mt-1">
@@ -132,7 +120,7 @@
     <section id="progressPanel" class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg hidden">
       <div class="flex items-center justify-between mb-3">
         <h2 class="text-lg font-semibold">Scanning…</h2>
-        <button onclick="cancelScan()" class="text-sm text-red-400 hover:text-red-300 border border-red-500/40 rounded px-3 py-1">Cancel</button>
+        <button id="cancelBtn" class="text-sm text-red-400 hover:text-red-300 border border-red-500/40 rounded px-3 py-1">Cancel</button>
       </div>
       <div class="w-full bg-gray-800 rounded-full h-4 overflow-hidden mb-2">
         <div id="progressBar" class="progress-stripes bg-brand-600 h-4 rounded-full transition-all duration-500" style="width:0%"></div>
@@ -155,7 +143,7 @@
     <section id="resultsPanel" class="hidden">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-2xl font-bold">Results for <span id="resultDomain" class="text-brand-400"></span></h2>
-        <button onclick="downloadCSV()"
+        <button id="downloadBtn"
           class="bg-emerald-600 hover:bg-emerald-700 transition-colors px-5 py-2.5 rounded-lg font-semibold text-white flex items-center gap-2">
           ⬇ Download CSV
         </button>
@@ -217,7 +205,7 @@
           <button data-filter="medium" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">MEDIUM Risk</button>
           <button data-filter="unresolved" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Unresolved</button>
         </div>
-        <input id="searchInput" type="text" placeholder="Search subdomains…" oninput="applyFilters()"
+        <input id="searchInput" type="text" placeholder="Search subdomains…"
           class="ml-auto bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
       </div>
 
@@ -232,15 +220,15 @@
         <table class="w-full min-w-[1024px] text-sm">
           <thead>
             <tr class="text-gray-400 text-left border-b border-gray-800">
-              <th class="sortable sticky-col py-3 px-3 whitespace-nowrap sticky top-0 z-10" onclick="sortResults('subdomain')">Subdomain</th>
+              <th class="sortable sticky-col py-3 px-3 whitespace-nowrap sticky top-0 z-10" data-sort="subdomain">Subdomain</th>
               <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">IP Addresses</th>
               <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">CNAME</th>
-              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('dns_status')">DNS</th>
-              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('http_status')">HTTP</th>
-              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('https_status')">HTTPS</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="dns_status">DNS</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="http_status">HTTP</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="https_status">HTTPS</th>
               <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Sources</th>
-              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('takeover_risk')">Risk / Verdict</th>
-              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('alive')">Live</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="takeover_risk">Risk / Verdict</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="alive">Live</th>
             </tr>
           </thead>
           <tbody id="resultsTable"></tbody>
@@ -645,7 +633,7 @@
           : '';
         return `<tr class="border-b border-gray-800/60 animate-fadein hover:bg-gray-800/40">
           <td class="sticky-col py-2 px-3 font-mono text-brand-300 whitespace-nowrap">
-            <button type="button" onclick="toggleRecords(${idx})" title="Show all DNS records"
+            <button type="button" data-rec="${idx}" title="Show all DNS records"
               class="mr-1 text-gray-500 hover:text-brand-300 focus:outline-none" aria-label="Toggle DNS records">
               <span id="rectri-${idx}">▸</span>
             </button>${escapeHtml(r.subdomain)}</td>
@@ -683,6 +671,33 @@
 
     document.getElementById('domainInput').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') startScan();
+    });
+
+    // --- Event wiring (CSP-safe) -------------------------------------------
+    // The Content-Security-Policy served by the backend uses script-src 'self'
+    // with NO 'unsafe-inline', so inline on* handler attributes would be
+    // blocked. All interactivity is wired here with addEventListener instead;
+    // behavior is identical to the former inline handlers.
+    document.getElementById('startBtn').addEventListener('click', startScan);
+    document.getElementById('advToggleBtn').addEventListener('click', toggleAdvanced);
+    document.getElementById('activeToggle').addEventListener('change', toggleActive);
+    document.getElementById('cancelBtn').addEventListener('click', cancelScan);
+    document.getElementById('downloadBtn').addEventListener('click', downloadCSV);
+    document.getElementById('searchInput').addEventListener('input', applyFilters);
+
+    // Sortable column headers carry a data-sort attribute (formerly an inline
+    // onclick="sortResults(...)"). Delegated from the results table header.
+    document.querySelectorAll('th[data-sort]').forEach((th) => {
+      th.addEventListener('click', () => sortResults(th.dataset.sort));
+    });
+
+    // The per-row "show DNS records" toggle buttons are re-rendered on every
+    // table paint, so wire them with event delegation on the table body. Each
+    // button carries data-rec="<row index>" (formerly onclick="toggleRecords").
+    document.getElementById('resultsTable').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-rec]');
+      if (!btn) return;
+      toggleRecords(Number(btn.dataset.rec));
     });
   </script>
 </body>
