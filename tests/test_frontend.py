@@ -95,6 +95,64 @@ def test_index_has_no_inline_event_handler_attributes():
     assert offenders == [], f"inline handler attributes remain: {offenders}"
 
 
+JS = __import__("pathlib").Path(main._static_dir) / "app.js"
+
+# An inline <script> with a body (executable inline JS) is refused by the strict
+# script-src 'self' CSP (no 'unsafe-inline', no nonce), which silently kills ALL
+# interactivity. Only an EXTERNAL reference (<script src=...>) is allowed. This
+# pattern matches an opening <script ...> whose attributes do NOT include a src.
+_INLINE_SCRIPT_RE = re.compile(r"<script(?![^>]*\bsrc\s*=)[^>]*>", re.IGNORECASE)
+
+
+def test_index_has_no_inline_executable_script():
+    """Under script-src 'self' an inline <script> body is CSP-blocked, so the
+    page must carry only external <script src=...> references (the root cause of
+    the dead 'Start Scan' button was the whole inline block being refused)."""
+    html = INDEX.read_text()
+    # Strip HTML comments first so a comment that merely MENTIONS a script tag
+    # cannot be mistaken for a real one.
+    html_no_comments = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
+    offenders = _INLINE_SCRIPT_RE.findall(html_no_comments)
+    assert offenders == [], f"inline <script> blocks remain (CSP-blocked): {offenders}"
+    # The externalized application JS must be referenced from the same origin.
+    assert '<script src="/app.js"></script>' in html
+
+
+def test_app_js_served_as_javascript_with_headers():
+    """/app.js must serve 200 with a javascript content type and carry the same
+    security headers (incl. the exact CSP) as every other response."""
+    with TestClient(main.app) as client:
+        resp = client.get("/app.js")
+        assert resp.status_code == 200
+        assert "javascript" in resp.headers.get("content-type", "")
+        _assert_security_headers(resp)
+
+
+def test_app_js_contains_the_relocated_logic():
+    """Externalizing must only RELOCATE the logic, not change it: the key
+    functions, the CSP-safe addEventListener wiring, and the data-sort / data-rec
+    delegation all live in app.js now."""
+    js = JS.read_text()
+    for fn in ("function startScan", "function toggleAdvanced", "function cancelScan",
+               "function downloadCSV", "function applyFilters", "function sortResults",
+               "function toggleRecords"):
+        assert fn in js, f"missing relocated {fn!r}"
+    assert "getElementById('startBtn').addEventListener('click', startScan)" in js
+    assert "th[data-sort]" in js
+    assert "button[data-rec]" in js
+    # XSS-safe rendering preserved (no innerHTML of raw server data).
+    assert "function escapeHtml" in js
+
+
+def test_csp_unchanged_still_script_src_self_no_unsafe_inline():
+    """The fix must NOT weaken the CSP: script-src stays 'self' with no
+    'unsafe-inline' and no CDN origin."""
+    csp = main.SECURITY_CSP
+    assert "script-src 'self'" in csp
+    assert "'unsafe-inline'" not in csp.split("script-src", 1)[1].split(";", 1)[0]
+    assert "cdn.tailwindcss.com" not in csp
+
+
 def test_tailwind_css_covers_brand_and_fadein():
     css = CSS.read_text()
     # Custom theme carried over from the former inline tailwind.config.
