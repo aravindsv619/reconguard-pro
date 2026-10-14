@@ -24,11 +24,11 @@ from typing import Optional, TypedDict
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("subrecon")
@@ -49,6 +49,53 @@ MAX_SUBDOMAINS_PER_JOB = 5000
 
 # Maximum total length of a domain name per RFC 1035 (<= 253 chars).
 MAX_DOMAIN_LENGTH = 253
+
+# Response-size cap (API10/API4): the maximum number of body bytes read from
+# any outbound fetch (source fetches via _get, target probes via check_http).
+# A hostile source or target that streams a multi-hundred-MB body cannot OOM
+# the process — reads are aborted past this cap and the caller treats the
+# response as empty. 10 MiB is far larger than any real passive-DNS/probe body.
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+
+# Request-body cap (A04/API4): the maximum length of the raw custom wordlist
+# string accepted in an EnumerateRequest, enforced by Pydantic BEFORE the value
+# is buffered/parsed, so an enormous wordlist cannot exhaust memory. Valid
+# labels within an accepted wordlist are still post-parse capped by
+# MAX_ACTIVE_CANDIDATES. 1 MiB holds well over 100k typical labels.
+MAX_WORDLIST_BYTES = 1 * 1024 * 1024
+
+# Per-client (IP) rate limit (A04/API4) for POST /api/enumerate. A simple
+# in-memory token bucket keyed by client IP: SUBRECON_RATE_LIMIT tokens are
+# refilled over RATE_LIMIT_WINDOW seconds, with a burst capacity of
+# RATE_LIMIT_BURST. The default is generous for a single-user local tool; the
+# limiter FAILS OPEN on any internal error so it never blocks legitimate work.
+try:
+    RATE_LIMIT_PER_MINUTE = max(1, int(os.environ.get("SUBRECON_RATE_LIMIT", "60")))
+except (TypeError, ValueError):
+    RATE_LIMIT_PER_MINUTE = 60
+RATE_LIMIT_WINDOW = 60.0
+RATE_LIMIT_BURST = RATE_LIMIT_PER_MINUTE
+# Drop stale per-IP buckets opportunistically once this many are tracked.
+RATE_LIMIT_MAX_BUCKETS = 10000
+
+# Security headers applied to EVERY HTTP response (API, static, and error) by
+# the security-headers middleware. The Content-Security-Policy is defined as a
+# module-level constant so FEAT-002 (frontend) and the tests import the exact
+# same string. It is kept tight: scripts only from 'self' (Tailwind is vendored
+# locally in FEAT-002, no third-party script origin); 'unsafe-inline' is
+# allowed for style ONLY (the frontend keeps a small inline <style> + dynamic
+# class strings) which does not weaken script protection.
+SECURITY_CSP = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "frame-ancestors 'none'; "
+    "base-uri 'none'; "
+    "object-src 'none'; "
+    "form-action 'self'"
+)
 
 # ---------------------------------------------------------------------------
 # Active DNS discovery (brute-force + permutation) — all OFF by default.
@@ -541,7 +588,11 @@ class EnumerateRequest(BaseModel):
     # Active DNS discovery (OFF by default). Omitting all of these reproduces
     # today's passive-only behavior byte-for-byte.
     active: bool = False
-    wordlist: Optional[str] = None
+    # A04/API4: cap the raw wordlist string so an enormous payload cannot be
+    # buffered/parsed into memory. Rejected with 422 before parsing when it
+    # exceeds MAX_WORDLIST_BYTES chars; valid labels inside an accepted
+    # wordlist are still post-parse capped by MAX_ACTIVE_CANDIDATES.
+    wordlist: Optional[str] = Field(default=None, max_length=MAX_WORDLIST_BYTES)
     wordlist_mode: Optional[str] = "replace"  # "replace" | "append"
     permutations: bool = False
 
@@ -560,13 +611,68 @@ def _normalize_host(host: str, domain: str) -> Optional[str]:
     if not host or "*" in host or " " in host:
         return None
     domain = domain.lower()
-    if host == domain or host.endswith("." + domain):
-        return host
-    return None
+    if not (host == domain or host.endswith("." + domain)):
+        return None
+    # API10: a hostile source can return a syntactically-invalid host (control
+    # chars, overlong >63 labels, scheme/slash/@ junk, IP literals). Require the
+    # strict RFC-1035 check BEFORE returning so such a value is never stored in
+    # `collected` nor rendered as a `subdomain`. Scope semantics above are
+    # unchanged; this only rejects malformed in-scope strings.
+    if not is_valid_hostname(host):
+        return None
+    return host
+
+
+async def _read_capped_body(resp: httpx.Response) -> Optional[bytes]:
+    """Return the response body, or None if it exceeds MAX_RESPONSE_BYTES.
+
+    API10/API4 guard: a hostile source/target streaming a huge body must not
+    OOM the process. Prefer an early Content-Length rejection; otherwise read
+    incrementally and abort once the cap is crossed. Returns None to signal the
+    caller to treat the response as empty (never raises on oversize).
+    """
+    try:
+        length = resp.headers.get("content-length")
+        if length is not None:
+            try:
+                if int(length) > MAX_RESPONSE_BYTES:
+                    return None
+            except (TypeError, ValueError):
+                pass
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > MAX_RESPONSE_BYTES:
+                return None
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except Exception:  # noqa: BLE001 — treat any read error as empty body.
+        return None
 
 
 async def _get(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
-    return await asyncio.wait_for(client.get(url, **kwargs), timeout=SOURCE_TIMEOUT)
+    """Fetch a URL on the verified source client, bounded by SOURCE_TIMEOUT and
+    MAX_RESPONSE_BYTES.
+
+    The body is streamed and capped so a hostile source cannot return a
+    multi-hundred-MB body and exhaust memory. On an oversize body the response
+    content is replaced with an empty payload (``_content = b""``) so the
+    caller's ``.json()``/``.text`` parsing yields empty/None and the source
+    degrades to an empty result set instead of crashing.
+    """
+    async def _send() -> httpx.Response:
+        req = client.build_request("GET", url, **kwargs)
+        resp = await client.send(req, stream=True)
+        try:
+            body = await _read_capped_body(resp)
+        finally:
+            await resp.aclose()
+        # httpx needs _content set to allow .text/.json() after a streamed read.
+        resp._content = body if body is not None else b""
+        return resp
+
+    return await asyncio.wait_for(_send(), timeout=SOURCE_TIMEOUT)
 
 
 async def query_crtsh(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
@@ -1278,9 +1384,19 @@ async def check_http(client: httpx.AsyncClient, host: str) -> tuple[Optional[int
     body = ""
     for scheme in ("http", "https"):
         try:
-            resp = await client.get(
-                f"{scheme}://{host}", timeout=HTTP_PROBE_TIMEOUT
+            # Stream + cap the probe body (API10/API4): a hostile target must
+            # not OOM the process with a huge body. The status code is still
+            # recorded; an oversize body is dropped (treated as empty) so
+            # fingerprint matching simply finds nothing rather than crashing.
+            req = client.build_request(
+                "GET", f"{scheme}://{host}", timeout=HTTP_PROBE_TIMEOUT
             )
+            resp = await client.send(req, stream=True)
+            try:
+                raw = await _read_capped_body(resp)
+            finally:
+                await resp.aclose()
+            resp._content = raw if raw is not None else b""
             if scheme == "http":
                 http_status = resp.status_code
             else:
@@ -1553,6 +1669,15 @@ async def verify_takeover(
         # never changes the CNAME-based path (final_target is set there). It is
         # what keeps an A-record cloud row (CloudFront bimi, or a held-LOW S3/ELB
         # PTR) from ending with an empty verdict.
+        # provider_from_cname is True only when the provider was derived from an
+        # actual CNAME target that matched a cloud pattern. The "user-chosen
+        # bucket/site name is attacker-registerable" logic (S3 NXDOMAIN =>
+        # VULNERABLE, S3-specific wording) is ONLY valid in that case. For an
+        # A-record host whose provider was recovered from the edge IP's PTR
+        # (below), the subdomain is NOT a bucket/site name, so that reasoning
+        # and S3-specific wording must NOT be applied (user note: a Lightsail/
+        # Bitnami A-record host was wrongly labeled "Inconclusive (AWS S3)").
+        provider_from_cname = provider is not None
         detected_service = result.get("takeover_service")
         if provider is None and not final_target and detected_service:
             provider = detected_service
@@ -1573,12 +1698,30 @@ async def verify_takeover(
 
         target_nxdomain = target_dns_status == "NXDOMAIN"
         target_resolved = target_dns_status == "RESOLVED"
+        # True iff at least one resolved IP is a public/routable address.
+        target_has_public_ip = any(_is_safe_public_ip(ip) for ip in target_ips)
 
-        # SSRF guard: if the target resolved to IP(s) and none are public, do
-        # NOT probe. Skip and report INCONCLUSIVE.
-        probe_blocked = bool(target_ips) and not any(
-            _is_safe_public_ip(ip) for ip in target_ips
-        )
+        # SSRF guard: if the target resolved to IP(s) and NONE are public, the
+        # target points only at private/internal/metadata space — do NOT probe
+        # and report INCONCLUSIVE early (unchanged behavior).
+        probe_blocked = bool(target_ips) and not target_has_public_ip
+
+        # SSRF rebinding guard (A10/API7): a CNAME-only target with NO resolved
+        # public IP (empty target_ips, or NXDOMAIN/ERROR) must NOT be probed by
+        # hostname — httpx would re-resolve at connect, re-opening a DNS-
+        # rebinding / internal-reach window. We therefore SKIP the probe when
+        # there is no public IP, but (unlike probe_blocked) we do NOT early-
+        # return: the per-provider branches below still decide on DNS evidence
+        # (e.g. NXDOMAIN of a user-chosen-name target => VULNERABLE). This keeps
+        # existing DNS-based verdicts intact while never reaching an internal
+        # host via a probe.
+        #
+        # Residual: a small resolve->connect TOCTOU window remains for the
+        # probed case — we resolve here, then httpx re-resolves at connect, so a
+        # hostile resolver could flip the answer between the two. Fully
+        # eliminating it needs a pinned-IP transport; documented in the audit as
+        # an accepted residual risk.
+        probe_allowed = target_has_public_ip
 
         http_status: Optional[int] = None
         https_status: Optional[int] = None
@@ -1598,8 +1741,10 @@ async def verify_takeover(
                 ),
             }
 
-        # Probe the target endpoint, bounded by the shared semaphore. CNAME-only
-        # targets (no A/AAAA) are still probed; httpx re-resolves at connect.
+        # Probe the target endpoint, bounded by the shared semaphore. Only
+        # probed when the target resolved to a PUBLIC IP (probe_allowed); a
+        # CNAME-only / no-public-IP target is NOT probed (SSRF rebinding guard)
+        # and the per-provider branch decides on DNS evidence alone.
         #
         # BUG 1: this probe is wrapped in its OWN try/except so a probe failure
         # (asyncio.TimeoutError / socket.gaierror / httpx.ConnectError — all of
@@ -1608,7 +1753,7 @@ async def verify_takeover(
         # On failure we leave status None and let the per-provider branch decide
         # on DNS evidence alone (e.g. a resolving ELB -> NOT_VULNERABLE even when
         # it refuses a bare HTTP probe). The failure is recorded in probe_error.
-        if final_target_norm:
+        if final_target_norm and probe_allowed:
             try:
                 async with sem:
                     http_status, https_status, body = await asyncio.wait_for(
@@ -1630,6 +1775,42 @@ async def verify_takeover(
         )
 
         # ---- Per-provider decision ------------------------------------
+        if provider == "AWS S3" and not provider_from_cname:
+            # The "AWS S3" label here came from an A-record PTR heuristic, NOT a
+            # real *.s3[...].amazonaws.com CNAME target. The subdomain is a plain
+            # A-record host (e.g. a Lightsail/Bitnami/EC2 instance whose edge-IP
+            # PTR merely lives under amazonaws.com), so S3 bucket-name reasoning
+            # and S3-specific wording do NOT apply. Give a provider-neutral
+            # verdict from the alias's own liveness/DNS instead.
+            if status == 200 or (200 <= (status or 0) < 400):
+                return {
+                    "verdict": VERDICT_NOT_VULNERABLE,
+                    "evidence": (
+                        "A-record host is live (healthy HTTP response) — the "
+                        f"resource is in use and claimed ({obs})."
+                    ),
+                }
+            if target_nxdomain:
+                return {
+                    "verdict": VERDICT_INCONCLUSIVE,
+                    "evidence": (
+                        "A-record host no longer resolves (NXDOMAIN). This is a "
+                        "plain compute/instance address, not an attacker-choosable "
+                        "resource name — manually verify ownership of the "
+                        f"underlying instance in the cloud provider console ({obs})."
+                    ),
+                }
+            return {
+                "verdict": VERDICT_INCONCLUSIVE,
+                "evidence": (
+                    "A-record host gave no decisive signal. This is a plain "
+                    "compute/instance address (e.g. Lightsail/Bitnami/EC2), not "
+                    "an attacker-choosable resource name — manually verify "
+                    f"ownership of the instance in the provider console ({obs})."
+                    + (f" [probe_error: {probe_error}]" if probe_error else "")
+                ),
+            }
+
         if provider == "AWS S3":
             if "nosuchbucket" in body_lower:
                 return {
@@ -2158,6 +2339,10 @@ async def run_enumeration(
     probe_client: httpx.AsyncClient = app.state.probe_client
     cleanup_old_jobs()
 
+    # A09 lifecycle logging: job_id + domain + mode ONLY. Never log API keys,
+    # the keys dict, request bodies, or response bodies.
+    logger.info("job %s started: domain=%s active=%s", job_id, domain, active)
+
     job.status = "running"
     job.progress = 0
     for name in SOURCES:
@@ -2333,6 +2518,9 @@ async def run_enumeration(
         job.progress = 100
         job.current_source = ""
         job.status = "done"
+        logger.info(
+            "job %s done: domain=%s results=%d", job_id, domain, len(final_results)
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("enumeration failed")
         job.status = "error"
@@ -2346,16 +2534,23 @@ async def run_enumeration(
 async def lifespan(app: FastAPI):
     # Verified client for data-source and authenticated API calls (SecurityTrails,
     # Shodan). TLS is validated so API keys never travel over unauthenticated TLS.
+    # A10/API7: follow_redirects is DISABLED on the verified source client so a
+    # hostile source cannot 3xx-redirect an authenticated/verified request to an
+    # internal host (SSRF via redirect). Sources return data on the first
+    # response; a 3xx is simply treated as a non-200 and yields no subdomains.
     app.state.client = httpx.AsyncClient(
         headers={"User-Agent": USER_AGENT},
-        follow_redirects=True,
+        follow_redirects=False,
         timeout=SOURCE_TIMEOUT,
         verify=True,
     )
     # Separate probe client with TLS verification disabled, used only to fetch
     # target subdomain bodies (which frequently present invalid/self-signed
     # certs) for liveness and takeover-fingerprint checks. No credentials are
-    # ever sent on this client.
+    # ever sent on this client. Redirects stay ENABLED here because target
+    # liveness/fingerprint detection often depends on following a 3xx to the
+    # provider's "gone" page; the probe is already IP-guarded at every call site
+    # (_is_safe_public_ip in analyze_subdomain / probe_allowed in verify_takeover).
     app.state.probe_client = httpx.AsyncClient(
         headers={"User-Agent": USER_AGENT},
         follow_redirects=True,
@@ -2394,13 +2589,88 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Attach hardening headers to EVERY response (A05/A08).
+
+    Applies to API, static-file, and error responses alike: nosniff defeats
+    content-type sniffing, DENY blocks framing/clickjacking, no-referrer stops
+    referrer leakage, and SECURITY_CSP constrains resource origins. Headers are
+    set via setdefault so a response that already specified one is not
+    overridden.
+    """
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Content-Security-Policy", SECURITY_CSP)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Per-client rate limit (A04/API4)
+# ---------------------------------------------------------------------------
+# In-memory token bucket keyed by client IP. Not shared across processes (this
+# is a single-process local tool); it bounds abusive bursts from one client.
+# Each bucket is [tokens, last_refill_ts]. Access is single-threaded under the
+# asyncio event loop, so no lock is needed.
+_RATE_BUCKETS: dict[str, list[float]] = {}
+
+
+def _rate_limit_ok(client_ip: Optional[str]) -> bool:
+    """Return True if a request from client_ip is within its token budget.
+
+    FAILS OPEN: any internal error (or a missing client IP) returns True so the
+    limiter never blocks legitimate work. Buckets refill continuously up to
+    RATE_LIMIT_BURST and are pruned opportunistically to bound memory.
+    """
+    try:
+        if not client_ip:
+            return True
+        now = time.monotonic()
+        refill_rate = RATE_LIMIT_PER_MINUTE / RATE_LIMIT_WINDOW  # tokens/sec
+
+        # Opportunistic prune of stale buckets (full-and-idle) when the table
+        # grows large, so a flood of distinct IPs cannot grow memory unbounded.
+        if len(_RATE_BUCKETS) > RATE_LIMIT_MAX_BUCKETS:
+            for ip in list(_RATE_BUCKETS.keys()):
+                tokens, last = _RATE_BUCKETS[ip]
+                refilled = min(RATE_LIMIT_BURST, tokens + (now - last) * refill_rate)
+                if refilled >= RATE_LIMIT_BURST:
+                    del _RATE_BUCKETS[ip]
+
+        bucket = _RATE_BUCKETS.get(client_ip)
+        if bucket is None:
+            # First request from this IP: full burst minus this one.
+            _RATE_BUCKETS[client_ip] = [RATE_LIMIT_BURST - 1.0, now]
+            return True
+        tokens, last = bucket
+        tokens = min(RATE_LIMIT_BURST, tokens + (now - last) * refill_rate)
+        if tokens < 1.0:
+            bucket[0] = tokens
+            bucket[1] = now
+            return False
+        bucket[0] = tokens - 1.0
+        bucket[1] = now
+        return True
+    except Exception:  # noqa: BLE001 — fail open, never block on limiter error.
+        return True
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
 @app.post("/api/enumerate")
-async def enumerate_domain(req: EnumerateRequest):
+async def enumerate_domain(req: EnumerateRequest, request: Request):
+    # Per-client rate limit (A04/API4): bound abusive bursts from a single IP.
+    # Fails open; returns a generic 429 when the budget is exhausted. Adding
+    # `request` does NOT change the JSON request/response schema.
+    client_ip = request.client.host if request.client else None
+    if not _rate_limit_ok(client_ip):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded, retry later")
+
     domain = req.domain.strip().lower().rstrip(".")
     # Strict RFC-1035 validation (length cap, label sizes, no scheme/slash/@/
     # whitespace, no IP literals) BEFORE the value ever reaches an outbound URL.
@@ -2584,4 +2854,8 @@ if os.path.isdir(_static_dir):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=False)
+    # A05: bind to localhost by default so the tool (which has no auth) is not
+    # exposed on all interfaces. Override with SUBRECON_HOST to bind elsewhere
+    # (e.g. behind an authenticating reverse proxy).
+    _host = os.environ.get("SUBRECON_HOST", "127.0.0.1")
+    uvicorn.run("main:app", host=_host, port=8080, reload=False)
