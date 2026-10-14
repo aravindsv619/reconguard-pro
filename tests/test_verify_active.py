@@ -11,6 +11,7 @@ deterministic (same patterns as tests/test_active.py).
 """
 
 import asyncio
+import socket
 
 import httpx
 import pytest
@@ -564,3 +565,243 @@ async def test_analyze_subdomain_verify_promoted_to_high(monkeypatch):
     assert res["takeover_verdict"] == "VULNERABLE"
     assert res["takeover_risk"] == "HIGH"
     assert "promoted" in res["takeover_evidence"].lower()
+
+
+# ===========================================================================
+# BUG 1 — the empty-error ELB regression. These drive the ACTUAL exception path
+# (RAISE), not a mocked response, so over-mocking cannot hide the bug again.
+# A real keyless scan of example.com produced
+# "Verification could not complete (error: )." for every resolving ELB target
+# because asyncio.TimeoutError/socket.gaierror/httpx.ConnectError('') all have
+# an EMPTY str() and the probe sat inside verify_takeover's outer try/except.
+# ===========================================================================
+
+
+# (a) A resolving ELB whose probe RAISES asyncio.TimeoutError must still reach
+# the ELB branch and return NOT_VULNERABLE (verdict depends on DNS resolution,
+# not on the bare HTTP probe the ELB refuses to answer).
+async def test_elb_resolving_target_probe_times_out_not_vulnerable(monkeypatch):
+    async def fake_resolve_dns_detailed(host):
+        return ["52.1.2.3"], "RESOLVED"
+
+    async def boom_check_http(client, host):
+        # Realistic, EMPTY-message error — the exact class that produced the bug.
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "check_http", boom_check_http)
+
+    out = await main.verify_takeover(
+        _result(cname="app-abcdef0123456789.elb.us-east-1.amazonaws.com"),
+        None,
+        asyncio.Semaphore(5),
+    )
+
+    # The probe timeout must NOT block the DNS-based ELB verdict.
+    assert out["verdict"] == "NOT_VULNERABLE"
+    ev = out["evidence"].lower()
+    assert "elb" in ev
+    # And the evidence can never be the empty-error marker.
+    assert "(error: )" not in out["evidence"]
+
+
+# (b) For a provider whose verdict depends on the PROBE (CloudFront), a probe
+# that RAISES socket.gaierror (also empty str()) must yield a NON-EMPTY evidence
+# string that names the exception type — proving the empty-error cannot recur.
+async def test_verify_probe_error_evidence_is_non_empty(monkeypatch):
+    async def fake_resolve_dns_detailed(host):
+        return ["13.33.1.2"], "RESOLVED"
+
+    async def boom_check_http(client, host):
+        raise socket.gaierror()
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "check_http", boom_check_http)
+
+    out = await main.verify_takeover(
+        _result(cname="d123abc.cloudfront.net"),
+        None,
+        asyncio.Semaphore(5),
+    )
+
+    # No status obtained -> CloudFront INCONCLUSIVE, but the evidence must be
+    # non-empty and carry the diagnosable probe-error (gaierror).
+    assert out["verdict"] == "INCONCLUSIVE"
+    assert out["evidence"].strip() != ""
+    assert "gaierror" in out["evidence"]
+    assert "(error: )" not in out["evidence"]
+
+
+# (c) When the OUTER work (DNS resolution) itself RAISES an empty-message error,
+# the catch-all must record the exception type and never emit "(error: )".
+async def test_outer_catchall_records_exception_type(monkeypatch):
+    async def boom_resolve(host):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", boom_resolve)
+
+    out = await main.verify_takeover(
+        _result(cname="svc.s3.amazonaws.com"),
+        None,
+        asyncio.Semaphore(5),
+    )
+
+    assert out["verdict"] == "INCONCLUSIVE"
+    assert out["evidence"].strip() != ""
+    assert "TimeoutError" in out["evidence"]
+    assert "(error: )" not in out["evidence"]
+
+
+# ELB target resolution ERROR (not NXDOMAIN) is handled WITHIN the ELB branch
+# with a specific, retriable message — not the generic indeterminate case.
+async def test_elb_resolution_error_specific_message(monkeypatch):
+    async def fake_resolve_dns_detailed(host):
+        return [], "TIMEOUT"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+
+    out = await main.verify_takeover(
+        _result(cname="internal-lb.us-east-1.elb.amazonaws.com"),
+        None,
+        asyncio.Semaphore(5),
+    )
+
+    assert out["verdict"] == "INCONCLUSIVE"
+    ev = out["evidence"].lower()
+    assert "resolution did not complete" in ev
+    assert "timeout" in ev
+
+
+# ===========================================================================
+# BUG 2 — a dangling CNAME with NO A record on the subdomain must still be
+# captured and verdicted. The subdomain is NXDOMAIN/NO_ANSWER for A/AAAA but
+# CNAMEs to *.cloudfront.net; the record must be KEPT, matched as CloudFront,
+# flagged VERIFY, then promoted to HIGH/VULNERABLE on the no-distribution body.
+# ===========================================================================
+async def test_dangling_cname_without_a_record_cloudfront_vulnerable(monkeypatch):
+    async def fake_resolve_dns_detailed(host):
+        # The CloudFront TARGET resolves; the SUBDOMAIN has NO A record.
+        if host.endswith("cloudfront.net"):
+            return ["13.33.1.2"], "RESOLVED"
+        return [], "NXDOMAIN"
+
+    async def fake_resolve_cname_chain(host):
+        # dig CNAME-TYPE query still returns the CNAME RR despite no A record.
+        return ["d123abc.cloudfront.net"]
+
+    async def fake_resolve_cname(host):
+        return "d123abc.cloudfront.net"
+
+    async def fake_resolve_ptrs(ips):
+        return []
+
+    async def fake_check_http(client, host):
+        # CloudFront no-distribution signature on the target probe.
+        if host.endswith("cloudfront.net"):
+            return 403, None, "ERROR: The request could not be satisfied."
+        return None, None, ""
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+
+    res = await main.analyze_subdomain(
+        None, "insuranext.example.com", ["crt.sh"], asyncio.Semaphore(5)
+    )
+
+    # The CNAME is KEPT even though the subdomain is NXDOMAIN for A/AAAA.
+    assert res["cname"] == "d123abc.cloudfront.net"
+    assert res["cname_chain"] == ["d123abc.cloudfront.net"]
+    # It matches CloudFront and reaches a confirmed VULNERABLE verdict.
+    assert main._match_cloud_resource(res["cname"]) == "AWS CloudFront"
+    assert res["takeover_verdict"] == "VULNERABLE"
+    assert res["takeover_risk"] == "HIGH"
+    assert res["resolved"] is False  # no A record on the subdomain itself
+    assert res["recommended_action"]
+
+
+# The same capture rule applies GENERALLY: an A-less ELB CNAME is kept and
+# verdicted (not CloudFront-only). A resolving ELB target -> NOT_VULNERABLE.
+async def test_dangling_cname_without_a_record_elb_kept_and_verdicted(monkeypatch):
+    async def fake_resolve_dns_detailed(host):
+        if host.endswith("elb.amazonaws.com"):
+            return ["52.1.2.3"], "RESOLVED"
+        return [], "NO_ANSWER"
+
+    async def fake_resolve_cname_chain(host):
+        return ["internal-lb.us-east-1.elb.amazonaws.com"]
+
+    async def fake_resolve_cname(host):
+        return "internal-lb.us-east-1.elb.amazonaws.com"
+
+    async def fake_resolve_ptrs(ips):
+        return []
+
+    async def boom_check_http(client, host):
+        # The ELB target refuses the bare probe (empty-message timeout) and must
+        # NOT swallow the verdict. The subdomain's own probe (no A record) just
+        # returns no status.
+        if host.endswith("elb.amazonaws.com"):
+            raise asyncio.TimeoutError()
+        return None, None, ""
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+    monkeypatch.setattr(main, "check_http", boom_check_http)
+
+    res = await main.analyze_subdomain(
+        None, "svc.example.com", ["crt.sh"], asyncio.Semaphore(5)
+    )
+
+    assert res["cname"] == "internal-lb.us-east-1.elb.amazonaws.com"
+    assert main._match_cloud_resource(res["cname"]) == "AWS ELB"
+    # Resolving ELB target -> NOT_VULNERABLE, with no empty-error marker.
+    assert res["takeover_verdict"] == "NOT_VULNERABLE"
+    assert "(error: )" not in res["takeover_evidence"]
+
+
+# ===========================================================================
+# Regression — a normal A-record subdomain (no cloud CNAME) is unchanged.
+# ===========================================================================
+@respx.mock
+async def test_normal_a_record_subdomain_unchanged(monkeypatch):
+    respx.route().mock(return_value=httpx.Response(200, text="welcome"))
+
+    async def fake_resolve_dns_detailed(host):
+        return ["93.184.216.34"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return []
+
+    async def fake_resolve_cname(host):
+        return None
+
+    async def fake_resolve_ptrs(ips):
+        return []
+
+    async def fake_check_http(client, host):
+        return 200, 200, "welcome"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+
+    client = httpx.AsyncClient()
+    try:
+        res = await main.analyze_subdomain(
+            client, "www.example.com", ["crt.sh"], asyncio.Semaphore(5)
+        )
+    finally:
+        await client.aclose()
+
+    assert res["takeover_risk"] == "NONE"
+    assert res["takeover_verdict"] == ""
+    assert res["recommended_action"] == ""
+    assert res["resolved"] is True
+    assert res["alive"] is True

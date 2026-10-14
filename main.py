@@ -1075,6 +1075,15 @@ def _socket_cname(host: str) -> Optional[str]:
     followed to. When that canonical name differs from the queried host it is,
     in practice, the CNAME target. This requires no external binary, so CNAME
     (and CNAME-based takeover) detection still works where `dig` is absent.
+
+    BUG 2 limitation (best-effort only): ``gethostbyname_ex`` resolves A
+    records, so a DANGLING CNAME whose target has NO A record (e.g. a deleted
+    CloudFront/ELB/S3 endpoint) raises ``gaierror`` and this returns None,
+    losing the CNAME. That is exactly the dangling-record case we must surface.
+    Mitigation: ``_resolve_cname_sync`` ALWAYS prefers ``_dig_cname`` (a
+    dedicated CNAME-TYPE query that returns the CNAME RR even when the target
+    has no A record) and only falls back here when ``dig`` is genuinely absent.
+    The box in production has ``dig``; this stdlib path is a degraded fallback.
     """
     try:
         canonical, aliases, _ = socket.gethostbyname_ex(host)
@@ -1092,7 +1101,15 @@ def _socket_cname(host: str) -> Optional[str]:
 
 
 def _resolve_cname_sync(host: str) -> Optional[str]:
-    """Try `dig` first, then fall back to the stdlib socket resolver."""
+    """Try `dig` first, then fall back to the stdlib socket resolver.
+
+    BUG 2: dig-first is REQUIRED, not just an optimization. ``_dig_cname`` runs
+    a CNAME-TYPE query, so it returns the CNAME RR even for a dangling CNAME
+    whose target has no A record (NXDOMAIN-on-target). ``_socket_cname`` cannot
+    see that case (it needs an A record), so a CNAME captured via dig is what
+    keeps a dangling *.cloudfront.net/*.elb.* record flowing into
+    _match_cloud_resource -> VERIFY -> verify_takeover.
+    """
     cname = _dig_cname(host)
     if cname:
         return cname
@@ -1466,6 +1483,10 @@ async def verify_takeover(
         https_status: Optional[int] = None
         body = ""
         probed = False
+        # Captures a probe-local failure (never a bare empty str()). Folded into
+        # the status-is-None INCONCLUSIVE evidence so a real failure is
+        # diagnosable instead of silently masked.
+        probe_error: Optional[str] = None
         if probe_blocked:
             return {
                 "verdict": VERDICT_INCONCLUSIVE,
@@ -1478,13 +1499,26 @@ async def verify_takeover(
 
         # Probe the target endpoint, bounded by the shared semaphore. CNAME-only
         # targets (no A/AAAA) are still probed; httpx re-resolves at connect.
+        #
+        # BUG 1: this probe is wrapped in its OWN try/except so a probe failure
+        # (asyncio.TimeoutError / socket.gaierror / httpx.ConnectError — all of
+        # which have an EMPTY str()) does NOT propagate to the outer catch-all
+        # and get stringified into "Verification could not complete (error: )".
+        # On failure we leave status None and let the per-provider branch decide
+        # on DNS evidence alone (e.g. a resolving ELB -> NOT_VULNERABLE even when
+        # it refuses a bare HTTP probe). The failure is recorded in probe_error.
         if final_target_norm:
-            async with sem:
-                http_status, https_status, body = await asyncio.wait_for(
-                    check_http(probe_client, final_target_norm),
-                    timeout=VERIFY_HTTP_TIMEOUT,
-                )
-            probed = True
+            try:
+                async with sem:
+                    http_status, https_status, body = await asyncio.wait_for(
+                        check_http(probe_client, final_target_norm),
+                        timeout=VERIFY_HTTP_TIMEOUT,
+                    )
+                probed = True
+            except Exception as probe_exc:  # noqa: BLE001 — never re-raise.
+                http_status, https_status, body = None, None, ""
+                probed = False
+                probe_error = f"{type(probe_exc).__name__}: {probe_exc!r}"
 
         body_lower = (body or "").lower()
         status = http_status if http_status is not None else https_status
@@ -1549,11 +1583,26 @@ async def verify_takeover(
                         f"({obs})."
                     ),
                 }
+            # The ELB branch handles its OWN resolution errors locally (never
+            # the outer catch-all): a resolver timeout/SERVFAIL/ERROR is a
+            # transient DNS condition, not a takeover. Report a SPECIFIC,
+            # retriable message distinct from the generic indeterminate case.
+            if target_dns_status in ("TIMEOUT", "ERROR", "SERVFAIL"):
+                return {
+                    "verdict": VERDICT_INCONCLUSIVE,
+                    "evidence": (
+                        "ELB target resolution did not complete "
+                        f"(status={target_dns_status}); retry or verify ownership "
+                        f"in AWS ({obs})."
+                        + (f" [probe_error: {probe_error}]" if probe_error else "")
+                    ),
+                }
             return {
                 "verdict": VERDICT_INCONCLUSIVE,
                 "evidence": (
                     "AWS ELB target gave an indeterminate signal; ELB names are not "
                     f"attacker-claimable — confirm ownership in AWS ({obs})."
+                    + (f" [probe_error: {probe_error}]" if probe_error else "")
                 ),
             }
 
@@ -1572,12 +1621,17 @@ async def verify_takeover(
                 )
             )
             if not probed:
+                reason = (
+                    f"probe failed ({probe_error})"
+                    if probe_error
+                    else "no final target to probe"
+                )
                 return {
                     "verdict": VERDICT_INCONCLUSIVE,
                     "evidence": (
-                        "AWS CloudFront target could not be probed (no final "
-                        "target) — manually verify the distribution in the AWS "
-                        f"CloudFront console ({obs})."
+                        f"AWS CloudFront target could not be probed ({reason}) — "
+                        "manually verify the distribution in the AWS CloudFront "
+                        f"console ({obs})."
                     ),
                 }
             if no_distribution_sig:
@@ -1609,6 +1663,7 @@ async def verify_takeover(
                         "AWS CloudFront probe timed out / was blocked with no "
                         "status. Recommended action: manually verify the "
                         f"distribution alias in the AWS CloudFront console ({obs})."
+                        + (f" [probe_error: {probe_error}]" if probe_error else "")
                     ),
                 }
             # A bare 403/404 (or other app error) WITHOUT the no-distribution
@@ -1774,12 +1829,21 @@ async def verify_takeover(
             "evidence": (
                 f"No provider-specific takeover signature available ({probe_note}). "
                 f"Observations: {obs}. Manually confirm resource ownership."
+                + (f" [probe_error: {probe_error}]" if probe_error else "")
             ),
         }
     except Exception as exc:  # noqa: BLE001
+        # BUG 1: NEVER stringify a bare exception whose str() is empty (e.g.
+        # asyncio.TimeoutError, socket.gaierror, httpx.ConnectError('')) — that
+        # produced the opaque "Verification could not complete (error: )."
+        # evidence. Record the exception TYPE and repr so the evidence is always
+        # a non-empty, diagnosable string.
         return {
             "verdict": VERDICT_INCONCLUSIVE,
-            "evidence": f"Verification could not complete (error: {exc}).",
+            "evidence": (
+                f"Verification could not complete "
+                f"(error: {type(exc).__name__}: {exc!r})."
+            ),
         }
 
 
@@ -1811,6 +1875,13 @@ async def analyze_subdomain(
 
     async with sem:
         ip_addresses, dns_status = await resolve_dns_detailed(sub)
+        # BUG 2: resolve the CNAME chain INDEPENDENTLY of dns_status and NEVER
+        # clear it when dns_status is NXDOMAIN/NO_ANSWER. A dangling CNAME (the
+        # subdomain has no A record but still CNAMEs to a cloud provider whose
+        # resource was deleted) is the whole point of takeover detection: the
+        # captured cname/cname_chain is what lets check_takeover flag VERIFY and
+        # verify_takeover render a verdict. resolve_cname_chain uses a dedicated
+        # dig CNAME-TYPE query, so it returns the CNAME RR even with no A record.
         cname_chain = await resolve_cname_chain(sub)
         cname = cname_chain[0] if cname_chain else await resolve_cname(sub)
         # Additive (FEAT-002): enumerate ALL DNS record types for this host,
