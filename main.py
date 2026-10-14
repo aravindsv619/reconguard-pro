@@ -337,7 +337,8 @@ def _csv_safe(value) -> str:
 TAKEOVER_FINGERPRINTS = {
     "github.io": {"service": "GitHub Pages", "fingerprint": "There isn't a GitHub Pages site here", "severity": "HIGH"},
     "s3.amazonaws.com": {"service": "AWS S3", "fingerprint": "NoSuchBucket", "severity": "HIGH"},
-    "amazonaws.com": {"service": "AWS S3", "fingerprint": "NoSuchBucket", "severity": "HIGH"},
+    "s3-website": {"service": "AWS S3", "fingerprint": "NoSuchBucket", "severity": "HIGH"},
+    "s3-accelerate": {"service": "AWS S3", "fingerprint": "NoSuchBucket", "severity": "HIGH"},
     "cloudfront.net": {"service": "AWS CloudFront", "fingerprint": "Bad request", "severity": "MEDIUM"},
     "herokudns.com": {"service": "Heroku", "fingerprint": "No such app", "severity": "HIGH"},
     "herokuapp.com": {"service": "Heroku", "fingerprint": "No such app", "severity": "HIGH"},
@@ -1389,6 +1390,21 @@ def check_takeover(
     # body gathered). A live host returning real content stays LOW. Uses ONLY
     # already-gathered data (CNAME chain + the HTTP statuses passed in) and
     # issues NO new network request.
+    # BUG 2: a host whose HTTP or HTTPS probe returns a healthy status is LIVE
+    # and claimed, so it is NEVER assigned a VERIFY/takeover risk purely from a
+    # service match. "Healthy" = any 2xx, or a normal (non-takeover-signature)
+    # redirect 301/302/307/308. When alive, a legitimately-detected cloud
+    # resource is returned as LOW so the row still flows through the
+    # cloud_low -> verify_takeover path and renders a concrete NOT_VULNERABLE
+    # verdict — never a VERIFY flag and never an INCONCLUSIVE "remove if
+    # dangling" action. The dangling signal (404/503/no-response) is unchanged.
+    def _is_healthy(status: Optional[int]) -> bool:
+        return status is not None and (
+            200 <= status < 300 or status in (301, 302, 307, 308)
+        )
+
+    http_alive = _is_healthy(http_status) or _is_healthy(https_status)
+
     chain = cname_chain or []
     final_target = chain[-1] if chain else cname
     provider = _match_cloud_resource(final_target)
@@ -1399,15 +1415,23 @@ def check_takeover(
             and https_status is None
             and not (http_body or "").strip()
         )
-        # AWS ELB/ALB CNAMEs must ALWAYS reach the verify pass, regardless of
-        # HTTP liveness. The broad "amazonaws.com" -> AWS S3 fingerprint above
-        # matches any "...elb.amazonaws.com" CNAME and would otherwise hold a
-        # live (200) ELB at LOW/AWS S3 — a misclassification, since the anchored
-        # CLOUD_RESOURCE_PATTERNS match identified it as an ELB whose name is
-        # AWS-assigned (not attacker-claimable). Routing it into verify_takeover
-        # yields the correct NOT_VULNERABLE (resolving target) verdict instead of
-        # a wrong LOW with an empty verdict. This anchored match takes precedence
-        # over the broad S3 fingerprint hold.
+        # A live cloud host (healthy 2xx/redirect) is claimed, not dangling.
+        # It is still a real cloud resource, so return LOW (not VERIFY): the
+        # cloud_low path routes it into verify_takeover for a concrete
+        # NOT_VULNERABLE verdict. ELB is included — a live ELB is owned, never
+        # a flag.
+        if http_alive:
+            target_display = (final_target or "").strip().rstrip(".").lower()
+            detail = (
+                f"CNAME points to {provider} ({target_display}) and the host is "
+                "live (healthy HTTP response) — the resource is claimed; confirm "
+                "ownership only if decommissioning."
+            )
+            return "LOW", provider, detail
+        # AWS ELB/ALB CNAMEs reach the verify pass when NOT live: the ELB name
+        # is AWS-assigned (not attacker-claimable), and routing a non-live ELB
+        # into verify_takeover yields a concrete verdict instead of a bare LOW
+        # with an empty verdict.
         if provider == "AWS ELB":
             target_display = (final_target or "").strip().rstrip(".").lower()
             detail = (
@@ -1452,6 +1476,17 @@ def check_takeover(
             None,
         )
         if cf_ptr is not None:
+            # A live (healthy) CloudFront alias is claimed by a distribution, so
+            # it is never a VERIFY flag — return LOW so it still routes through
+            # verify_takeover for a concrete NOT_VULNERABLE verdict. Only a
+            # non-live alias remains a VERIFY candidate.
+            if http_alive:
+                detail = (
+                    "Served directly by AWS CloudFront edge IPs "
+                    f"(PTR {cf_ptr}) with no CNAME and the host is live "
+                    "(healthy HTTP response) — a distribution claims this alias."
+                )
+                return "LOW", "AWS CloudFront", detail
             detail = (
                 "Served directly by AWS CloudFront edge IPs "
                 f"(PTR {cf_ptr}) with no CNAME — verify a CloudFront "

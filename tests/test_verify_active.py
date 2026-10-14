@@ -843,10 +843,12 @@ async def test_arecord_cloudfront_healthy_not_vulnerable(monkeypatch):
         None, "bimi.example.com", ["crt.sh"], asyncio.Semaphore(5)
     )
 
-    # Identified as CloudFront via the A-record PTR, flagged (not LOW), and
-    # routed into verify_takeover which sets a concrete verdict (NOT empty).
+    # BUG 2: a LIVE (200) CloudFront alias is claimed, so it is LOW (never a
+    # VERIFY flag). It is still identified as CloudFront via the A-record PTR
+    # and routed into verify_takeover via the cloud_low path, which renders a
+    # concrete NOT_VULNERABLE verdict (never empty, never INCONCLUSIVE-dangling).
     assert res["takeover_service"] == "AWS CloudFront"
-    assert res["takeover_risk"] == "VERIFY"
+    assert res["takeover_risk"] == "LOW"
     assert res["takeover_verdict"] == "NOT_VULNERABLE"
     assert res["takeover_evidence"]
     assert res["recommended_action"]
@@ -886,10 +888,11 @@ async def test_arecord_cloudfront_unclaimed_alias_vulnerable(monkeypatch):
     assert res["recommended_action"]
 
 
-def test_check_takeover_arecord_cloudfront_ptr_is_verify():
-    # A CloudFront A-record PTR (no CNAME) is routed to VERIFY so a verdict can
-    # be rendered. An S3 A-record PTR without a body stays LOW (unchanged) —
-    # only CloudFront's alias is verifiably claimable from an A-record hit.
+def test_check_takeover_arecord_cloudfront_ptr_live_is_low():
+    # BUG 2: a LIVE (200/200) CloudFront A-record host is claimed by a
+    # distribution, so it is never a VERIFY flag — it is LOW/AWS CloudFront and
+    # still routes through the cloud_low path for a concrete verdict. An S3
+    # A-record PTR without a body stays LOW (unchanged).
     risk, service, detail = main.check_takeover(
         subdomain="bimi.example.com",
         cname=None,
@@ -899,8 +902,21 @@ def test_check_takeover_arecord_cloudfront_ptr_is_verify():
         http_status=200,
         https_status=200,
     )
-    assert risk == "VERIFY"
+    assert risk == "LOW"
     assert service == "AWS CloudFront"
+
+    # A non-live CloudFront A-record alias is still a VERIFY candidate.
+    risk_dead, service_dead, _ = main.check_takeover(
+        subdomain="bimi.example.com",
+        cname=None,
+        a_records=["93.184.216.34"],
+        http_body="",
+        ptr_hosts=["server-93-184-216-34.maa51.r.cloudfront.net"],
+        http_status=404,
+        https_status=None,
+    )
+    assert risk_dead == "VERIFY"
+    assert service_dead == "AWS CloudFront"
 
     # Regression: an S3 A-record PTR (no body) is still LOW, not VERIFY.
     risk_s3, service_s3, _ = main.check_takeover(
@@ -914,10 +930,10 @@ def test_check_takeover_arecord_cloudfront_ptr_is_verify():
     assert service_s3 == "AWS S3"
 
 
-def test_check_takeover_http_alive_elb_cname_is_verify():
-    # Regression for the live-scan misclassification: an HTTP-alive (200/200)
-    # ELB/ALB CNAME must be classified AWS ELB -> VERIFY and reach the verify
-    # pass, NOT held at AWS S3 / LOW by the broad "amazonaws.com" fingerprint.
+def test_check_takeover_http_alive_elb_cname_is_low():
+    # BUG 2: an HTTP-alive (200/200) ELB/ALB CNAME is a LIVE, claimed host, so
+    # it is classified AWS ELB -> LOW (never a VERIFY flag) and still reaches
+    # the verify pass via the cloud_low path, rendering NOT_VULNERABLE.
     for target in (
         "demo-alb-1234567890.us-east-1.elb.amazonaws.com",
         "demo-common-1234567890.us-east-1.elb.amazonaws.com",
@@ -933,7 +949,7 @@ def test_check_takeover_http_alive_elb_cname_is_verify():
             https_status=200,
             cname_chain=[target],
         )
-        assert risk == "VERIFY", f"{target} should be VERIFY, got {risk}"
+        assert risk == "LOW", f"{target} should be LOW, got {risk}"
         assert service == "AWS ELB", f"{target} should be AWS ELB, got {service}"
         assert detail
 
@@ -947,7 +963,7 @@ def test_check_takeover_http_alive_elb_cname_is_verify():
         https_status=200,
         cname_chain=["demo-alb-1234567890.us-east-1.elb.amazonaws.com."],
     )
-    assert risk_dot == "VERIFY"
+    assert risk_dot == "LOW"
     assert service_dot == "AWS ELB"
 
 

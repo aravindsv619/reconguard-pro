@@ -214,19 +214,19 @@
 
       <!-- Results table -->
       <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto">
-        <table class="w-full text-sm">
+        <table class="w-full min-w-[1024px] text-sm">
           <thead>
             <tr class="text-gray-400 text-left border-b border-gray-800">
-              <th class="sortable py-3 px-3" onclick="sortResults('subdomain')">Subdomain</th>
-              <th class="py-3 px-3">IP Addresses</th>
-              <th class="py-3 px-3">CNAME</th>
-              <th class="sortable py-3 px-3" onclick="sortResults('dns_status')">DNS</th>
-              <th class="sortable py-3 px-3" onclick="sortResults('http_status')">HTTP</th>
-              <th class="sortable py-3 px-3" onclick="sortResults('https_status')">HTTPS</th>
-              <th class="py-3 px-3">Sources</th>
-              <th class="sortable py-3 px-3" onclick="sortResults('takeover_risk')">Risk</th>
-              <th class="py-3 px-3">Verdict</th>
-              <th class="sortable py-3 px-3" onclick="sortResults('alive')">Live</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('subdomain')">Subdomain</th>
+              <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">IP Addresses</th>
+              <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">CNAME</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('dns_status')">DNS</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('http_status')">HTTP</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('https_status')">HTTPS</th>
+              <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Sources</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('takeover_risk')">Risk</th>
+              <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Verdict</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" onclick="sortResults('alive')">Live</th>
             </tr>
           </thead>
           <tbody id="resultsTable"></tbody>
@@ -630,20 +630,20 @@
               <span class="text-gray-300">${escapeHtml(String(r.recommended_action))}</span></div>`
           : '';
         return `<tr class="border-b border-gray-800/60 animate-fadein hover:bg-gray-800/40">
-          <td class="py-2 px-3 font-mono text-brand-300">
+          <td class="py-2 px-3 font-mono text-brand-300 whitespace-nowrap">
             <button type="button" onclick="toggleRecords(${idx})" title="Show all DNS records"
               class="mr-1 text-gray-500 hover:text-brand-300 focus:outline-none" aria-label="Toggle DNS records">
               <span id="rectri-${idx}">▸</span>
             </button>${escapeHtml(r.subdomain)}</td>
-          <td class="py-2 px-3 text-gray-400 font-mono text-xs">${escapeHtml((r.ip_addresses||[]).join(', ')) || '—'}</td>
-          <td class="py-2 px-3 text-gray-400 font-mono text-xs"${cnameTitle}>${escapeHtml(r.cname || '') || '—'}</td>
-          <td class="py-2 px-3 text-gray-400 font-mono text-xs">${escapeHtml(r.dns_status || '') || '—'}</td>
-          <td class="py-2 px-3">${statusCell(r.http_status)}</td>
-          <td class="py-2 px-3">${statusCell(r.https_status)}</td>
-          <td class="py-2 px-3 text-gray-500 text-xs">${escapeHtml((r.sources||[]).join(', '))}${sourceChips(r.sources)}</td>
-          <td class="py-2 px-3"${title}>${riskBadge(r.takeover_risk)}</td>
-          <td class="py-2 px-3"${verdictTitle}>${verdictBadge(r.takeover_verdict)}</td>
-          <td class="py-2 px-3 text-center">${dot}</td>
+          <td class="py-2 px-3 text-gray-400 font-mono text-xs whitespace-nowrap">${escapeHtml((r.ip_addresses||[]).join(', ')) || '—'}</td>
+          <td class="py-2 px-3 text-gray-400 font-mono text-xs whitespace-nowrap"${cnameTitle}>${escapeHtml(r.cname || '') || '—'}</td>
+          <td class="py-2 px-3 text-gray-400 font-mono text-xs whitespace-nowrap">${escapeHtml(r.dns_status || '') || '—'}</td>
+          <td class="py-2 px-3 whitespace-nowrap">${statusCell(r.http_status)}</td>
+          <td class="py-2 px-3 whitespace-nowrap">${statusCell(r.https_status)}</td>
+          <td class="py-2 px-3 text-gray-500 text-xs whitespace-nowrap">${escapeHtml((r.sources||[]).join(', '))}${sourceChips(r.sources)}</td>
+          <td class="py-2 px-3 whitespace-nowrap"${title}>${riskBadge(r.takeover_risk)}</td>
+          <td class="py-2 px-3 whitespace-nowrap"${verdictTitle}>${verdictBadge(r.takeover_verdict)}</td>
+          <td class="py-2 px-3 text-center whitespace-nowrap">${dot}</td>
         </tr>
         <tr id="recrow-${idx}" class="hidden bg-gray-900/60 border-b border-gray-800/60">
           <td colspan="10" class="py-2 px-6">

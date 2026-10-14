@@ -91,12 +91,11 @@ def test_verify_does_not_override_high():
     assert service == "GitHub Pages"
 
 
-def test_cloud_resource_healthy_200_elb_routes_to_verify():
-    # A healthy 200 ELB/ALB CNAME must STILL route into the verify pass (so
-    # verify_takeover can render NOT_VULNERABLE from the resolving target),
-    # rather than being held at AWS S3 / LOW by the broad "amazonaws.com"
-    # fingerprint. The anchored ELB CLOUD_RESOURCE_PATTERNS match takes
-    # precedence over the broad S3 fingerprint regardless of HTTP liveness.
+def test_cloud_resource_healthy_200_elb_is_low_not_flag():
+    # BUG 2: a healthy 200 ELB/ALB CNAME is a LIVE, claimed host, so it is
+    # classified AWS ELB -> LOW (never a VERIFY flag). It still routes into the
+    # verify pass via the cloud_low path, where verify_takeover renders
+    # NOT_VULNERABLE from the resolving target.
     risk, service, detail = main.check_takeover(
         subdomain="live.example.com",
         cname="app.us-east-1.elb.amazonaws.com",
@@ -107,7 +106,7 @@ def test_cloud_resource_healthy_200_elb_routes_to_verify():
         https_status=200,
         cname_chain=["app.us-east-1.elb.amazonaws.com"],
     )
-    assert risk == "VERIFY"
+    assert risk == "LOW"
     assert service == "AWS ELB"
 
 
