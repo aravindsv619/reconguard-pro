@@ -135,6 +135,67 @@ steps and were NOT run here per the step instruction.
 
 ---
 
+## Iteration 2 — review fix (A-record CloudFront reaches a verdict)
+
+Review `subrecon-bugfix-review.json` (verdict CHANGES_REQUESTED) raised one
+code-level finding `cloudfront-arecord-not-verdicted` (the live-gate finding is
+its downstream consequence):
+
+> `bimi.example.com` is served by CloudFront A records whose PTR identifies
+> CloudFront, so `_match_cloud_resource` sets `takeover_service='AWS CloudFront'`
+> via the A-record PTR path — but `cname` is null, so the CNAME-gated CloudFront
+> branch in `verify_takeover` never ran and the host was dropped at LOW with an
+> empty verdict. Route A-record-PTR CloudFront hits into `verify_takeover`.
+
+Confirmed real resolver behavior this iteration:
+- `dig +short CNAME bimi.example.com` -> EMPTY (no CNAME).
+- `dig +short A bimi.example.com` -> `108.158.251.{96,87,10,118}` (CloudFront edge).
+- `dig +short -x 93.184.216.34` -> `server-93-184-216-34.maa51.r.cloudfront.net.`
+  which matches `^.+\.cloudfront\.net\Z` in `_match_cloud_resource`.
+- `dig +short CNAME docs.example.com` -> `common-alb-...elb.amazonaws.com.`
+  (the ELB/ALB CNAME path is unchanged).
+
+Changes made in `main.py` (scoped, no security-guard or CSV changes):
+- `check_takeover` VERIFY tier: added a CloudFront-ONLY A-record branch. When
+  no CNAME-based VERIFY and no HIGH/MEDIUM fingerprint already returned, and the
+  host has NO CNAME, and an A-record PTR matches CloudFront, return
+  `("VERIFY", "AWS CloudFront", <detail>)`. S3/ELB/etc. A-record-only hits are
+  deliberately NOT promoted (their target names are not attacker-choosable from
+  an A-record match), so `test_takeover_a_record_ptr_match_low_without_body`
+  (S3 -> LOW) is unchanged.
+- `verify_takeover`: when `provider` is unset (no CNAME) but
+  `result['takeover_service'] == 'AWS CloudFront'`, treat the provider as
+  CloudFront and use the SUBDOMAIN itself as the resolve/probe target (the alias
+  claimability is decided by probing the alias, not the edge IP's PTR). The
+  existing CNAME-based path is untouched. The CloudFront branch then renders
+  NOT_VULNERABLE (healthy 200) or VULNERABLE (no-distribution body signature)
+  instead of leaving the row at LOW with an empty verdict.
+
+Tests added in `tests/test_verify_active.py` (3 new, drive the real path):
+- `test_arecord_cloudfront_healthy_not_vulnerable` — full `analyze_subdomain`
+  flow: CloudFront A records + PTR, no CNAME, alias answers 200 -> service
+  CloudFront, risk VERIFY, verdict NOT_VULNERABLE, non-empty evidence + action.
+- `test_arecord_cloudfront_unclaimed_alias_vulnerable` — same discovery but the
+  alias returns the CloudFront no-distribution body -> VULNERABLE, risk HIGH.
+- `test_check_takeover_arecord_cloudfront_ptr_is_verify` — unit assertion that a
+  CloudFront A-record PTR yields VERIFY, and a regression assertion that an S3
+  A-record PTR without a body stays LOW (behavior unchanged for non-CloudFront).
+
+Commands run (single-run mode, venv):
+- `/home/aravind/New-SEC/.venv/bin/python -m pytest -q`
+  -> `171 passed` (168 from iteration 1 + 3 new), 0 failed.
+- `/home/aravind/New-SEC/.venv/bin/python -c "import ast; ast.parse(open('main.py').read()); import main; print(len(main.CSV_COLUMNS), main.CSV_COLUMNS[-1])"`
+  -> `16 recommended_action` (CSV 16-column contract intact).
+
+Security guards untouched: `_is_safe_public_ip` SSRF gate, the single shared
+`Semaphore(50)` (NO new semaphore), `_csv_safe`, `is_valid_hostname`, XSS-safe
+frontend. `verify_takeover` still never raises. The A-record CloudFront probe
+reuses the SSRF-guarded `probe_client` and the passed-in `sem`.
+
+Items 9 (live keyless re-scan) and 10 (verdict file) remain DOWNSTREAM.
+
+---
+
 ## Plan
 
 - [x] 1. BUG 1 — Make `verify_takeover`'s target probe fail soft so a resolving ELB (or any provider) reaches its branch, and make the outer catch-all evidence non-empty.

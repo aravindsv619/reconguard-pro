@@ -1415,6 +1415,33 @@ def check_takeover(
             )
             return "VERIFY", provider, detail
 
+    # CloudFront A-record VERIFY tier. A host served DIRECTLY by CloudFront A
+    # records (no *.cloudfront.net CNAME — the PTR of the edge IP is what
+    # identifies the provider) is still a takeover candidate: a CloudFront
+    # alias is attacker-claimable when NO distribution owns it, and that is
+    # decided by probing the ALIAS (this subdomain), not the edge IP's PTR.
+    # Unlike S3/ELB (whose target names are not attacker-choosable here, so an
+    # A-record-only match stays LOW), CloudFront's alias claimability is
+    # verifiable, so we route it into verify_takeover for a concrete verdict
+    # instead of dropping it at LOW. This fires ONLY when no CNAME-based VERIFY
+    # or HIGH/MEDIUM fingerprint already returned above, and only for a
+    # CloudFront A-record PTR (not S3/ELB/etc.), so existing LOW behavior for
+    # those providers is unchanged. The verify pass decides VULNERABLE vs
+    # NOT_VULNERABLE on the alias's own response signature.
+    if provider is None and not (chain or cname):
+        cf_ptr = next(
+            (p for p in ptr_hosts if _match_cloud_resource(p) == "AWS CloudFront"),
+            None,
+        )
+        if cf_ptr is not None:
+            detail = (
+                "Served directly by AWS CloudFront edge IPs "
+                f"(PTR {cf_ptr}) with no CNAME — verify a CloudFront "
+                "distribution still claims this alias; an unclaimed alias is "
+                "attacker-registerable."
+            )
+            return "VERIFY", "AWS CloudFront", detail
+
     if held_low is not None:
         return held_low
     return "NONE", None, None
@@ -1456,6 +1483,16 @@ async def verify_takeover(
         cname = result.get("cname")
         final_target = chain[-1] if chain else cname
         provider = _match_cloud_resource(final_target)
+        # A-record CloudFront: the host is served directly by CloudFront edge
+        # IPs with NO *.cloudfront.net CNAME (the provider was identified from
+        # the edge IP's PTR in check_takeover). CloudFront claimability is
+        # decided by probing the ALIAS itself (this subdomain), so when there
+        # is no CNAME target, fall back to the subdomain as the probe/resolve
+        # target and treat the provider as CloudFront. This never changes the
+        # CNAME-based path (final_target is set there).
+        if provider is None and not final_target and result.get("takeover_service") == "AWS CloudFront":
+            provider = "AWS CloudFront"
+            final_target = result.get("subdomain")
         # Strip the trailing dot (and whitespace) ONCE up front and resolve/
         # probe the clean name. A trailing-dotted CNAME target (e.g.
         # "...elb.amazonaws.com.") otherwise fails resolution and never maps to

@@ -805,3 +805,110 @@ async def test_normal_a_record_subdomain_unchanged(monkeypatch):
     assert res["recommended_action"] == ""
     assert res["resolved"] is True
     assert res["alive"] is True
+
+
+# ===========================================================================
+# A-RECORD CloudFront — a host served DIRECTLY by CloudFront edge IPs (no
+# *.cloudfront.net CNAME; the provider is identified from the edge IP's PTR)
+# must NOT be dropped at LOW with an empty verdict. It is routed into
+# verify_takeover, which probes the ALIAS (the subdomain) and renders a verdict.
+# This is the live gap from the review (bimi.example.com): A-record-PTR
+# CloudFront hits previously never reached verify_takeover.
+# ===========================================================================
+async def test_arecord_cloudfront_healthy_not_vulnerable(monkeypatch):
+    # Healthy owned distribution: the alias (subdomain) answers 200. The host
+    # has CloudFront A records (PTR identifies CloudFront) and NO CNAME.
+    async def fake_resolve_dns_detailed(host):
+        return ["93.184.216.34"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return []
+
+    async def fake_resolve_cname(host):
+        return None
+
+    async def fake_resolve_ptrs(ips):
+        return ["server-93-184-216-34.maa51.r.cloudfront.net"]
+
+    async def fake_check_http(client, host):
+        return 200, 200, "welcome"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+
+    res = await main.analyze_subdomain(
+        None, "bimi.example.com", ["crt.sh"], asyncio.Semaphore(5)
+    )
+
+    # Identified as CloudFront via the A-record PTR, flagged (not LOW), and
+    # routed into verify_takeover which sets a concrete verdict (NOT empty).
+    assert res["takeover_service"] == "AWS CloudFront"
+    assert res["takeover_risk"] == "VERIFY"
+    assert res["takeover_verdict"] == "NOT_VULNERABLE"
+    assert res["takeover_evidence"]
+    assert res["recommended_action"]
+
+
+async def test_arecord_cloudfront_unclaimed_alias_vulnerable(monkeypatch):
+    # The alias is NOT claimed by any distribution: probing the subdomain
+    # returns the CloudFront no-distribution signature -> VULNERABLE, HIGH.
+    async def fake_resolve_dns_detailed(host):
+        return ["93.184.216.34"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return []
+
+    async def fake_resolve_cname(host):
+        return None
+
+    async def fake_resolve_ptrs(ips):
+        return ["server-93-184-216-34.maa51.r.cloudfront.net"]
+
+    async def fake_check_http(client, host):
+        return 403, None, "ERROR: The request could not be satisfied."
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+
+    res = await main.analyze_subdomain(
+        None, "bimi.example.com", ["crt.sh"], asyncio.Semaphore(5)
+    )
+
+    assert res["takeover_service"] == "AWS CloudFront"
+    assert res["takeover_verdict"] == "VULNERABLE"
+    assert res["takeover_risk"] == "HIGH"
+    assert res["recommended_action"]
+
+
+def test_check_takeover_arecord_cloudfront_ptr_is_verify():
+    # A CloudFront A-record PTR (no CNAME) is routed to VERIFY so a verdict can
+    # be rendered. An S3 A-record PTR without a body stays LOW (unchanged) —
+    # only CloudFront's alias is verifiably claimable from an A-record hit.
+    risk, service, detail = main.check_takeover(
+        subdomain="bimi.example.com",
+        cname=None,
+        a_records=["93.184.216.34"],
+        http_body="",
+        ptr_hosts=["server-93-184-216-34.maa51.r.cloudfront.net"],
+        http_status=200,
+        https_status=200,
+    )
+    assert risk == "VERIFY"
+    assert service == "AWS CloudFront"
+
+    # Regression: an S3 A-record PTR (no body) is still LOW, not VERIFY.
+    risk_s3, service_s3, _ = main.check_takeover(
+        subdomain="foo.example.com",
+        cname=None,
+        a_records=["52.1.2.3"],
+        http_body="",
+        ptr_hosts=["s3-website.s3.amazonaws.com"],
+    )
+    assert risk_s3 == "LOW"
+    assert service_s3 == "AWS S3"
