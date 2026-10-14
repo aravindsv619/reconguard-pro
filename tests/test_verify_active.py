@@ -949,3 +949,121 @@ def test_check_takeover_http_alive_elb_cname_is_verify():
     )
     assert risk_dot == "VERIFY"
     assert service_dot == "AWS ELB"
+
+
+# ===========================================================================
+# A-RECORD CloudFront — the probe TIMES OUT / is blocked. The alias cannot be
+# confirmed, so the verdict is INCONCLUSIVE with a concrete recommended_action
+# (manual CloudFront console check). It must NEVER be left empty. This is the
+# third of the three A-record CloudFront outcomes (200 -> NOT_VULNERABLE and
+# no-distribution -> VULNERABLE are covered above).
+# ===========================================================================
+async def test_arecord_cloudfront_probe_timeout_inconclusive(monkeypatch):
+    async def fake_resolve_dns_detailed(host):
+        return ["93.184.216.34"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return []
+
+    async def fake_resolve_cname(host):
+        return None
+
+    async def fake_resolve_ptrs(ips):
+        return ["server-93-184-216-34.maa51.r.cloudfront.net"]
+
+    async def fake_check_http(client, host):
+        # Simulate a blocked/timed-out probe: no status, no body. The verify
+        # pass maps a status-less CloudFront probe to INCONCLUSIVE.
+        return None, None, ""
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+
+    res = await main.analyze_subdomain(
+        None, "bimi.example.com", ["crt.sh"], asyncio.Semaphore(5)
+    )
+
+    assert res["takeover_service"] == "AWS CloudFront"
+    assert res["takeover_risk"] == "VERIFY"
+    assert res["takeover_verdict"] == "INCONCLUSIVE"
+    assert res["takeover_evidence"]
+    assert res["recommended_action"]
+
+
+# ===========================================================================
+# A held-LOW cloud-detected row (non-empty takeover_service, risk LOW) must
+# ALSO be routed into verify_takeover so it ends with a NON-EMPTY verdict —
+# never a dead-end empty verdict for a row whose takeover_service is set.
+# Here an A-record S3 PTR with no decisive body stays LOW, but because a cloud
+# service was detected it is verified and gets a concrete verdict + action.
+# ===========================================================================
+async def test_cloud_low_service_row_gets_nonempty_verdict(monkeypatch):
+    async def fake_resolve_dns_detailed(host):
+        return ["52.1.2.3"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return []
+
+    async def fake_resolve_cname(host):
+        return None
+
+    async def fake_resolve_ptrs(ips):
+        return ["s3-website-us-east-1.amazonaws.com"]
+
+    async def fake_check_http(client, host):
+        return 200, 200, ""
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+
+    res = await main.analyze_subdomain(
+        None, "assets.example.com", ["crt.sh"], asyncio.Semaphore(5)
+    )
+
+    # Detected as a cloud service (held LOW), still routed to a real verdict.
+    assert res["takeover_service"]
+    assert res["takeover_risk"] == "LOW"
+    assert res["takeover_verdict"] != ""
+    assert res["recommended_action"] != ""
+
+
+# ===========================================================================
+# Regression: a PLAIN non-cloud A-record subdomain (no cloud service detected)
+# correctly keeps an EMPTY takeover_verdict. Empty is right ONLY when no cloud
+# takeover_service is set.
+# ===========================================================================
+async def test_plain_arecord_noncloud_empty_verdict(monkeypatch):
+    async def fake_resolve_dns_detailed(host):
+        return ["93.184.216.34"], "RESOLVED"
+
+    async def fake_resolve_cname_chain(host):
+        return []
+
+    async def fake_resolve_cname(host):
+        return None
+
+    async def fake_resolve_ptrs(ips):
+        return ["edge.example-cdn.net"]
+
+    async def fake_check_http(client, host):
+        return 200, 200, "welcome"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", fake_resolve_cname_chain)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+
+    res = await main.analyze_subdomain(
+        None, "www.example.com", ["crt.sh"], asyncio.Semaphore(5)
+    )
+
+    assert not res["takeover_service"]
+    assert res["takeover_verdict"] == ""
+    assert res["recommended_action"] == ""

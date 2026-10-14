@@ -1493,7 +1493,15 @@ async def verify_takeover(
     attacker-choosable, so they prefer NOT_VULNERABLE/INCONCLUSIVE.
     """
     risk = result.get("takeover_risk")
-    if risk not in ("VERIFY", "HIGH"):
+    # Flagged candidates (VERIFY/HIGH) always run the active pass. A LOW row is
+    # normally non-actionable and gets an empty verdict — EXCEPT a LOW that was
+    # produced by cloud-resource detection (a non-empty takeover_service, e.g.
+    # the held_low S3/ELB A-record-PTR path). Such a row names a detected cloud
+    # service, so it must END in a concrete verdict, never a dead-end empty one.
+    # Routing it here lets the per-provider branch render NOT_VULNERABLE /
+    # VULNERABLE / INCONCLUSIVE instead of leaving takeover_verdict empty.
+    cloud_low = risk == "LOW" and bool(result.get("takeover_service"))
+    if risk not in ("VERIFY", "HIGH") and not cloud_low:
         return {"verdict": "", "evidence": ""}
 
     try:
@@ -1501,15 +1509,18 @@ async def verify_takeover(
         cname = result.get("cname")
         final_target = chain[-1] if chain else cname
         provider = _match_cloud_resource(final_target)
-        # A-record CloudFront: the host is served directly by CloudFront edge
-        # IPs with NO *.cloudfront.net CNAME (the provider was identified from
-        # the edge IP's PTR in check_takeover). CloudFront claimability is
-        # decided by probing the ALIAS itself (this subdomain), so when there
-        # is no CNAME target, fall back to the subdomain as the probe/resolve
-        # target and treat the provider as CloudFront. This never changes the
-        # CNAME-based path (final_target is set there).
-        if provider is None and not final_target and result.get("takeover_service") == "AWS CloudFront":
-            provider = "AWS CloudFront"
+        # A-record cloud detection: the host was identified as a cloud resource
+        # from an edge IP's PTR (check_takeover) with NO CNAME target, so
+        # final_target is empty and _match_cloud_resource gave None. Recover the
+        # provider from the detected takeover_service and probe the ALIAS (this
+        # subdomain) directly — CloudFront claimability, and any provider's live
+        # response, is decided by probing the alias, not the edge IP's PTR. This
+        # never changes the CNAME-based path (final_target is set there). It is
+        # what keeps an A-record cloud row (CloudFront bimi, or a held-LOW S3/ELB
+        # PTR) from ending with an empty verdict.
+        detected_service = result.get("takeover_service")
+        if provider is None and not final_target and detected_service:
+            provider = detected_service
             final_target = result.get("subdomain")
         # Strip the trailing dot (and whitespace) ONCE up front and resolve/
         # probe the clean name. A trailing-dotted CNAME target (e.g.
@@ -1974,7 +1985,14 @@ async def analyze_subdomain(
     # fan-out) and the SSRF-guarded probe_client. verify_takeover never raises.
     takeover_verdict = ""
     takeover_evidence = ""
-    if risk in ("VERIFY", "HIGH"):
+    # Run the active verification pass for flagged candidates (VERIFY/HIGH) AND
+    # for a LOW row that nonetheless named a detected cloud service (held_low
+    # from a CNAME/host or A-record-PTR match). The latter must END in a
+    # concrete verdict — a row whose takeover_service is set must never be left
+    # with an empty takeover_verdict. verify_takeover itself re-checks this gate
+    # and returns empty for a LOW row with no service.
+    cloud_low = risk == "LOW" and bool(service)
+    if risk in ("VERIFY", "HIGH") or cloud_low:
         verdict_result = await verify_takeover(
             SubdomainResult(
                 subdomain=sub,
