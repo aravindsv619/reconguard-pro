@@ -1328,10 +1328,18 @@ async def resolve_cname_chain(host: str) -> list[str]:
 def _dig_records(host: str) -> dict[str, list[str]]:
     """Return all DNS records for ``host`` keyed by record type (FEAT-002).
 
-    For every type in ``DNS_RECORD_TYPES`` a ``dig +short <TYPE> <host>`` query
-    is run and its answer lines are parsed into a list. Only types that
-    produced at least one answer appear in the returned dict (purely additive;
-    never changes ip_addresses/cname/cname_chain).
+    For every type in ``DNS_RECORD_TYPES`` a ``dig +noall +answer <TYPE>
+    <host>`` query is run and its answer SECTION is parsed. Only answer lines
+    whose TYPE column equals the queried type are kept, so a CNAME chain that
+    ``dig`` echoes in the answer section does NOT leak into the A/MX/NS/TXT/SOA
+    buckets. Only types that produced at least one answer appear in the
+    returned dict (purely additive; never changes ip_addresses/cname/
+    cname_chain).
+
+    Why not ``dig +short``: for a host that is a CNAME, ``dig +short <TYPE>``
+    follows the CNAME and prints the CNAME target hostname with no type label,
+    so the target leaks into every record type. ``+noall +answer`` keeps the
+    TYPE column, letting us filter by it.
 
     Security: the subprocess is invoked with an argument LIST (never a shell
     string, never ``shell=True``) and ``host`` is gated by
@@ -1351,7 +1359,7 @@ def _dig_records(host: str) -> dict[str, list[str]]:
         for rtype in DNS_RECORD_TYPES:
             try:
                 out = subprocess.run(
-                    ["dig", "+short", rtype, host],
+                    ["dig", "+noall", "+answer", rtype, host],
                     capture_output=True,
                     text=True,
                     timeout=5,
@@ -1363,13 +1371,19 @@ def _dig_records(host: str) -> dict[str, list[str]]:
                 continue
             values: list[str] = []
             for line in (out.stdout or "").splitlines():
-                line = line.strip()
-                if not line:
+                parsed = _parse_answer_line(line)
+                if parsed is None:
                     continue
-                # CNAME/NS/SOA/MX targets are hostnames with a trailing dot;
-                # strip it for a clean display. A/AAAA/TXT are left as-is
-                # (except the trailing dot which never appears on them).
-                cleaned = line.rstrip(".") if rtype != "TXT" else line
+                line_type, rdata = parsed
+                # Keep this line only if its answer-section TYPE matches the
+                # queried type. This drops the echoed CNAME chain from every
+                # other bucket (the acme.com cdn.* leak).
+                if line_type != rtype:
+                    continue
+                # Hostname-valued record data (CNAME/NS/SOA/MX target) carries a
+                # trailing dot; strip a single one for clean display. TXT and
+                # A/AAAA content is preserved verbatim.
+                cleaned = rdata if rtype == "TXT" else _strip_trailing_dot(rtype, rdata)
                 if cleaned and cleaned not in values:
                     values.append(cleaned)
             if values:
@@ -1377,6 +1391,67 @@ def _dig_records(host: str) -> dict[str, list[str]]:
     except Exception:  # noqa: BLE001 — never raise; return partial results.
         return records
     return records
+
+
+# Resource-record type tokens we may encounter in a dig answer-section line.
+_RR_TYPES = frozenset(DNS_RECORD_TYPES)
+
+
+def _parse_answer_line(line: str) -> Optional[tuple[str, str]]:
+    """Parse one ``dig +noall +answer`` answer line into (TYPE, RDATA).
+
+    Lines look like ``NAME TTL CLASS TYPE RDATA...`` e.g.::
+
+        cdn.acme.com.   300 IN CNAME d2nw98z1ioq9pm.cloudfront.net.
+        d2nw98z1ioq9pm.cloudfront.net. 60 IN A 3.175.86.76
+
+    Returns ``None`` for blank/comment/unparseable lines. RDATA is everything
+    after the TYPE token joined by single spaces (so multi-token RDATA like
+    ``10 mail.example.com.`` or a SOA record is preserved). The TYPE is located
+    by finding the token after the ``IN`` class, falling back to the first
+    token that is a known RR type.
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith(";"):
+        return None
+    tokens = stripped.split()
+    type_idx = -1
+    # Prefer the standard shape: TYPE is the token right after the IN class.
+    for i, tok in enumerate(tokens):
+        if tok == "IN" and i + 1 < len(tokens):
+            type_idx = i + 1
+            break
+    # Defensive fallback: no IN class present — take the first known RR type.
+    if type_idx == -1:
+        for i, tok in enumerate(tokens):
+            if tok in _RR_TYPES:
+                type_idx = i
+                break
+    if type_idx == -1 or type_idx + 1 > len(tokens) - 1:
+        return None
+    line_type = tokens[type_idx]
+    rdata = " ".join(tokens[type_idx + 1:]).strip()
+    if not rdata:
+        return None
+    return line_type, rdata
+
+
+def _strip_trailing_dot(rtype: str, rdata: str) -> str:
+    """Strip a single trailing dot from the hostname portion of ``rdata``.
+
+    For MX the RDATA is ``<priority> <host>.`` so only the final token's
+    trailing dot is removed and the priority is kept. For other hostname-valued
+    types (CNAME/NS/SOA target fields) a single trailing dot on the whole value
+    is removed. A/AAAA pass through unchanged (no trailing dot present).
+    """
+    if rtype == "MX":
+        parts = rdata.split()
+        if parts:
+            parts[-1] = parts[-1].rstrip(".") if parts[-1].endswith(".") else parts[-1]
+        return " ".join(parts)
+    if rdata.endswith("."):
+        return rdata[:-1]
+    return rdata
 
 
 def _socket_records(host: str) -> dict[str, list[str]]:
