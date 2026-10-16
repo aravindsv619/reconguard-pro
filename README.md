@@ -283,6 +283,116 @@ resource immediately. It is surfaced XSS-safe in the dashboard (the
 per-subdomain Records panel, `escapeHtml`-ed) and exported as the 16th CSV
 column (see [CSV report format](#csv-report-format)).
 
+## Lookalike Domains mode
+
+Alongside subdomain enumeration, SubRecon Pro has a second mode that works the
+other way round: instead of finding hosts *under* your domain, it proactively
+hunts for confusingly-similar domains that **someone else** might register for
+phishing or brand abuse. You give it one domain at a time; it generates
+plausible lookalike variants, resolves and probes each one, and tells you which
+ones are live, registered, or still available to register. For example, from
+`brandco.ai` it surfaces `brand-co.com` and `brandco.com` — but the engine
+is **general** and works for any domain you own, not just that example.
+
+Switch to it with the **Lookalike Domains** tab at the top of the dashboard
+(the UI defaults to the Subdomains mode, so existing workflows are unchanged).
+
+> ⚠️ **For authorized brand protection only.** Use this mode only on domains you
+> own or are authorized to protect. The findings are **candidates to
+> investigate, not proof of malice** — a lookalike may be an unrelated legitimate
+> site, a typo-parking page, or simply unregistered.
+
+### Fully keyless
+
+Candidate generation is pure and keyless — no API key and no network I/O to
+produce the variants. Resolution and HTTP probing reuse the same guards as the
+subdomain path (strict hostname validation, the SSRF private/loopback/metadata
+IP guard before any probe, bounded concurrency, and capped response bodies).
+
+### Permutation techniques
+
+`generate_lookalikes(domain)` applies each of these techniques, deduped,
+lowercased, and excluding the input domain itself:
+
+- **Hyphenation** — insert a single hyphen between adjacent character groups
+  (e.g. `brandco` → `brand-co`).
+- **TLD swap** — keep the label and swap the TLD across a common set
+  (`com`, `net`, `org`, `io`, `co`, `ai`, `app`, `dev`, …) plus the original.
+- **Omission** — remove one character.
+- **Insertion** — insert an adjacent-keyboard character between letters.
+- **Repetition** — double a character.
+- **Transposition** — swap two adjacent characters.
+- **Replacement** — replace a character with a QWERTY-adjacent key.
+- **Homoglyph** — apply visually-similar substitutions (`o`↔`0`, `l`↔`1`↔`i`,
+  `m`↔`rn`, `w`↔`vv`, `cl`↔`d`, `b`↔`6`, `g`↔`9`, `s`↔`5`), bounded.
+- **Combosquatting** — prepend/append common words (`login`, `secure`,
+  `account`, `support`, `verify`, …) with a hyphen.
+- **Subdomain / dot-insert** — insert a dot splitting the label
+  (e.g. `brand.co.tld`).
+- **Bitsquatting** — flip one bit of each alphabetic character, keeping only
+  valid hostnames.
+
+Generation is capped at `MAX_LOOKALIKE_CANDIDATES = 5000`; the cap is enforced
+at every growth step so a pathological input can never blow up the candidate
+set.
+
+### Optional WHOIS / RDAP check
+
+The **Check WHOIS/RDAP (slower)** flag is off by default. When enabled, each
+candidate is looked up over RDAP (`https://rdap.org/domain/{domain}`) on the
+**verified** TLS client to determine whether it is registered and to pull the
+registrar and creation date when present. RDAP is rate-limited, so its
+concurrency is kept deliberately low (`RDAP_CONCURRENCY = 5`) and any
+error or timeout is **tolerated** — the candidate's `registered` field is marked
+`unknown` and the lookup never blocks or fails the job. With the flag off, no
+RDAP calls are made and `registered` stays `unknown`.
+
+### Lookalike risk tiers
+
+Each candidate is scored into one of these tiers (**candidates to investigate,
+not proof of malice**):
+
+- **HIGH** — resolves and serves a live site, and either has MX records or its
+  page resembles your original. Treat as a possible phishing / brand-abuse site:
+  investigate, consider monitoring or takedown, and confirm ownership.
+- **MEDIUM** — resolves and is live but with no MX and no apparent mimicry, or is
+  registered but parked / has no real site.
+- **LOW** — resolves at the DNS level only, with no live site.
+- **AVAILABLE** — does not resolve and (when WHOIS/RDAP was checked) appears
+  unregistered. Consider **defensive registration** so an attacker can't grab it.
+
+Every candidate also carries a `recommended_action` string with a concrete next
+step appropriate to its tier (e.g. HIGH → investigate possible phishing/brand
+abuse and confirm ownership; AVAILABLE → consider defensive registration).
+
+### Lookalike CSV report
+
+This mode exports its **own** report, separate from the 16-column subdomain CSV.
+The lookalike CSV has these 14 columns, in order:
+
+```
+candidate, technique, dns_status, ip_addresses, http_status, https_status,
+page_title, has_mx, registered, registrar, creation_date, resembles_original,
+risk, recommended_action
+```
+
+`ip_addresses` is joined with `;`, and every text cell (including
+attacker-influenced values like `page_title` and `registrar`) passes through the
+same spreadsheet-formula-injection neutralizer used by the subdomain export.
+
+### Lookalike API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | `/api/lookalike` | Start a lookalike job. Body: `{domain, check_whois?}` (`check_whois` defaults to `false`). Returns `{job_id}`. |
+| GET | `/api/lookalike/status/{job_id}` | Poll `status`, `progress`, `candidates_generated`, `candidates_checked`, and `registered_count`. |
+| GET | `/api/lookalike/results/{job_id}` | Full candidate list plus a summary once the job is `done`. |
+| GET | `/api/lookalike/download/{job_id}` | Download the lookalike CSV report. |
+
+These endpoints are keyless, reuse the per-client rate limit and the combined
+active-job cap, and keep their jobs in a store separate from the subdomain jobs
+(also expiring one hour after creation).
+
 ## DNS reporting
 
 ### `dns_status`
