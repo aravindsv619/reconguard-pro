@@ -61,6 +61,10 @@
           class="px-5 py-2 rounded-lg text-sm font-semibold bg-transparent text-gray-300">
           Lookalike Domains
         </button>
+        <button id="modeBreach"
+          class="px-5 py-2 rounded-lg text-sm font-semibold bg-transparent text-gray-300">
+          Breach Exposure
+        </button>
       </div>
     </div>
 
@@ -366,6 +370,127 @@
 
     </div><!-- /#lookalikeMode -->
 
+    <!-- Breach Exposure mode (hidden by default). Drives the FEAT-001 API:
+         POST /api/breach {domain, emails, names}, GET /api/breach/status|
+         results|download/{id}. Keyless checks via XposedOrNot; coverage is
+         limited to discovered/supplied addresses. All interactivity is wired
+         in app.js via addEventListener — no inline <script>, no inline on*
+         handlers. Breach data is attacker-influenced PII, so app.js renders
+         every dynamic value XSS-safe (escapeHtml/statusCell/textContent). -->
+    <div id="breachMode" class="hidden">
+
+      <!-- Breach check form -->
+      <section class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg">
+        <div class="flex flex-col sm:flex-row gap-3">
+          <input id="breachDomainInput" type="text" placeholder="target.com" autocomplete="off"
+            class="flex-1 bg-gray-950 border border-gray-700 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-brand-500" />
+          <button id="checkBreachBtn"
+            class="bg-brand-600 hover:bg-brand-700 transition-colors px-6 py-3 rounded-lg font-semibold text-white">
+            Check Breach Exposure
+          </button>
+        </div>
+        <p id="breachDomainError" class="text-red-400 text-sm mt-2 hidden">Please enter a valid domain (e.g. example.com).</p>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4">
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Known emails (optional, one per line)</label>
+            <textarea id="breachEmails" rows="4"
+              placeholder="alice@target.com&#10;bob@target.com"
+              class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-500"></textarea>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Employee names (optional, one per line) — used to generate &amp; verify likely addresses</label>
+            <textarea id="breachNames" rows="4"
+              placeholder="Alice Smith&#10;Bob Jones"
+              class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-500"></textarea>
+          </div>
+        </div>
+
+        <p class="text-amber-400 text-xs mt-3">
+          ⚠️ Keyless check via XposedOrNot. Coverage limited to discovered/supplied addresses — not an exhaustive domain report. Handle results as sensitive PII; authorized use only.
+        </p>
+      </section>
+
+      <!-- Breach progress panel -->
+      <section id="breachProgressPanel" class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg hidden">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-lg font-semibold">Checking breach exposure…</h2>
+          <button id="breachCancelBtn" class="text-sm text-red-400 hover:text-red-300 border border-red-500/40 rounded px-3 py-1">Cancel</button>
+        </div>
+        <div class="w-full bg-gray-800 rounded-full h-4 overflow-hidden mb-2">
+          <div id="breachProgressBar" class="progress-stripes bg-brand-600 h-4 rounded-full transition-all duration-500" style="width:0%"></div>
+        </div>
+        <p id="breachProgressText" class="text-sm text-gray-400">0 emails discovered, 0 checked, 0 exposed</p>
+      </section>
+
+      <!-- Breach results dashboard -->
+      <section id="breachResultsPanel" class="hidden">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-2xl font-bold">Breach exposure for <span id="breachResultDomain" class="text-brand-400"></span></h2>
+          <button id="breachDownloadBtn"
+            class="bg-emerald-600 hover:bg-emerald-700 transition-colors px-5 py-2.5 rounded-lg font-semibold text-white flex items-center gap-2">
+            ⬇ Download CSV
+          </button>
+        </div>
+
+        <!-- Coverage-note banner (filled via textContent from the API). -->
+        <div class="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 mb-6">
+          <p id="breachCoverageNote" class="text-amber-300 text-xs"></p>
+        </div>
+
+        <!-- Summary cards -->
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+          <div class="bg-gray-900 border border-blue-500/30 rounded-xl p-4">
+            <div class="text-3xl font-bold text-blue-400" id="breachCardChecked">0</div>
+            <div class="text-xs text-gray-400 mt-1">Emails Checked</div>
+          </div>
+          <div class="bg-gray-900 border border-red-500/30 rounded-xl p-4">
+            <div class="text-3xl font-bold text-red-400" id="breachCardExposed">0</div>
+            <div class="text-xs text-gray-400 mt-1">Exposed</div>
+          </div>
+          <div class="bg-gray-900 border border-orange-500/30 rounded-xl p-4">
+            <div class="text-3xl font-bold text-orange-400" id="breachCardBreaches">0</div>
+            <div class="text-xs text-gray-400 mt-1">Breaches</div>
+          </div>
+          <div class="bg-gray-900 border border-red-600/40 rounded-xl p-4">
+            <div class="text-3xl font-bold text-red-500" id="breachCardHigh">0</div>
+            <div class="text-xs text-gray-400 mt-1">High-Risk</div>
+          </div>
+        </div>
+
+        <!-- Filters -->
+        <div class="flex flex-wrap items-center gap-2 mb-4">
+          <div class="flex flex-wrap gap-2" id="breachFilterBtns">
+            <button data-filter="all" class="breach-filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm">All</button>
+            <button data-filter="high" class="breach-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">High</button>
+            <button data-filter="medium" class="breach-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Medium</button>
+            <button data-filter="low" class="breach-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Low</button>
+            <button data-filter="exposed" class="breach-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Exposed</button>
+          </div>
+          <input id="breachSearchInput" type="text" placeholder="Search emails…"
+            class="ml-auto bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
+        </div>
+
+        <!-- Results table -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto">
+          <table class="w-full min-w-[1024px] text-sm">
+            <thead>
+              <tr class="text-gray-400 text-left border-b border-gray-800">
+                <th class="sortable sticky-col py-3 px-3 whitespace-nowrap sticky top-0 z-10" data-sort="email">Email</th>
+                <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="breaches">Breaches</th>
+                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="exposed_data">Exposed Data</th>
+                <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="risk">Risk</th>
+                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="source">Source</th>
+              </tr>
+            </thead>
+            <tbody id="breachResultsTable"></tbody>
+          </table>
+          <p id="breachEmptyRow" class="text-center text-gray-500 py-6 hidden">No emails match the current filter.</p>
+        </div>
+      </section>
+
+    </div><!-- /#breachMode -->
+
     <!-- Footer -->
     <footer class="text-center text-xs text-gray-600 mt-12">
       ⚠️ For authorized security testing only. Unauthorized use is illegal.
@@ -381,6 +506,6 @@
   <!-- ?v= is a cache-buster: bump it whenever app.js changes so browsers
        re-fetch instead of running a stale cached copy (which previously left
        the mode switch / buttons dead after an update). -->
-  <script src="/app.js?v=3"></script>
+  <script src="/app.js?v=4"></script>
 </body>
 </html>

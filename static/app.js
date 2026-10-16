@@ -438,24 +438,38 @@
     let lookalikeFilter = 'all';
 
     function switchMode(mode) {
-      // Toggle visibility of the two mode containers and the active-tab styling.
-      // Neither container's inner state is touched, so each mode keeps its DOM.
+      // Toggle visibility of the three mode containers and the active-tab
+      // styling. No container's inner state is touched, so each mode keeps its
+      // DOM. Subdomains stays the default when mode is anything unexpected.
       const sub = document.getElementById('subdomainMode');
       const look = document.getElementById('lookalikeMode');
+      const breach = document.getElementById('breachMode');
       const subBtn = document.getElementById('modeSubdomains');
       const lookBtn = document.getElementById('modeLookalike');
+      const breachBtn = document.getElementById('modeBreach');
       const active = 'px-5 py-2 rounded-lg text-sm font-semibold bg-brand-600 text-white';
       const inactive = 'px-5 py-2 rounded-lg text-sm font-semibold bg-transparent text-gray-300';
       if (mode === 'lookalike') {
         sub.classList.add('hidden');
+        breach.classList.add('hidden');
         look.classList.remove('hidden');
         lookBtn.className = active;
         subBtn.className = inactive;
+        breachBtn.className = inactive;
+      } else if (mode === 'breach') {
+        sub.classList.add('hidden');
+        look.classList.add('hidden');
+        breach.classList.remove('hidden');
+        breachBtn.className = active;
+        subBtn.className = inactive;
+        lookBtn.className = inactive;
       } else {
         look.classList.add('hidden');
+        breach.classList.add('hidden');
         sub.classList.remove('hidden');
         subBtn.className = active;
         lookBtn.className = inactive;
+        breachBtn.className = inactive;
       }
     }
 
@@ -680,6 +694,248 @@
       if (lookalikeJobId) window.open(`/api/lookalike/download/${lookalikeJobId}`);
     }
 
+    // --- Breach Exposure mode ---------------------------------------------
+    // Separate state from the subdomain/lookalike modes so switching never
+    // mutates another mode's DOM or data. Drives the FEAT-001 endpoints:
+    //   POST /api/breach {domain, emails, names}
+    //   GET  /api/breach/status/{id}  -> emails_discovered/checked/exposed_count
+    //   GET  /api/breach/results/{id} -> {domain, exposed:[...], summary, coverage_note}
+    //   GET  /api/breach/download/{id}
+    // Breach data is attacker-influenced PII: EVERY dynamic value is rendered
+    // via escapeHtml/statusCell/textContent — never innerHTML of raw API data.
+    let breachJobId = null;
+    let breachPollInterval = null;
+    let breachResults = [];
+    let breachFilteredResults = [];
+    let breachSort = { column: null, asc: true };
+    let breachFilter = 'all';
+
+    async function startBreach() {
+      const input = document.getElementById('breachDomainInput');
+      const domain = input.value.trim().toLowerCase();
+      const err = document.getElementById('breachDomainError');
+      if (!DOMAIN_RE.test(domain)) {
+        err.classList.remove('hidden');
+        return;
+      }
+      err.classList.add('hidden');
+
+      const emails = document.getElementById('breachEmails').value;
+      const names = document.getElementById('breachNames').value;
+      const body = { domain, emails, names };
+
+      document.getElementById('checkBreachBtn').disabled = true;
+      document.getElementById('breachResultsPanel').classList.add('hidden');
+      document.getElementById('breachProgressPanel').classList.remove('hidden');
+      updateBreachProgress(0, 0, 0, 0);
+
+      try {
+        const resp = await fetch('/api/breach', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (!resp.ok) {
+          const e = await resp.json().catch(() => ({}));
+          throw new Error(e.detail || 'Request failed');
+        }
+        const data = await resp.json();
+        breachJobId = data.job_id;
+        breachPollInterval = setInterval(pollBreachStatus, 2000);
+        pollBreachStatus();
+      } catch (e) {
+        alert('Failed to start breach check: ' + e.message);
+        document.getElementById('checkBreachBtn').disabled = false;
+        document.getElementById('breachProgressPanel').classList.add('hidden');
+      }
+    }
+
+    function updateBreachProgress(pct, discovered, checked, exposed) {
+      document.getElementById('breachProgressBar').style.width = pct + '%';
+      document.getElementById('breachProgressText').textContent =
+        `${discovered} emails discovered, ${checked} checked, ${exposed} exposed`;
+    }
+
+    async function pollBreachStatus() {
+      if (!breachJobId) return;
+      try {
+        const resp = await fetch(`/api/breach/status/${breachJobId}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        updateBreachProgress(
+          data.progress || 0,
+          data.emails_discovered || 0,
+          data.emails_checked || 0,
+          data.exposed_count || 0
+        );
+
+        if (data.status === 'done') {
+          clearInterval(breachPollInterval);
+          breachPollInterval = null;
+          await loadBreachResults();
+        } else if (data.status === 'error') {
+          clearInterval(breachPollInterval);
+          breachPollInterval = null;
+          alert('Breach check failed: ' + (data.error || 'unknown error'));
+          document.getElementById('checkBreachBtn').disabled = false;
+        }
+      } catch (e) {
+        // transient; keep polling
+      }
+    }
+
+    async function loadBreachResults() {
+      const resp = await fetch(`/api/breach/results/${breachJobId}`);
+      if (!resp.ok) {
+        alert('Failed to load breach results');
+        document.getElementById('checkBreachBtn').disabled = false;
+        return;
+      }
+      const data = await resp.json();
+      displayBreachResults(data);
+    }
+
+    function displayBreachResults(data) {
+      breachResults = data.exposed || [];
+      document.getElementById('breachProgressPanel').classList.add('hidden');
+      document.getElementById('breachResultsPanel').classList.remove('hidden');
+      document.getElementById('checkBreachBtn').disabled = false;
+      // Result domain + coverage note are set via textContent so no server
+      // string is ever interpreted as HTML.
+      document.getElementById('breachResultDomain').textContent = data.domain || '';
+      document.getElementById('breachCoverageNote').textContent = data.coverage_note || '';
+
+      const summary = data.summary || {};
+      const byRisk = summary.by_risk || {};
+      document.getElementById('breachCardChecked').textContent = summary.emails_checked || 0;
+      document.getElementById('breachCardExposed').textContent = summary.exposed_count || 0;
+      document.getElementById('breachCardBreaches').textContent =
+        summary.breaches_count != null ? summary.breaches_count : 0;
+      document.getElementById('breachCardHigh').textContent = byRisk.high || 0;
+
+      breachFilter = 'all';
+      setBreachFilterButton();
+      applyBreachFilters();
+    }
+
+    function setBreachFilterButton() {
+      document.querySelectorAll('.breach-filter-btn').forEach(btn => {
+        if (btn.dataset.filter === breachFilter) {
+          btn.className = 'breach-filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm';
+        } else {
+          btn.className = 'breach-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm';
+        }
+      });
+    }
+
+    function applyBreachFilters() {
+      const search = document.getElementById('breachSearchInput').value.trim().toLowerCase();
+      breachFilteredResults = breachResults.filter(r => {
+        if (search && !String(r.email || '').toLowerCase().includes(search)) return false;
+        const risk = String(r.risk_label || '').toLowerCase();
+        switch (breachFilter) {
+          case 'high': return risk === 'high';
+          case 'medium': return risk === 'medium';
+          case 'low': return risk === 'low';
+          case 'exposed': return Array.isArray(r.breaches) && r.breaches.length > 0;
+          default: return true;
+        }
+      });
+      if (breachSort.column) applyBreachSort();
+      renderBreachTable();
+    }
+
+    function sortBreachResults(column) {
+      if (breachSort.column === column) {
+        breachSort.asc = !breachSort.asc;
+      } else {
+        breachSort.column = column;
+        breachSort.asc = true;
+      }
+      applyBreachSort();
+      renderBreachTable();
+    }
+
+    function applyBreachSort() {
+      const col = breachSort.column;
+      const dir = breachSort.asc ? 1 : -1;
+      const riskOrder = { high: 3, medium: 2, low: 1 };
+      breachFilteredResults.sort((a, b) => {
+        let va, vb;
+        if (col === 'risk') {
+          va = riskOrder[String(a.risk_label || '').toLowerCase()] ?? 0;
+          vb = riskOrder[String(b.risk_label || '').toLowerCase()] ?? 0;
+        } else if (col === 'breaches') {
+          va = Array.isArray(a.breaches) ? a.breaches.length : 0;
+          vb = Array.isArray(b.breaches) ? b.breaches.length : 0;
+        } else if (col === 'exposed_data') {
+          va = Array.isArray(a.exposed_data) ? a.exposed_data.length : 0;
+          vb = Array.isArray(b.exposed_data) ? b.exposed_data.length : 0;
+        } else {
+          va = a[col];
+          vb = b[col];
+        }
+        if (va == null) va = -Infinity;
+        if (vb == null) vb = -Infinity;
+        if (typeof va === 'string') return va.localeCompare(vb) * dir;
+        return (va - vb) * dir;
+      });
+    }
+
+    function breachRiskBadge(risk) {
+      // Whitelist the risk label before it reaches innerHTML. risk_label is
+      // server data derived from an untrusted third-party API, so it is mapped
+      // to a fixed label + fixed Tailwind classes — never interpolated raw.
+      const label = String(risk || '').toLowerCase();
+      if (label === 'high') return '<span class="bg-red-500 text-white text-xs font-semibold px-2 py-0.5 rounded">High</span>';
+      if (label === 'medium') return '<span class="bg-amber-500 text-black text-xs font-semibold px-2 py-0.5 rounded">Medium</span>';
+      // Everything else (including 'low', '', and unexpected values) -> Low/grey.
+      return '<span class="bg-gray-500 text-white text-xs font-semibold px-2 py-0.5 rounded">Low</span>';
+    }
+
+    function renderBreachTable() {
+      const tbody = document.getElementById('breachResultsTable');
+      const empty = document.getElementById('breachEmptyRow');
+      if (!breachFilteredResults.length) {
+        tbody.innerHTML = '';
+        empty.classList.remove('hidden');
+        return;
+      }
+      empty.classList.add('hidden');
+      tbody.innerHTML = breachFilteredResults.map((r) => {
+        // Breach data is attacker-influenced PII: email, each breach name, each
+        // exposed-data category, and source are ALL escapeHtml-ed before they
+        // reach innerHTML (arrays joined from escaped elements). risk_score is
+        // coerced via statusCell; risk via the whitelisted breachRiskBadge.
+        const breaches = Array.isArray(r.breaches) ? r.breaches : [];
+        const exposedData = Array.isArray(r.exposed_data) ? r.exposed_data : [];
+        const breachesHtml = breaches.length
+          ? breaches.map(b => escapeHtml(String(b))).join(', ')
+          : '—';
+        const exposedHtml = exposedData.length
+          ? exposedData.map(x => escapeHtml(String(x))).join(', ')
+          : '—';
+        return `<tr class="border-b border-gray-800/60 animate-fadein hover:bg-gray-800/40">
+          <td class="sticky-col py-2 px-3 font-mono text-brand-300 whitespace-nowrap">${escapeHtml(r.email || '')}</td>
+          <td class="py-2 px-3 text-gray-300 text-xs max-w-xs truncate">${breachesHtml}</td>
+          <td class="py-2 px-3 text-gray-400 text-xs max-w-xs truncate">${exposedHtml}</td>
+          <td class="py-2 px-3 whitespace-nowrap">${breachRiskBadge(r.risk_label)} <span class="text-gray-500 text-xs">${statusCell(r.risk_score)}</span></td>
+          <td class="py-2 px-3 text-gray-400 text-xs whitespace-nowrap">${escapeHtml(r.source || '') || '—'}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    function cancelBreach() {
+      if (breachPollInterval) { clearInterval(breachPollInterval); breachPollInterval = null; }
+      breachJobId = null;
+      document.getElementById('breachProgressPanel').classList.add('hidden');
+      document.getElementById('checkBreachBtn').disabled = false;
+    }
+
+    function downloadBreachCSV() {
+      if (breachJobId) window.open(`/api/breach/download/${breachJobId}`);
+    }
+
     document.getElementById('domainInput').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') startScan();
     });
@@ -735,4 +991,28 @@
     // Lookalike sortable column headers, scoped to #lookalikeMode.
     document.querySelectorAll('#lookalikeMode th[data-sort]').forEach((th) => {
       th.addEventListener('click', () => sortLookalikeResults(th.dataset.sort));
+    });
+
+    // --- Breach mode wiring (CSP-safe, addEventListener only) --------------
+    document.getElementById('modeBreach').addEventListener('click', () => switchMode('breach'));
+    document.getElementById('checkBreachBtn').addEventListener('click', startBreach);
+    document.getElementById('breachCancelBtn').addEventListener('click', cancelBreach);
+    document.getElementById('breachDownloadBtn').addEventListener('click', downloadBreachCSV);
+    document.getElementById('breachSearchInput').addEventListener('input', applyBreachFilters);
+    document.getElementById('breachDomainInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') startBreach();
+    });
+
+    // Breach filter buttons via delegation on their container.
+    document.getElementById('breachFilterBtns').addEventListener('click', (e) => {
+      const btn = e.target.closest('.breach-filter-btn');
+      if (!btn) return;
+      breachFilter = btn.dataset.filter;
+      setBreachFilterButton();
+      applyBreachFilters();
+    });
+
+    // Breach sortable column headers, scoped to #breachMode.
+    document.querySelectorAll('#breachMode th[data-sort]').forEach((th) => {
+      th.addEventListener('click', () => sortBreachResults(th.dataset.sort));
     });
