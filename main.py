@@ -653,6 +653,131 @@ def generate_lookalikes(domain: str) -> set[str]:
     return out
 
 
+# Generic words that carry no distinctive brand signal. When a brand label or
+# an original page title is reduced to tokens, these are dropped so resemblance
+# keys off the DISTINCTIVE part (e.g. 'nerd' for brandco), not a word any
+# unrelated business might share ('agent', 'solutions', 'services', ...).
+BRAND_STOPWORDS = frozenset(
+    {
+        "home", "welcome", "ai", "the", "app", "apps", "inc", "llc", "ltd",
+        "co", "corp", "company", "solutions", "services", "service", "agent",
+        "agents", "agency", "and", "for", "online", "official", "site",
+        "website", "web", "page", "login", "portal", "group", "io", "net",
+        "com", "org", "of", "to", "your", "best", "free", "new", "get",
+    }
+)
+
+# Case-insensitive substrings that mark a page as parked/placeholder rather than
+# a real site. Matched against the candidate's title/content slice. An empty or
+# whitespace-only title is also treated as parked (handled in _is_parked).
+PARKED_SIGNATURES = (
+    "parking page",
+    "parked",
+    "domain for sale",
+    "buy this domain",
+    "coming soon",
+    "under construction",
+    "this domain is for sale",
+    "godaddy",
+    "sedo",
+    "default web page",
+    "namecheap parking",
+    "domain is parked",
+    "domain parked",
+)
+
+
+def _normalize_label(label: Optional[str]) -> str:
+    """Lowercase ``label`` and strip everything but [a-z0-9].
+
+    Used so hyphen/dot variants compare equal: 'brand-co' and 'brand.co'
+    both normalize to 'brandco'. Returns "" for falsy input.
+    """
+    if not label:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", label.lower())
+
+
+def _brand_tokens(brand_label: str, original_title: Optional[str]) -> set[str]:
+    """Derive the DISTINCTIVE brand tokens for the original domain.
+
+    Combines the normalized registrable brand label with the significant words
+    of the original page title, drops BRAND_STOPWORDS and very short (<3 char)
+    tokens, and ALSO adds the leading distinctive fragment of the brand label
+    (e.g. 'nerd' from 'brandco' once the generic suffix 'agent' is removed) so
+    a content match can key off the distinctive part. Best-effort, never raises.
+    """
+    tokens: set[str] = set()
+    norm_label = _normalize_label(brand_label)
+    if norm_label:
+        tokens.add(norm_label)
+        # Peel off a trailing generic stopword to expose the distinctive stem,
+        # e.g. 'brandco' -> 'nerd' (since 'agent' is a stopword). Only strip
+        # ONE suffix and only when a meaningful (>=3 char) stem remains.
+        for stop in BRAND_STOPWORDS:
+            if len(stop) >= 3 and norm_label.endswith(stop) and \
+                    len(norm_label) - len(stop) >= 3:
+                tokens.add(norm_label[: -len(stop)])
+                break
+    if original_title:
+        for word in re.split(r"[^a-z0-9]+", original_title.lower()):
+            if len(word) >= 3 and word not in BRAND_STOPWORDS:
+                tokens.add(word)
+    return {t for t in tokens if len(t) >= 3}
+
+
+def _is_parked(title: Optional[str]) -> bool:
+    """True when a candidate's title/content looks like a parking/placeholder.
+
+    Case-insensitive substring match against PARKED_SIGNATURES; an empty or
+    whitespace-only title (a live site with no real title) also counts as
+    parked. Best-effort, never raises.
+    """
+    if title is None:
+        return False
+    text = title.strip().lower()
+    if not text:
+        return True
+    return any(sig in text for sig in PARKED_SIGNATURES)
+
+
+def _resembles_brand(
+    candidate: str,
+    candidate_title: Optional[str],
+    brand_label: str,
+    brand_tokens: set[str],
+) -> bool:
+    """Best-effort brand-resemblance for one candidate.
+
+    True when EITHER:
+      (a) the candidate's registrable label CONTAINS the original brand label
+          (or vice-versa) once hyphens/dots are removed — so 'brand-co',
+          'brandco.<tld>' and 'brandco-login' all match 'brandco'; OR
+      (b) the candidate's fetched title shares a DISTINCTIVE brand token with
+          the original (tokens already exclude generic stopwords), which lets a
+          content match catch look-alikes that reworded their label.
+
+    This is a heuristic, NOT a proof of impersonation: it is tuned to flag
+    brand-containing / content-echoing sites while letting coincidental
+    unrelated businesses (different label AND no shared distinctive token) fall
+    through. Never raises.
+    """
+    norm_brand = _normalize_label(brand_label)
+    if norm_brand:
+        cand_label, _ = split_domain(candidate)
+        norm_cand = _normalize_label(cand_label)
+        if norm_cand and (norm_brand in norm_cand or norm_cand in norm_brand):
+            return True
+    if candidate_title and brand_tokens:
+        cand_words = {
+            w for w in re.split(r"[^a-z0-9]+", candidate_title.lower())
+            if len(w) >= 3
+        }
+        if cand_words & brand_tokens:
+            return True
+    return False
+
+
 def score_lookalike(
     dns_status: Optional[str],
     http_status: Optional[int],
@@ -660,40 +785,67 @@ def score_lookalike(
     has_mx: bool,
     resembles_original: bool,
     registered,
+    parked: bool = False,
 ) -> tuple[str, str]:
     """Return (risk, recommended_action) for a lookalike candidate.
 
     Tiers (honest wording — a candidate to INVESTIGATE, never an assertion of
-    malice):
-      HIGH     — resolves AND a live HTTP site (2xx/3xx) AND (has MX OR the page
-                 resembles the original). Likely active impersonation infra.
-      MEDIUM   — resolves + live but no MX and no mimicry, OR registered but
-                 parked / no live site.
-      LOW      — resolves (DNS only), no live site.
+    malice). HIGH now means "likely brand impersonation worth urgent
+    investigation", NOT "any live domain with mail": a bare MX record is only a
+    BOOSTER noted in the action text, never a sole trigger.
+
+      HIGH     — resolves AND a live HTTP site (2xx/3xx) AND the page/label
+                 resembles the original brand AND is NOT parked. Likely active
+                 impersonation infra.
+      MEDIUM   — resolves + live + NOT parked but does NOT resemble the brand
+                 (a live but apparently-unrelated/generic site — possibly a
+                 coincidental unrelated business); OR resolves + live +
+                 resembles but parked (brand-ish parking page worth monitoring).
+      LOW      — resolves + live + parked + not resembling (unrelated parked
+                 page); OR resolves (DNS only) with no live site; OR registered
+                 but no live site.
       AVAILABLE— does not resolve and (when whois was checked) appears
                  unregistered. A defensive-registration opportunity.
       NONE     — anything else (e.g. unresolved with unknown registration).
     """
     resolves = dns_status == "RESOLVED"
     live = _http_live(http_status) or _http_live(https_status)
+    mx_note = " It also publishes mail (MX) records." if has_mx else ""
 
-    if resolves and live and (has_mx or resembles_original):
-        return (
-            "HIGH",
-            "Candidate to investigate for possible phishing/brand-abuse: it "
-            "resolves and serves a live site" + (" with mail (MX)" if has_mx else "")
-            + ". Consider monitoring and, if confirmed malicious, takedown; "
-            "first confirm it is not owned by you.",
-        )
     if resolves and live:
+        if resembles_original and not parked:
+            return (
+                "HIGH",
+                "Likely brand impersonation to investigate urgently: it "
+                "resolves, serves a live site, and its label or page content "
+                "resembles your brand." + mx_note + " Confirm it is not owned "
+                "by you, then consider monitoring and, if confirmed malicious, "
+                "takedown.",
+            )
+        if resembles_original and parked:
+            return (
+                "MEDIUM",
+                "Resembles your brand but currently shows a parked/placeholder "
+                "page." + mx_note + " Worth monitoring in case it is activated; "
+                "confirm it is not owned by you.",
+            )
+        if parked:
+            return (
+                "LOW",
+                "Resolves and is live but shows a parked/placeholder page and "
+                "does not resemble your brand." + mx_note + " Low priority; "
+                "re-check periodically.",
+            )
         return (
             "MEDIUM",
-            "Resolves and is live but shows no mail records or page mimicry. "
-            "Worth a periodic re-check; confirm ownership.",
+            "Resolves and is live but its label and page title do not resemble "
+            "your brand — the title suggests a possibly-unrelated business, so "
+            "a human should confirm before acting." + mx_note + " Lower "
+            "priority; confirm ownership.",
         )
     if resolves and registered is True and not live:
         return (
-            "MEDIUM",
+            "LOW",
             "Registered and resolves but no live site (possibly parked). "
             "Monitor for activation.",
         )
@@ -832,16 +984,26 @@ async def analyze_candidate(
     check_whois: bool,
     sem: asyncio.Semaphore,
     rdap_sem: asyncio.Semaphore,
+    brand_label: str = "",
+    brand_tokens: Optional[set[str]] = None,
 ) -> dict:
     """Analyze one lookalike candidate. Returns a fixed-shape result dict.
 
     All probing happens under ``sem`` (bounded concurrency, NO unbounded
     fan-out). Flow mirrors analyze_subdomain: is_valid_hostname gate ->
     resolve_dns_detailed -> HTTP probe ONLY when a resolved IP passes
-    _is_safe_public_ip (SSRF guard). MX comes from _dig_records; mimicry is a
-    best-effort case-insensitive title match. RDAP runs under ``rdap_sem`` only
-    when ``check_whois`` is set.
+    _is_safe_public_ip (SSRF guard). MX comes from _dig_records.
+
+    Brand resemblance (``resembles_original``) is computed by _resembles_brand
+    from the original's ``brand_label`` + distinctive ``brand_tokens``: a
+    candidate resembles when its registrable label contains the brand label
+    (hyphens/dots ignored) OR its fetched title shares a distinctive brand
+    token. If the original-title fetch failed, ``brand_tokens`` is simply empty
+    and resemblance falls back to label-containment only (never raises). RDAP
+    runs under ``rdap_sem`` only when ``check_whois`` is set.
     """
+    if brand_tokens is None:
+        brand_tokens = _brand_tokens(brand_label, original_title)
     dns_status = "ERROR"
     ip_addresses: list[str] = []
     http_status: Optional[int] = None
@@ -893,11 +1055,13 @@ async def analyze_candidate(
             registrar = info.get("registrar", "")
             creation_date = info.get("creation_date", "")
 
-    resembles_original = bool(
-        original_title
-        and page_title
-        and original_title.strip().lower() == page_title.strip().lower()
+    resembles_original = _resembles_brand(
+        candidate, page_title, brand_label, brand_tokens
     )
+    live = _http_live(http_status) or _http_live(https_status)
+    # Parked detection only matters for a live site; an unresolved/dead
+    # candidate has no page to classify.
+    parked = _is_parked(page_title) if live else False
     risk, recommended_action = score_lookalike(
         dns_status,
         http_status,
@@ -905,6 +1069,7 @@ async def analyze_candidate(
         has_mx,
         resembles_original,
         registered,
+        parked,
     )
     return {
         "candidate": candidate,
@@ -3014,8 +3179,14 @@ async def run_lookalike(job_id: str, domain: str, check_whois: bool) -> None:
         candidates = sorted(generate_lookalikes(domain))
         job.candidates_generated = len(candidates)
 
-        # Best-effort original page title (once), never fatal.
+        # Best-effort original page title (once), never fatal. Derive the
+        # brand label + distinctive brand tokens ONCE for the whole job so each
+        # candidate's resemblance check is cheap and consistent. If the fetch
+        # failed, brand_tokens still contains the label-derived stems and
+        # resemblance degrades to label-containment only.
         original_title = await fetch_title(probe_client, domain)
+        brand_label, _brand_tld = split_domain(domain)
+        brand_tokens = _brand_tokens(brand_label, original_title)
 
         sem = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
         rdap_sem = asyncio.Semaphore(RDAP_CONCURRENCY)
@@ -3031,6 +3202,8 @@ async def run_lookalike(job_id: str, domain: str, check_whois: bool) -> None:
                 check_whois,
                 sem,
                 rdap_sem,
+                brand_label,
+                brand_tokens,
             )
             job.candidates_checked += 1
             if res.get("registered") is True:

@@ -378,6 +378,9 @@
        which blocks any inline script element entirely. Keeping the JS inline
        here would be silently refused by the browser, leaving every button
        dead. Do not inline the JS back into this file. -->
-  <script src="/app.js"></script>
+  <!-- ?v= is a cache-buster: bump it whenever app.js changes so browsers
+       re-fetch instead of running a stale cached copy (which previously left
+       the mode switch / buttons dead after an update). -->
+  <script src="/app.js?v=2"></script>
 </body>
 </html>

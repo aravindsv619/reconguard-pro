@@ -101,7 +101,8 @@ def test_index_has_no_inline_executable_script():
     html_no_comments = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
     offenders = _INLINE_SCRIPT_RE.findall(html_no_comments)
     assert offenders == [], f"inline <script> blocks remain (CSP-blocked): {offenders}"
-    assert '<script src="/app.js"></script>' in html
+    # A cache-buster query (?v=N) is allowed; still same-origin /app.js.
+    assert re.search(r'<script src="/app\.js(\?v=\d+)?"></script>', html)
 
 
 def test_index_has_no_inline_event_handler_attributes():
@@ -119,7 +120,8 @@ def test_index_has_no_inline_event_handler_attributes():
 def test_index_links_app_js_and_tailwind_and_no_third_party_origin():
     html = INDEX.read_text()
     assert '<link rel="stylesheet" href="/tailwind.css">' in html
-    assert '<script src="/app.js"></script>' in html
+    # A cache-buster query (?v=N) is allowed; still same-origin /app.js.
+    assert re.search(r'<script src="/app\.js(\?v=\d+)?"></script>', html)
     origins = re.findall(r"https?://[a-zA-Z0-9.-]+", html)
     assert origins == [], f"unexpected external origins: {origins}"
 

@@ -115,7 +115,9 @@ def test_index_has_no_inline_executable_script():
     offenders = _INLINE_SCRIPT_RE.findall(html_no_comments)
     assert offenders == [], f"inline <script> blocks remain (CSP-blocked): {offenders}"
     # The externalized application JS must be referenced from the same origin.
-    assert '<script src="/app.js"></script>' in html
+    # A cache-buster query (?v=N) is allowed — it still resolves to same-origin
+    # /app.js — so match the src attribute rather than the exact tag.
+    assert re.search(r'<script src="/app\.js(\?v=\d+)?"></script>', html)
 
 
 def test_app_js_served_as_javascript_with_headers():
