@@ -7,6 +7,7 @@ exposes an in-memory job API plus a single-file dark-themed frontend.
 
 import asyncio
 import csv
+import html
 import io
 import ipaddress
 import json
@@ -267,6 +268,33 @@ BREACH_RETRY_BACKOFF = 2.0
 # DoS cap: the total candidate address set a single breach job will check.
 MAX_BREACH_EMAILS = 2000
 
+# --- Keyless page-scrape discovery bounds (FEAT-001 strengthen) ---
+# The strengthened domain-only discovery reuses the EXISTING subdomain
+# enumeration to find the domain's own hosts, then fetches a BOUNDED subset of
+# the live ones through the SSRF-guarded probe client to harvest mailto:/inline
+# emails and conservative person names. Every bound below is a hard DoS/blast-
+# radius cap; the whole path is best-effort and never aborts the breach job.
+#
+# Max distinct hosts we will attempt to fetch (after SSRF gating).
+MAX_SCRAPE_HOSTS = 25
+# Low concurrency for page fetches — separate from the breach-API Semaphore(3).
+SCRAPE_CONCURRENCY = 5
+# Short per-request timeout for scraping the domain's own pages.
+SCRAPE_TIMEOUT = 5.0
+# Common contact-style paths probed per host (best-effort, in addition to '/').
+SCRAPE_PATHS = ("/", "/contact", "/about", "/team", "/careers")
+# Common hostname prefixes used as a fallback when subdomain discovery is empty
+# (and always unioned in, since these pages routinely publish addresses).
+SCRAPE_COMMON_HOSTS = ("www", "mail", "careers", "about", "contact", "team")
+# Keyless role-based local parts: extremely common org addresses that cost only
+# a handful of breach-API checks. Checked as {local}@domain, source 'pattern'.
+BREACH_ROLE_LOCALS = (
+    "info", "contact", "careers", "hr", "admin", "support",
+    "sales", "security", "it", "hello", "team", "jobs", "no-reply",
+)
+# Cap on the number of harvested person names fed to generate_email_patterns.
+MAX_HARVEST_NAMES = 50
+
 # Sentinel the breach client returns when the API outcome is indeterminate
 # (persistent error / non-200 after retry) — DISTINCT from None ("Not found").
 BREACH_UNKNOWN = "UNKNOWN"
@@ -275,6 +303,26 @@ BREACH_UNKNOWN = "UNKNOWN"
 # punctuation (. _ % + -). Anchored, no whitespace / URL-breaking chars, so a
 # validated address is always safe to interpolate into the FIXED-host URL.
 BREACH_EMAIL_RE = re.compile(r"^[a-z0-9][a-z0-9._%+-]{0,63}$")
+
+# Conservative "First Last" person-name token: two-to-three capitalized words.
+# Each token is either a capitalized word ([A-Z][a-z]+) or an all-caps token of
+# length >= 2 (surname initials like "VR", "KM"). Heuristic only — every
+# generated address is still gated by the breach API (verify-then-keep), so a
+# false name can never surface noise.
+_NAME_TOKEN = r"(?:[A-Z][a-z]{1,19}|[A-Z]{2,4})"
+PERSON_NAME_RE = re.compile(rf"\b{_NAME_TOKEN}(?:\s+{_NAME_TOKEN}){{1,2}}\b")
+# Obvious non-name capitalized bigrams to drop before pattern-generation.
+NAME_STOPWORDS = frozenset(
+    {
+        "the", "and", "for", "our", "your", "all", "about", "contact", "team",
+        "home", "careers", "privacy", "policy", "terms", "cookie", "cookies",
+        "learn", "more", "read", "get", "started", "sign", "log", "login",
+        "menu", "page", "site", "copyright", "rights", "reserved", "inc", "llc",
+        "ltd", "company", "services", "solutions", "products", "news", "blog",
+        "email", "phone", "address", "follow", "us", "we", "are", "is", "to",
+        "view", "open", "close", "next", "prev", "back", "skip", "main",
+    }
+)
 
 # Email-pattern templates for name-based candidate generation. Each entry is a
 # callable mapping (first, last, f) -> local part; generate_email_patterns
@@ -1268,6 +1316,161 @@ async def breach_analytics(client: httpx.AsyncClient, email: str) -> dict:
         return dict(neutral)
 
 
+def _deobfuscate_page_text(text: str) -> str:
+    """Decode HTML entities and normalize common email-obfuscation spellings.
+
+    Turns ``name [at] domain [dot] com`` / ``name(at)domain(dot)com`` and the
+    HTML-entity variants into plain ``name@domain.com`` so the email regex can
+    match them. Purely textual; never executes anything from the page.
+    """
+    if not text:
+        return ""
+    text = html.unescape(text)
+    # ' [at] ' / '(at)' / ' AT ' -> '@'   and   ' [dot] ' / '(dot)' -> '.'
+    text = re.sub(r"\s*[\[\(\{]\s*at\s*[\]\)\}]\s*", "@", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*[\[\(\{]\s*dot\s*[\]\)\}]\s*", ".", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+at\s+", "@", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+dot\s+", ".", text, flags=re.IGNORECASE)
+    return text
+
+
+def _extract_domain_emails(text: str, domain: str) -> set[str]:
+    """Extract validated ``local@domain`` addresses from untrusted page text.
+
+    Deobfuscates first, then regex-matches ONLY addresses whose host equals the
+    target ``domain`` (third-party vendor/gmail addresses are ignored) and gates
+    every hit through _valid_email_for_domain. Returns lowercased, deduped set.
+    """
+    out: set[str] = set()
+    if not text or not domain:
+        return out
+    decoded = _deobfuscate_page_text(text)
+    pattern = re.compile(
+        r"[a-z0-9][a-z0-9._%+-]{0,63}@" + re.escape(domain),
+        re.IGNORECASE,
+    )
+    for match in pattern.findall(decoded):
+        if len(out) >= MAX_BREACH_EMAILS:
+            break
+        email = match.strip().lower()
+        if _valid_email_for_domain(email, domain):
+            out.add(email)
+    return out
+
+
+def _extract_person_names(text: str) -> set[str]:
+    """Heuristically extract conservative 'First Last' person names from text.
+
+    Best-effort and intentionally conservative: requires two-to-three
+    capitalized tokens, drops obvious non-name/stopword bigrams, and caps the
+    result. These names are only ever turned into pattern candidates that must
+    be CONFIRMED by the breach API (verify-then-keep), so false positives can
+    never surface as noise.
+    """
+    out: set[str] = set()
+    if not text:
+        return out
+    decoded = html.unescape(text)
+    for match in PERSON_NAME_RE.finditer(decoded):
+        if len(out) >= MAX_HARVEST_NAMES:
+            break
+        name = match.group(0).strip()
+        tokens = name.split()
+        if len(tokens) < 2:
+            continue
+        if any(t.lower() in NAME_STOPWORDS for t in tokens):
+            continue
+        out.add(name)
+    return out
+
+
+async def _scrape_host_pages(
+    probe_client: httpx.AsyncClient, host: str, domain: str
+) -> tuple[set[str], set[str]]:
+    """Fetch a few pages of ONE host (SSRF-guarded) and harvest emails + names.
+
+    Mirrors the subdomain-liveness probe's SSRF discipline EXACTLY: the host is
+    resolved and the HTTP(S) probe only runs when a resolved IP passes
+    _is_safe_public_ip (private/internal/loopback/link-local/metadata hosts are
+    never fetched). Fetches go through the verify=False probe client with a
+    short timeout and the MAX_RESPONSE_BYTES body cap (inside check_http). Every
+    page is wrapped in try/except so one failure never aborts discovery.
+
+    Returns (emails, names). Never raises. Never logs page content (A09).
+    """
+    emails: set[str] = set()
+    names: set[str] = set()
+    if not is_valid_hostname(host):
+        return emails, names
+    try:
+        # SSRF gate — identical to analyze_subdomain: resolve first, and only
+        # probe when at least one resolved address is a public IP. A host with
+        # no A/AAAA records is skipped here (no CNAME-chain probing for scrape).
+        ip_addresses, _dns_status = await resolve_dns_detailed(host)
+        if not ip_addresses or not any(_is_safe_public_ip(ip) for ip in ip_addresses):
+            return emails, names
+    except Exception:  # noqa: BLE001 — never raise.
+        return emails, names
+
+    for path in SCRAPE_PATHS:
+        for scheme in ("https", "http"):
+            try:
+                req = probe_client.build_request(
+                    "GET", f"{scheme}://{host}{path}", timeout=SCRAPE_TIMEOUT
+                )
+                resp = await probe_client.send(req, stream=True)
+                try:
+                    raw = await _read_capped_body(resp)
+                finally:
+                    await resp.aclose()
+                resp._content = raw if raw is not None else b""
+                body = resp.text
+            except Exception:  # noqa: BLE001 — per-request isolation.
+                continue
+            emails |= _extract_domain_emails(body, domain)
+            names |= _extract_person_names(body)
+            # One successful scheme per path is enough; avoid double-fetching.
+            break
+    return emails, names
+
+
+async def _discover_hosts(verified_client: httpx.AsyncClient, domain: str) -> list[str]:
+    """Return candidate hostnames for ``domain`` by REUSING the existing
+    subdomain enumeration SOURCES, unioned with the root + common hosts.
+
+    Reuses the same passive SOURCES machinery the Subdomains mode uses (so
+    pages like careers./about./team. are found); each source runs in its own
+    try/except and the root domain plus SCRAPE_COMMON_HOSTS are always included
+    as a fallback. Validated with is_valid_hostname; capped at MAX_SCRAPE_HOSTS.
+    """
+    hosts: set[str] = {domain}
+    for prefix in SCRAPE_COMMON_HOSTS:
+        hosts.add(f"{prefix}.{domain}")
+
+    async def _run_source(fn) -> set[str]:
+        try:
+            return set(await fn(verified_client, domain, {})) or set()
+        except Exception:  # noqa: BLE001 — one source failing never aborts.
+            return set()
+
+    try:
+        results = await asyncio.gather(
+            *(_run_source(fn) for fn in SOURCES.values()),
+            return_exceptions=True,
+        )
+        for found in results:
+            if isinstance(found, set):
+                hosts |= found
+    except Exception:  # noqa: BLE001 — never raise.
+        pass
+
+    valid = [h for h in hosts if is_valid_hostname(h)]
+    # Deterministic, bounded: prefer the root domain + shorter (more public)
+    # names first so the cap keeps the most likely address-bearing pages.
+    valid.sort(key=lambda h: (h != domain, len(h), h))
+    return valid[:MAX_SCRAPE_HOSTS]
+
+
 async def discover_emails(client: httpx.AsyncClient, domain: str) -> set[str]:
     """Best-effort email discovery at ``domain`` from crt.sh. Never raises.
 
@@ -1276,6 +1479,10 @@ async def discover_emails(client: httpx.AsyncClient, domain: str) -> set[str]:
     raw response text, validates each with _valid_email_for_domain, lowercases /
     dedupes, and caps the set at MAX_BREACH_EMAILS. On ANY failure it logs at
     DEBUG (job_id/domain only, never addresses) and returns what it gathered.
+
+    This is the crt.sh-only base harvest; the strengthened keyless crawl lives
+    in discover_emails_rich, which unions these results with addresses scraped
+    from the domain's own live pages plus harvested names.
     """
     out: set[str] = set()
     domain = (domain or "").strip().lower().rstrip(".")
@@ -1284,19 +1491,88 @@ async def discover_emails(client: httpx.AsyncClient, domain: str) -> set[str]:
     try:
         resp = await _get(client, f"https://crt.sh/?q=%25.{domain}&output=json")
         text = resp.text or ""
-        pattern = re.compile(
-            r"[a-z0-9][a-z0-9._%+-]{0,63}@" + re.escape(domain),
-            re.IGNORECASE,
-        )
-        for match in pattern.findall(text):
-            if len(out) >= MAX_BREACH_EMAILS:
-                break
-            email = match.strip().lower()
-            if _valid_email_for_domain(email, domain):
-                out.add(email)
+        out |= _extract_domain_emails(text, domain)
     except Exception as exc:  # noqa: BLE001 — never raise.
         logger.debug("email discovery failed for %s: %s", domain, exc)
     return out
+
+
+async def discover_emails_rich(
+    verified_client: httpx.AsyncClient,
+    probe_client: Optional[httpx.AsyncClient],
+    domain: str,
+    job: Optional["BreachJobState"] = None,
+) -> dict:
+    """Strengthened keyless discovery for a DOMAIN-ONLY breach run. Never raises.
+
+    Unions three keyless sources and returns::
+
+        {"discovered": set[str],  # addresses scraped from the domain's pages
+                                  # (+ crt.sh) — source 'discovered'
+         "names": set[str]}       # conservative person names harvested from the
+                                  # same pages — fed to generate_email_patterns
+
+    Pipeline (every stage best-effort, bounded, SSRF-safe):
+      1. crt.sh base harvest (discover_emails).
+      2. Reuse the EXISTING subdomain enumeration (_discover_hosts) to find the
+         domain's own hosts, then fetch a BOUNDED subset of the LIVE/public ones
+         (MAX_SCRAPE_HOSTS, SSRF-gated via _is_safe_public_ip, probe client,
+         SCRAPE_TIMEOUT, MAX_RESPONSE_BYTES) under a low Semaphore and scrape
+         mailto:/inline emails + person names.
+
+    Role-based locals and name->pattern generation happen in run_breach so the
+    verify-then-keep rule and source tagging stay in one place. ``job`` (when
+    passed) has emails_discovered bumped as pages are scraped. A09: counts +
+    host only, never addresses/page content.
+    """
+    result = {"discovered": set(), "names": set()}
+    domain = (domain or "").strip().lower().rstrip(".")
+    if not domain:
+        return result
+
+    discovered: set[str] = set()
+    names: set[str] = set()
+
+    # 1. crt.sh base harvest (unchanged contract).
+    try:
+        discovered |= await discover_emails(verified_client, domain)
+    except Exception:  # noqa: BLE001 — never raise.
+        pass
+
+    # 2. Page-scrape the domain's own hosts (the main win). Only runs when a
+    #    probe client is available (always true in the live app).
+    if probe_client is not None:
+        try:
+            hosts = await _discover_hosts(verified_client, domain)
+        except Exception:  # noqa: BLE001
+            hosts = [domain]
+
+        sem = asyncio.Semaphore(SCRAPE_CONCURRENCY)
+
+        async def _scrape(host: str) -> tuple[set[str], set[str]]:
+            async with sem:
+                return await _scrape_host_pages(probe_client, host, domain)
+
+        try:
+            scraped = await asyncio.gather(
+                *(_scrape(h) for h in hosts),
+                return_exceptions=True,
+            )
+        except Exception:  # noqa: BLE001
+            scraped = []
+
+        for item in scraped:
+            if isinstance(item, tuple):
+                page_emails, page_names = item
+                discovered |= page_emails
+                names |= page_names
+                if job is not None:
+                    job.emails_discovered = len(discovered)
+
+    # Honor the global cap on the scraped/discovered set.
+    result["discovered"] = set(list(discovered)[:MAX_BREACH_EMAILS])
+    result["names"] = set(list(names)[:MAX_HARVEST_NAMES])
+    return result
 
 
 async def analyze_candidate(
@@ -3603,8 +3879,9 @@ async def run_breach(
     """Run a keyless breach-exposure job: discover/collect candidate addresses,
     check each against XposedOrNot, and surface the exposed/supplied hits.
 
-    Candidate set = supplied emails | crt.sh-discovered emails | name-pattern
-    emails, capped at MAX_BREACH_EMAILS. All breach calls go through the
+    Candidate set = supplied emails | keyless-discovered emails (crt.sh + the
+    domain's own scraped public pages) | name/role pattern emails, capped at
+    MAX_BREACH_EMAILS. All breach calls go through the
     VERIFIED client (app.state.client) to the FIXED host api.xposedornot.com
     under a bounded Semaphore(BREACH_CONCURRENCY) with a polite inter-call
     sleep. A supplied address is kept regardless of outcome; a discovered /
@@ -3621,16 +3898,46 @@ async def run_breach(
 
     logger.info("breach job %s started: domain=%s", job_id, domain)
 
+    probe_client: Optional[httpx.AsyncClient] = getattr(
+        app.state, "probe_client", None
+    )
+
     job.status = "running"
     job.progress = 0
     try:
         supplied = set(parse_email_lines(emails, domain))
-        discovered = await discover_emails(verified_client, domain)
-        pattern = generate_email_patterns(parse_name_lines(names), domain)
+        supplied_names = parse_name_lines(names)
+
+        # Keyless discovery: when the user supplied no emails/names (domain-only)
+        # OR to augment a supplied run, crawl the domain's own public pages
+        # (subdomain-reuse + SSRF-guarded probe scrape) + crt.sh for published
+        # addresses, and harvest conservative person names for pattern-gen.
+        rich = await discover_emails_rich(
+            verified_client, probe_client, domain, job
+        )
+        discovered = rich["discovered"]
+        harvested_names = rich["names"]
+
+        # Name patterns come from BOTH supplied names and names harvested off
+        # the domain's own pages. These are speculative: a pattern address is
+        # only ever surfaced when the breach API confirms it (verify-then-keep),
+        # so harvested-name noise can never leak into results.
+        pattern = generate_email_patterns(
+            supplied_names + sorted(harvested_names), domain
+        )
+        # Common keyless role-based locals (info@, careers@, hr@, ...). Tagged
+        # 'pattern' and subject to the same verify-then-keep rule.
+        role = {
+            f"{local}@{domain}"
+            for local in BREACH_ROLE_LOCALS
+            if _valid_email_for_domain(f"{local}@{domain}", domain)
+        }
 
         # Source label per address; 'supplied' wins over 'discovered' over
         # 'pattern' when an address appears in more than one set.
         source_of: dict[str, str] = {}
+        for addr in role:
+            source_of[addr] = "pattern"
         for addr in pattern:
             source_of[addr] = "pattern"
         for addr in discovered:
@@ -4397,7 +4704,9 @@ BREACH_CSV_COLUMNS = [
 # engine only checks addresses it discovered or the user supplied, so this is
 # explicitly NOT an exhaustive domain report.
 BREACH_COVERAGE_NOTE = (
-    "Coverage is limited to discovered or supplied addresses; this is not an "
+    "Coverage is limited to supplied addresses plus those discovered by "
+    "crawling the domain's own public pages (mailto:/inline harvest) and "
+    "name/role patterns confirmed against the breach database; this is not an "
     "exhaustive domain report. Source: XposedOrNot keyless API."
 )
 

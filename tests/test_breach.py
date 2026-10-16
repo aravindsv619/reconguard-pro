@@ -448,3 +448,293 @@ def test_api_results_409_when_not_done(client, monkeypatch):
     main.BREACH_JOBS[job_id].status = "running"
     assert client.get(f"/api/breach/results/{job_id}").status_code == 409
     assert client.get(f"/api/breach/download/{job_id}").status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# 11. Pure helpers: deobfuscation, email/name extraction
+# ---------------------------------------------------------------------------
+def test_extract_domain_emails_mailto_inline_and_obfuscated():
+    body = (
+        'Reach <a href="mailto:careers@example.com">us</a> or email '
+        "aruna.vr@example.com. Also info [at] example [dot] com. "
+        "A vendor someone@gmail.com must be ignored. "
+        "HTML entity: hr&#64;example.com"
+    )
+    out = main._extract_domain_emails(body, "example.com")
+    assert "careers@example.com" in out
+    assert "aruna.vr@example.com" in out
+    assert "info@example.com" in out
+    assert "hr@example.com" in out
+    # Third-party vendor address at a DIFFERENT domain is excluded.
+    assert "someone@gmail.com" not in out
+    assert all(e.endswith("@example.com") for e in out)
+
+
+def test_extract_person_names_conservative():
+    body = (
+        "<h2>Our Team</h2> Aruna VR leads engineering. "
+        "Contact Us for details. Read More about privacy policy."
+    )
+    names = main._extract_person_names(body)
+    assert "Aruna VR" in names
+    # Stopword bigrams must not be treated as person names.
+    assert "Contact Us" not in names
+    assert "Read More" not in names
+
+
+# ---------------------------------------------------------------------------
+# 12. _scrape_host_pages — SSRF gate + harvest (respx + monkeypatched resolver)
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_scrape_host_pages_harvests_public_host(monkeypatch):
+    async def fake_resolve(host):
+        return (["93.184.216.34"], "RESOLVED")  # a public, routable IP
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve)
+    respx.get("https://example.com/").mock(
+        return_value=httpx.Response(
+            200,
+            text=(
+                'mailto:careers@example.com inline aruna.vr@example.com '
+                "info [at] example [dot] com someone@gmail.com. "
+                "Our Team: Aruna VR heads hiring."
+            ),
+        )
+    )
+    # Other paths 404 — harvest still succeeds from '/'.
+    respx.get(url__regex=r"https://example\.com/(contact|about|team|careers)").mock(
+        return_value=httpx.Response(404, text="")
+    )
+
+    async with httpx.AsyncClient() as probe:
+        emails, names = await main._scrape_host_pages(probe, "example.com", "example.com")
+
+    assert "careers@example.com" in emails
+    assert "aruna.vr@example.com" in emails
+    assert "info@example.com" in emails
+    assert "someone@gmail.com" not in emails
+    assert "Aruna VR" in names
+
+
+@respx.mock
+async def test_scrape_host_pages_ssrf_private_ip_not_fetched(monkeypatch):
+    async def fake_resolve(host):
+        return (["10.0.0.5"], "RESOLVED")  # private — must be skipped
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve)
+
+    fetched = {"called": False}
+
+    def record(request):
+        fetched["called"] = True
+        return httpx.Response(200, text="careers@example.com")
+
+    respx.get(url__regex=r"https?://internal\.example\.com.*").mock(side_effect=record)
+
+    async with httpx.AsyncClient() as probe:
+        emails, names = await main._scrape_host_pages(
+            probe, "internal.example.com", "example.com"
+        )
+
+    assert emails == set()
+    assert names == set()
+    assert fetched["called"] is False  # SSRF guard: never probed the private host
+
+
+# ---------------------------------------------------------------------------
+# 13. discover_emails_rich — subdomain reuse + scrape + name harvest
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_discover_emails_rich_unions_scrape_and_crtsh(monkeypatch):
+    # crt.sh base harvest returns one address.
+    respx.get("https://crt.sh/?q=%25.example.com&output=json").mock(
+        return_value=httpx.Response(200, text="admin@example.com")
+    )
+
+    async def fake_hosts(client, domain):
+        return ["example.com", "careers.example.com"]
+
+    monkeypatch.setattr(main, "_discover_hosts", fake_hosts)
+
+    async def fake_resolve(host):
+        return (["93.184.216.34"], "RESOLVED")
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve)
+
+    respx.get("https://example.com/").mock(
+        return_value=httpx.Response(200, text="info@example.com Our Team: Aruna VR")
+    )
+    respx.get("https://careers.example.com/").mock(
+        return_value=httpx.Response(
+            200, text='mailto:careers@example.com and vendor@gmail.com'
+        )
+    )
+    respx.get(url__regex=r"https://[a-z.]+/(contact|about|team|careers)$").mock(
+        return_value=httpx.Response(404, text="")
+    )
+
+    job = main.BreachJobState(job_id="rich", domain="example.com")
+    async with httpx.AsyncClient() as verified, httpx.AsyncClient() as probe:
+        rich = await main.discover_emails_rich(verified, probe, "example.com", job)
+
+    assert "admin@example.com" in rich["discovered"]  # crt.sh
+    assert "info@example.com" in rich["discovered"]  # scraped root
+    assert "careers@example.com" in rich["discovered"]  # scraped careers host
+    assert "vendor@gmail.com" not in rich["discovered"]  # third-party excluded
+    assert "Aruna VR" in rich["names"]
+    assert job.emails_discovered >= 1
+
+
+@respx.mock
+async def test_discover_emails_rich_per_source_errors_isolated(monkeypatch):
+    # crt.sh errors; _discover_hosts returns one host whose page times out.
+    respx.get("https://crt.sh/?q=%25.example.com&output=json").mock(
+        side_effect=httpx.ConnectError("boom")
+    )
+
+    async def fake_hosts(client, domain):
+        return ["example.com"]
+
+    monkeypatch.setattr(main, "_discover_hosts", fake_hosts)
+
+    async def fake_resolve(host):
+        return (["93.184.216.34"], "RESOLVED")
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve)
+    respx.get(url__regex=r"https?://example\.com.*").mock(
+        side_effect=httpx.ConnectTimeout("slow")
+    )
+
+    async with httpx.AsyncClient() as verified, httpx.AsyncClient() as probe:
+        rich = await main.discover_emails_rich(verified, probe, "example.com", None)
+
+    # Discovery completes (never raises) with an empty set.
+    assert rich["discovered"] == set()
+    assert rich["names"] == set()
+
+
+async def test_discover_emails_rich_no_probe_client_crtsh_only(monkeypatch):
+    async def fake_discover(client, domain):
+        return {"base@example.com"}
+
+    monkeypatch.setattr(main, "discover_emails", fake_discover)
+
+    async with httpx.AsyncClient() as verified:
+        rich = await main.discover_emails_rich(verified, None, "example.com", None)
+
+    assert rich["discovered"] == {"base@example.com"}
+    assert rich["names"] == set()
+
+
+# ---------------------------------------------------------------------------
+# 14. _discover_hosts — reuses SOURCES + always includes root/common hosts
+# ---------------------------------------------------------------------------
+async def test_discover_hosts_reuses_sources_and_includes_common(monkeypatch):
+    async def fake_source(client, domain, keys):
+        return {"team.example.com", "about.example.com"}
+
+    monkeypatch.setattr(main, "SOURCES", {"fake": fake_source})
+
+    async with httpx.AsyncClient() as verified:
+        hosts = await main._discover_hosts(verified, "example.com")
+
+    assert "example.com" in hosts  # root always included
+    assert "www.example.com" in hosts  # common fallback
+    assert "team.example.com" in hosts  # from reused source
+    assert "about.example.com" in hosts
+    assert len(hosts) <= main.MAX_SCRAPE_HOSTS
+
+
+async def test_discover_hosts_source_failure_isolated(monkeypatch):
+    async def boom(client, domain, keys):
+        raise RuntimeError("source down")
+
+    monkeypatch.setattr(main, "SOURCES", {"boom": boom})
+
+    async with httpx.AsyncClient() as verified:
+        hosts = await main._discover_hosts(verified, "example.com")
+
+    # Still returns the root + common-host fallback despite the source failing.
+    assert "example.com" in hosts
+    assert "mail.example.com" in hosts
+
+
+# ---------------------------------------------------------------------------
+# 15. run_breach domain-only — strengthened discovery yields candidates
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_run_breach_domain_only_uses_rich_discovery(monkeypatch):
+    monkeypatch.setattr(main, "BREACH_CALL_DELAY", 0)
+    monkeypatch.setattr(main, "BREACH_RETRY_BACKOFF", 0)
+
+    async def fake_rich(verified, probe, domain, job):
+        if job is not None:
+            job.emails_discovered = 1
+        return {"discovered": {"careers@example.com"}, "names": {"Aruna VR"}}
+
+    monkeypatch.setattr(main, "discover_emails_rich", fake_rich)
+
+    # careers@ (discovered) is exposed; info@ (role/pattern) is Not found ->
+    # dropped; aruna.vr@ (name pattern) exposed -> kept and tagged 'pattern'.
+    def check(request):
+        local = request.url.path.rsplit("/", 1)[-1]
+        if local in ("careers@example.com", "aruna.vr@example.com"):
+            return httpx.Response(200, json={"breaches": [["B1"]], "status": "success"})
+        return httpx.Response(200, json={"Error": "Not found", "email": None})
+
+    respx.get(url__regex=r"https://api\.xposedornot\.com/v1/check-email/.*").mock(
+        side_effect=check
+    )
+    respx.get(url__regex=r"https://api\.xposedornot\.com/v1/breach-analytics.*").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "BreachMetrics": {"risk": [{"risk_label": "Low", "risk_score": 2}]},
+                "BreachesSummary": {"site": "B1"},
+                "ExposedBreaches": {"breaches_details": []},
+            },
+        )
+    )
+
+    async with httpx.AsyncClient() as c:
+        main.app.state.client = c
+        # No probe client needed: discovery is mocked.
+        if hasattr(main.app.state, "probe_client"):
+            delattr(main.app.state, "probe_client")
+        main.BREACH_JOBS["dom"] = main.BreachJobState(job_id="dom", domain="example.com")
+        await main.run_breach("dom", "example.com", None, None)
+
+    job = main.BREACH_JOBS["dom"]
+    assert job.status == "done"
+    assert job.emails_checked > 0  # domain-only now checks candidates (not 0)
+    emails = {r["email"]: r["source"] for r in job.results}
+    assert emails.get("careers@example.com") == "discovered"
+    assert emails.get("aruna.vr@example.com") == "pattern"
+    # Role/pattern address the API doesn't know is NOT surfaced (verify-then-keep).
+    assert "info@example.com" not in emails
+
+
+@respx.mock
+async def test_run_breach_domain_only_respects_cap(monkeypatch):
+    monkeypatch.setattr(main, "BREACH_CALL_DELAY", 0)
+    monkeypatch.setattr(main, "MAX_BREACH_EMAILS", 3)
+
+    async def fake_rich(verified, probe, domain, job):
+        return {
+            "discovered": {f"d{i}@example.com" for i in range(10)},
+            "names": set(),
+        }
+
+    monkeypatch.setattr(main, "discover_emails_rich", fake_rich)
+    respx.get(url__regex=r"https://api\.xposedornot\.com/.*").mock(
+        return_value=httpx.Response(200, json={"Error": "Not found", "email": None})
+    )
+
+    async with httpx.AsyncClient() as c:
+        main.app.state.client = c
+        main.BREACH_JOBS["cap"] = main.BreachJobState(job_id="cap", domain="example.com")
+        await main.run_breach("cap", "example.com", None, None)
+
+    job = main.BREACH_JOBS["cap"]
+    assert job.status == "done"
+    assert job.emails_checked <= 3  # MAX_BREACH_EMAILS honored

@@ -417,35 +417,65 @@ This is **not** an exhaustive domain report. The check is **keyless** and uses
 XposedOrNot's *per-email* endpoints only. There is **no keyless complete
 domain-wide email list**: XposedOrNot's domain-level endpoint now requires an
 API key, which this tool deliberately does not use. Coverage is therefore
-**limited to addresses that are discovered from public sources or supplied by
-you**, then verified against the breach API. An address you did not supply is
-surfaced only when the breach database already knows it; unknown addresses are
-not reported. Treat the output as a floor, not a ceiling.
+**limited to addresses that are discovered** (by crawling the domain's own
+public pages for published `mailto:`/inline addresses and names, plus crt.sh and
+common role locals) **or supplied by you**, then verified against the breach
+API. An address you did not supply is surfaced only when the breach database
+already knows it; unknown addresses are not reported. Treat the output as a
+floor, not a ceiling.
 
 ### Discovery approach
 
-The candidate set is the union of three keyless sources, all verified against
-the breach API before anything is surfaced:
+The candidate set is the union of several keyless sources, all verified against
+the breach API before anything is surfaced. A **domain-only** run (just a
+domain, no emails or names pasted) now finds real candidates on its own instead
+of returning zero:
 
-- **Public-source harvest** — email addresses ending in `@{domain}` are
-  extracted from the keyless [crt.sh](https://crt.sh) certificate-transparency
-  response (no ToS-gray search engines are queried).
-- **User-supplied emails** — addresses you paste in (one per line), validated to
-  the target domain.
-- **Pattern generation from supplied names** — for each employee name you
-  provide, common address shapes are generated and then verified against the
-  breach API: `{first}.{last}`, `{first}`, `{f}{last}`, `{first}{last}`,
-  `{last}.{first}`, `{flast}`, and `{first}_{last}` (all `@{domain}`). A
-  single-token name yields only `{first}@{domain}`.
+- **Public-page crawl (the main keyless win)** — ReconGuard reuses its own
+  **existing subdomain discovery** (the same keyless passive sources the
+  Subdomains mode uses) to enumerate the domain's hosts, then fetches a
+  **bounded** subset of the live ones (`MAX_SCRAPE_HOSTS = 25`) and scrapes
+  `mailto:` links and inline `...@{domain}` addresses from the home page plus a
+  few common contact pages (`/contact`, `/about`, `/team`, `/careers`). Common
+  obfuscations (`name [at] domain [dot] com`, HTML entities) are decoded
+  best-effort, and only addresses whose host is the target domain are kept
+  (third-party vendor/`gmail.com` addresses are ignored). These are tagged
+  `discovered`. The root domain plus common prefixes (`www`, `mail`, `careers`,
+  `about`, `contact`, `team`) are always included as a fallback.
+- **crt.sh harvest** — addresses ending in `@{domain}` are also extracted from
+  the keyless [crt.sh](https://crt.sh) certificate-transparency response.
+- **Name harvest → pattern generation** — conservative `First Last` person
+  names are scraped from the same team/about pages and, together with any names
+  you supply, expanded into common address shapes: `{first}.{last}`, `{first}`,
+  `{f}{last}`, `{first}{last}`, `{last}.{first}`, `{flast}`, and
+  `{first}_{last}` (all `@{domain}`; a single-token name yields only
+  `{first}@{domain}`). Tagged `pattern`.
+- **Common role locals** — a small keyless fallback set (`info`, `contact`,
+  `careers`, `hr`, `admin`, `support`, `sales`, `security`, `it`, `hello`,
+  `team`, `jobs`, `no-reply`) is checked as `{local}@{domain}`. Tagged
+  `pattern`.
+- **User-supplied emails/names** — anything you paste in (one per line),
+  validated to the target domain. Unchanged.
 
 A **discovered** or **pattern-generated** candidate is dropped unless the breach
-database actually knows it; a **supplied** address is always kept (and counted
-as checked-clean when the database has nothing on it). The whole candidate set
-is capped at `MAX_BREACH_EMAILS = 2000`, and the per-email API calls run under a
-deliberately low bounded `asyncio.Semaphore(BREACH_CONCURRENCY = 3)` with a
-polite inter-call delay, because the XposedOrNot API is rate-limited. All calls
-go through the **verified** TLS client to the fixed host `api.xposedornot.com`
-(plus crt.sh for discovery); no user-controlled host is ever fetched.
+database actually knows it (**verify-then-keep**, so harvested-name/role noise
+can never surface); a **supplied** address is always kept (and counted as
+checked-clean when the database has nothing on it). The whole candidate set is
+capped at `MAX_BREACH_EMAILS = 2000`.
+
+**Security.** Page fetching targets only the target domain's own
+subdomain-discovery-derived hosts and is **SSRF-guarded exactly like the
+subdomain liveness probe**: each host is resolved first and is fetched only when
+a resolved IP passes `_is_safe_public_ip` (private/internal/loopback/link-local
+and the cloud-metadata address are never fetched), through the dedicated probe
+client under a low bounded `asyncio.Semaphore`, a short timeout, and the
+`MAX_RESPONSE_BYTES` body cap. Every scraped address is re-validated with
+`_valid_email_for_domain` before any use. The per-email breach calls still run
+under the deliberately low bounded `asyncio.Semaphore(BREACH_CONCURRENCY = 3)`
+with a polite inter-call delay (the XposedOrNot API is rate-limited) and go
+through the **verified** TLS client to the fixed host `api.xposedornot.com`; no
+arbitrary user-controlled host is ever fetched, and scraped page content is
+never logged.
 
 ### Breach API
 
