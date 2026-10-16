@@ -256,15 +256,38 @@ RDAP_ENDPOINT = "https://rdap.org/domain/{}"
 # logs emails, breach names, or exposed data — only job_id + domain + counts.
 XPOSEDORNOT_BASE = "https://api.xposedornot.com"
 
-# Dedicated LOW concurrency for breach checks — the keyless XposedOrNot API
-# rate-limits aggressively, so a small bounded Semaphore + a polite inter-call
-# sleep keeps the job within budget. MUST stay <= 4.
-BREACH_CONCURRENCY = 3
-# Polite pause between successive breach calls (per worker) to avoid 429s.
-BREACH_CALL_DELAY = 0.2
+# Dedicated concurrency for breach checks — the keyless XposedOrNot per-email
+# endpoint rate-limits HARD and fast (a handful of calls in quick succession
+# earns HTTP 429 + a Cloudflare "Just a moment" challenge, and the throttle has
+# memory: a "violation history" keeps dropping subsequent calls). The API simply
+# cannot tolerate parallelism, so we SERIALIZE the XposedOrNot calls (==1) and
+# pace them. This makes large lists slower but CORRECT — a throttled check is
+# never silently treated as "not exposed". Kept as a tunable named constant.
+# (Page-scrape discovery has its own SCRAPE_CONCURRENCY and is unaffected.)
+# MUST stay <= 4.
+BREACH_CONCURRENCY = 1
+# Polite pause between successive XposedOrNot calls to stay under the throttle.
+# ~1.0-1.5s keeps a keyless caller below the drop threshold. Larger lists take
+# proportionally longer by design — correctness over speed.
+BREACH_REQUEST_DELAY = 1.2
+# The inter-call delay run_breach actually paces with (the adaptive base). Kept
+# as a separate name so it can be overridden to 0 in offline tests without
+# touching the documented BREACH_REQUEST_DELAY; defaults to BREACH_REQUEST_DELAY.
+BREACH_CALL_DELAY = BREACH_REQUEST_DELAY
 BREACH_CHECK_TIMEOUT = 15.0
-# Short backoff before the single 429 retry in check_email_exposed.
+# Exponential-backoff base for a throttled (429 / Cloudflare challenge) check:
+# retry sleeps BREACH_RETRY_BACKOFF * 2**attempt (i.e. ~2s, 4s, 8s) — honoring a
+# Retry-After header when the API sends one.
 BREACH_RETRY_BACKOFF = 2.0
+# Max retries for a throttled check before it is marked UNKNOWN (indeterminate).
+BREACH_MAX_RETRIES = 4
+# Upper bound on a single backoff sleep (also caps a hostile Retry-After value).
+BREACH_MAX_BACKOFF = 30.0
+# Adaptive slowdown: once a 429 is seen in a job, the inter-call delay is bumped
+# by this step (up to BREACH_ADAPTIVE_MAX) so one throttle doesn't cascade into
+# all-429s for the rest of the job.
+BREACH_ADAPTIVE_STEP = 1.0
+BREACH_ADAPTIVE_MAX = 6.0
 # DoS cap: the total candidate address set a single breach job will check.
 MAX_BREACH_EMAILS = 2000
 
@@ -1178,18 +1201,68 @@ def parse_name_lines(text: Optional[str]) -> list[str]:
     return out
 
 
+def _is_throttle_response(resp: httpx.Response) -> bool:
+    """True when an XposedOrNot response is a rate-limit / Cloudflare challenge.
+
+    The keyless endpoint signals throttling in several shapes and we must treat
+    ALL of them as "retry", never as a "Not found" / clean result:
+      * HTTP 429 (explicit rate limit) or 403 (Cloudflare block);
+      * an HTML body (``<!DOCTYPE html`` / ``Just a moment`` interstitial)
+        returned with ANY status, including 200;
+      * a JSON body carrying the "violation history" drop marker.
+    Never logs the body (A09) — only inspects it.
+    """
+    try:
+        if resp.status_code in (429, 403):
+            return True
+        # Peek at the body cheaply. A JSON error endpoint is tiny; the Cloudflare
+        # interstitial is HTML. We only read a prefix for the HTML sniff.
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if "text/html" in ctype:
+            return True
+        body = resp.text or ""
+        head = body.lstrip()[:512].lower()
+        if head.startswith("<!doctype html") or head.startswith("<html"):
+            return True
+        if "just a moment" in head or "violation history" in head:
+            return True
+    except Exception:  # noqa: BLE001 — never raise while sniffing.
+        return False
+    return False
+
+
+def _retry_after_seconds(resp: httpx.Response) -> Optional[float]:
+    """Parse a Retry-After header (delta-seconds form) into a bounded float."""
+    try:
+        raw = resp.headers.get("retry-after")
+        if not raw:
+            return None
+        secs = float(raw.strip())
+        if secs < 0:
+            return None
+        return min(secs, BREACH_MAX_BACKOFF)
+    except (TypeError, ValueError):
+        return None
+
+
 async def check_email_exposed(
     client: httpx.AsyncClient, email: str
 ):
     """Keyless XposedOrNot per-email breach check. Never raises.
 
     GET {XPOSEDORNOT_BASE}/v1/check-email/{email} on the VERIFIED client,
-    bounded by BREACH_CHECK_TIMEOUT. Returns:
+    bounded by BREACH_CHECK_TIMEOUT. The keyless endpoint throttles aggressively
+    (HTTP 429 + a Cloudflare "Just a moment" challenge once a "violation
+    history" builds up), so a throttled check is retried with EXPONENTIAL
+    BACKOFF (~2s, 4s, 8s; up to BREACH_MAX_RETRIES), honoring a Retry-After
+    header when present. Returns:
       * a flattened list[str] of breach names when status == 'success';
       * ``None`` when the API reports {'Error': 'Not found'} (clean/unknown
         address the breach DB does not know);
-      * the BREACH_UNKNOWN sentinel on any remaining error / non-200 after a
-        single short-backoff retry on 429.
+      * the BREACH_UNKNOWN sentinel when the check is INDETERMINATE — a
+        persistent throttle (429/Cloudflare challenge that never clears) or any
+        other non-200 / parse error after retries are exhausted. A throttled
+        check is NEVER silently reported as "not exposed".
     NEVER logs the email or the response body (A09).
     """
     url = f"{XPOSEDORNOT_BASE}/v1/check-email/{email}"
@@ -1200,32 +1273,48 @@ async def check_email_exposed(
         )
 
     try:
-        resp = await _fetch()
-        if resp.status_code == 429:
-            # ONE polite backoff + retry; the API rate-limits keyless callers.
-            await asyncio.sleep(BREACH_RETRY_BACKOFF)
+        for attempt in range(BREACH_MAX_RETRIES + 1):
             resp = await _fetch()
-        if resp.status_code != 200:
+
+            # Explicit throttle / Cloudflare challenge -> exponential backoff.
+            if _is_throttle_response(resp):
+                if attempt >= BREACH_MAX_RETRIES:
+                    # Retries exhausted; indeterminate, NOT "not exposed".
+                    return BREACH_UNKNOWN
+                hinted = _retry_after_seconds(resp)
+                backoff = hinted if hinted is not None else min(
+                    BREACH_RETRY_BACKOFF * (2 ** attempt), BREACH_MAX_BACKOFF
+                )
+                await asyncio.sleep(backoff)
+                continue
+
+            if resp.status_code != 200:
+                return BREACH_UNKNOWN
+
+            try:
+                data = resp.json()
+            except Exception:  # noqa: BLE001 — non-JSON 200 is indeterminate.
+                return BREACH_UNKNOWN
+            if not isinstance(data, dict):
+                return BREACH_UNKNOWN
+            # Authoritative "no breach record" marker.
+            if data.get("Error") == "Not found":
+                return None
+            if data.get("status") == "success":
+                names: list[str] = []
+                # 'breaches' is shaped [[name, name, ...]] (a single-element
+                # outer list wrapping the breach-name list). Flatten defensively.
+                for group in data.get("breaches", []) or []:
+                    if isinstance(group, (list, tuple)):
+                        for name in group:
+                            if name:
+                                names.append(str(name))
+                    elif group:
+                        names.append(str(group))
+                return names
+            # Unexpected-but-not-error payload: treat as indeterminate.
             return BREACH_UNKNOWN
-        data = resp.json()
-        if not isinstance(data, dict):
-            return BREACH_UNKNOWN
-        # Authoritative "no breach record" marker.
-        if data.get("Error") == "Not found":
-            return None
-        if data.get("status") == "success":
-            names: list[str] = []
-            # 'breaches' is shaped [[name, name, ...]] (a single-element outer
-            # list wrapping the breach-name list). Flatten defensively.
-            for group in data.get("breaches", []) or []:
-                if isinstance(group, (list, tuple)):
-                    for name in group:
-                        if name:
-                            names.append(str(name))
-                elif group:
-                    names.append(str(group))
-            return names
-        # Unexpected-but-not-error payload: treat as indeterminate.
+        # Loop fell through (all attempts throttled).
         return BREACH_UNKNOWN
     except Exception:  # noqa: BLE001 — never raise; caller treats as unknown.
         return BREACH_UNKNOWN
@@ -1931,6 +2020,10 @@ class BreachJobState:
     emails_checked: int = 0
     exposed_count: int = 0
     checked_clean: int = 0
+    # Count of checks that ended INDETERMINATE (throttled/Cloudflare/error after
+    # backoff) — reported distinctly so a "0 exposed" is never silently a
+    # throttled result mistaken for "confirmed clean".
+    checked_unknown: int = 0
     results: list = field(default_factory=list)
     error: Optional[str] = None
     created_at: float = field(default_factory=time.time)
@@ -3951,15 +4044,36 @@ async def run_breach(
         job.emails_discovered = len(candidates)
 
         total = len(candidates) or 1
+        # Serialize the XposedOrNot calls (BREACH_CONCURRENCY == 1 by design —
+        # the keyless API cannot tolerate parallelism). Kept as a Semaphore so
+        # the constant stays tunable without restructuring.
         sem = asyncio.Semaphore(BREACH_CONCURRENCY)
         results: dict[str, dict] = {}
-        counters = {"checked": 0, "clean": 0}
+        counters = {"checked": 0, "clean": 0, "unknown": 0}
+        # Adaptive inter-call delay: starts at the polite base and grows (capped)
+        # the first time this job is throttled, so one 429 doesn't cascade into
+        # all-429s for the rest of the list.
+        pacing = {"delay": BREACH_CALL_DELAY, "throttled": False}
+
+        async def _paced_sleep() -> None:
+            await asyncio.sleep(pacing["delay"])
+
+        def _note_throttle() -> None:
+            if not pacing["throttled"]:
+                pacing["throttled"] = True
+            pacing["delay"] = min(
+                pacing["delay"] + BREACH_ADAPTIVE_STEP, BREACH_ADAPTIVE_MAX
+            )
 
         async def _check(addr: str) -> None:
             async with sem:
                 res = await check_email_exposed(verified_client, addr)
-                # Polite pause so the keyless API is not hammered.
-                await asyncio.sleep(BREACH_CALL_DELAY)
+                # If the check came back indeterminate, assume we hit the
+                # throttle and slow the whole job down for the next calls.
+                if res == BREACH_UNKNOWN:
+                    _note_throttle()
+                # Polite (possibly slowed) pause so the keyless API is not hammered.
+                await _paced_sleep()
             counters["checked"] += 1
             job.emails_checked = counters["checked"]
             job.progress = min(100, int(counters["checked"] * 100 / total))
@@ -3968,21 +4082,23 @@ async def run_breach(
             is_supplied = source == "supplied"
 
             if res is None:
-                # 'Not found': keep only if the user supplied it; otherwise drop.
+                # 'Not found': a CONFIRMED clean address. Keep the count only if
+                # the user supplied it; otherwise drop the speculative candidate.
                 if is_supplied:
                     counters["clean"] += 1
                 return
             if res == BREACH_UNKNOWN:
-                # Indeterminate: keep supplied addresses (so the user sees the
-                # coverage gap); drop speculative discovered/pattern ones.
-                if is_supplied:
-                    counters["clean"] += 1
+                # Indeterminate (throttled/error after backoff): NEVER counted as
+                # clean. Reported distinctly so '0 exposed' can't masquerade as a
+                # confirmed-clean result. Counted for every candidate so the user
+                # sees the full coverage gap.
+                counters["unknown"] += 1
                 return
 
             # res is a (possibly empty) list of breach names -> exposed. Enrich
             # with detailed analytics (never raises).
             analytics = await breach_analytics(verified_client, addr)
-            await asyncio.sleep(BREACH_CALL_DELAY)
+            await _paced_sleep()
             breach_names = sorted(set(res) | set(analytics.get("breaches", [])))
             results[addr] = {
                 "email": addr,
@@ -4001,15 +4117,19 @@ async def run_breach(
         job.results = [results[a] for a in candidates if a in results]
         job.exposed_count = len(job.results)
         job.checked_clean = counters["clean"]
+        job.checked_unknown = counters["unknown"]
         job.progress = 100
         job.status = "done"
         logger.info(
-            "breach job %s done: domain=%s candidates=%d checked=%d exposed=%d",
+            "breach job %s done: domain=%s candidates=%d checked=%d exposed=%d "
+            "clean=%d unknown=%d",
             job_id,
             domain,
             len(candidates_set),
             job.emails_checked,
             job.exposed_count,
+            job.checked_clean,
+            job.checked_unknown,
         )
     except Exception as exc:  # noqa: BLE001
         job.status = "error"
@@ -4707,7 +4827,11 @@ BREACH_COVERAGE_NOTE = (
     "Coverage is limited to supplied addresses plus those discovered by "
     "crawling the domain's own public pages (mailto:/inline harvest) and "
     "name/role patterns confirmed against the breach database; this is not an "
-    "exhaustive domain report. Source: XposedOrNot keyless API."
+    "exhaustive domain report. The keyless XposedOrNot API is rate-limited, so "
+    "checks are serialized with exponential backoff (large lists take longer "
+    "but are reliable); any check that stays indeterminate after backoff is "
+    "reported as UNKNOWN (checked_unknown), never as confirmed clean. "
+    "Source: XposedOrNot keyless API."
 )
 
 
@@ -4735,12 +4859,20 @@ def _build_breach_csv(results: list) -> str:
     return buffer.getvalue()
 
 
-def _summarize_breach(results: list, emails_checked: int, checked_clean: int) -> dict:
+def _summarize_breach(
+    results: list,
+    emails_checked: int,
+    checked_clean: int,
+    checked_unknown: int = 0,
+) -> dict:
     """Summary counts for the breach results payload.
 
     ``breaches_count`` is the total breach mentions across all exposed emails;
     ``distinct_breaches`` is the count of unique breach names; ``by_risk`` tiers
     the exposed emails by their risk_label (high/medium/low, case-insensitive).
+    ``checked_unknown`` surfaces how many checks were INDETERMINATE (throttled /
+    Cloudflare / error after backoff) so a "0 exposed" is never silently a
+    throttled result mistaken for "confirmed clean".
     """
     exposed_count = len(results)
     breaches_count = 0
@@ -4760,6 +4892,7 @@ def _summarize_breach(results: list, emails_checked: int, checked_clean: int) ->
         "distinct_breaches": len(distinct),
         "by_risk": by_risk,
         "checked_clean": checked_clean,
+        "checked_unknown": checked_unknown,
     }
 
 
@@ -4813,6 +4946,7 @@ async def breach_status(job_id: str):
         "emails_discovered": job.emails_discovered,
         "emails_checked": job.emails_checked,
         "exposed_count": job.exposed_count,
+        "checked_unknown": job.checked_unknown,
         "error": job.error,
     }
 
@@ -4828,7 +4962,12 @@ async def breach_results(job_id: str):
         "job_id": job.job_id,
         "domain": job.domain,
         "exposed": job.results,
-        "summary": _summarize_breach(job.results, job.emails_checked, job.checked_clean),
+        "summary": _summarize_breach(
+            job.results,
+            job.emails_checked,
+            job.checked_clean,
+            job.checked_unknown,
+        ),
         "coverage_note": BREACH_COVERAGE_NOTE,
     }
 

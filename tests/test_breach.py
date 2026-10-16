@@ -239,6 +239,9 @@ async def test_run_breach_drops_notfound_discovered_keeps_supplied(monkeypatch):
     # pattern address exposed (surfaced).
     monkeypatch.setattr(main, "BREACH_CALL_DELAY", 0)
     monkeypatch.setattr(main, "BREACH_RETRY_BACKOFF", 0)
+    # Keep the adaptive slowdown from pacing this offline test (the unmocked
+    # role/pattern candidates come back UNKNOWN and would otherwise bump delay).
+    monkeypatch.setattr(main, "BREACH_ADAPTIVE_STEP", 0)
 
     async def no_discovery(client, domain):
         return set()
@@ -738,3 +741,258 @@ async def test_run_breach_domain_only_respects_cap(monkeypatch):
     job = main.BREACH_JOBS["cap"]
     assert job.status == "done"
     assert job.emails_checked <= 3  # MAX_BREACH_EMAILS honored
+
+
+# ---------------------------------------------------------------------------
+# 16. Rate-limit survival: serialization + exponential backoff + UNKNOWN
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def no_sleep(monkeypatch):
+    """Mock asyncio.sleep so backoff/pacing tests never actually wait.
+
+    Records every requested sleep duration so a test can assert a backoff path
+    was taken, while returning immediately.
+    """
+    slept: list = []
+
+    async def fake_sleep(secs, *a, **k):
+        slept.append(secs)
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    return slept
+
+
+def test_breach_concurrency_is_serial():
+    # The XposedOrNot calls MUST be serialized — this API cannot tolerate
+    # parallelism. Kept as a tunable named constant.
+    assert main.BREACH_CONCURRENCY == 1
+
+
+@respx.mock
+async def test_check_email_exposed_backoff_then_success(no_sleep):
+    # 429 on the first call, 200 with breaches on the retry -> parsed exposed,
+    # and the backoff path was taken (endpoint called twice, a sleep recorded).
+    route = respx.get(
+        f"{main.XPOSEDORNOT_BASE}/v1/check-email/careers@example.com"
+    ).mock(
+        side_effect=[
+            httpx.Response(429, json={"detail": {"error": "Request dropped"}}),
+            httpx.Response(200, json={"breaches": [["AlienStealerLogs"]], "status": "success"}),
+        ]
+    )
+    async with httpx.AsyncClient() as c:
+        res = await main.check_email_exposed(c, "careers@example.com")
+    assert res == ["AlienStealerLogs"]
+    assert route.call_count == 2  # backoff retry happened
+    assert len(no_sleep) >= 1  # at least one backoff sleep
+
+
+@respx.mock
+async def test_check_email_exposed_honors_retry_after(no_sleep):
+    respx.get(f"{main.XPOSEDORNOT_BASE}/v1/check-email/a@example.com").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "5"}, json={}),
+            httpx.Response(200, json={"breaches": [["B1"]], "status": "success"}),
+        ]
+    )
+    async with httpx.AsyncClient() as c:
+        res = await main.check_email_exposed(c, "a@example.com")
+    assert res == ["B1"]
+    # The Retry-After value (5s) was used as the backoff sleep.
+    assert 5.0 in no_sleep
+
+
+@respx.mock
+async def test_check_email_exposed_cloudflare_challenge_then_unknown(no_sleep):
+    # A Cloudflare "Just a moment" interstitial (served 200) must be treated as
+    # a throttle and retried; if it NEVER clears -> UNKNOWN, never "not exposed".
+    cf_html = (
+        "<!DOCTYPE html><html><head><title>Just a moment...</title></head>"
+        "<body>Checking your browser</body></html>"
+    )
+    route = respx.get(
+        f"{main.XPOSEDORNOT_BASE}/v1/check-email/cf@example.com"
+    ).mock(return_value=httpx.Response(200, text=cf_html))
+    async with httpx.AsyncClient() as c:
+        res = await main.check_email_exposed(c, "cf@example.com")
+    assert res == main.BREACH_UNKNOWN  # indeterminate, NOT None/clean
+    # Retried BREACH_MAX_RETRIES times before giving up.
+    assert route.call_count == main.BREACH_MAX_RETRIES + 1
+
+
+@respx.mock
+async def test_check_email_exposed_violation_history_body_is_throttle(no_sleep):
+    # The explicit "violation history" drop marker (even with a 200/JSON body)
+    # is a throttle, not a result.
+    route = respx.get(
+        f"{main.XPOSEDORNOT_BASE}/v1/check-email/v@example.com"
+    ).mock(
+        side_effect=[
+            httpx.Response(
+                429,
+                json={"detail": {"error": "Request dropped due to violation history"}},
+            ),
+            httpx.Response(200, json={"Error": "Not found", "email": None}),
+        ]
+    )
+    async with httpx.AsyncClient() as c:
+        res = await main.check_email_exposed(c, "v@example.com")
+    # Retry cleared and the address is genuinely Not found.
+    assert res is None
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_check_email_exposed_notfound_is_not_unknown(no_sleep):
+    # A genuine 'Not found' is clean (None) and distinct from UNKNOWN.
+    respx.get(f"{main.XPOSEDORNOT_BASE}/v1/check-email/clean@example.com").mock(
+        return_value=httpx.Response(200, json={"Error": "Not found", "email": None})
+    )
+    async with httpx.AsyncClient() as c:
+        res = await main.check_email_exposed(c, "clean@example.com")
+    assert res is None
+    assert res is not main.BREACH_UNKNOWN
+
+
+@respx.mock
+async def test_run_breach_mix_exposed_notfound_throttled(no_sleep, monkeypatch):
+    # A mix of three SUPPLIED addresses: one exposed, one genuine Not-found,
+    # one perpetually 429'd. Expect exposed_count=1, checked_clean=1 (not-found),
+    # checked_unknown=1 (throttled) — and the throttled one is NOT reported clean.
+    async def no_discovery(client, domain):
+        return set()
+
+    monkeypatch.setattr(main, "discover_emails", no_discovery)
+
+    async def fake_rich(verified, probe, domain, job):
+        return {"discovered": set(), "names": set()}
+
+    monkeypatch.setattr(main, "discover_emails_rich", fake_rich)
+    # Only the supplied addresses should be checked in this test.
+    monkeypatch.setattr(main, "BREACH_ROLE_LOCALS", ())
+
+    respx.get(f"{main.XPOSEDORNOT_BASE}/v1/check-email/hit@example.com").mock(
+        return_value=httpx.Response(200, json={"breaches": [["B1"]], "status": "success"})
+    )
+    respx.get(f"{main.XPOSEDORNOT_BASE}/v1/check-email/clean@example.com").mock(
+        return_value=httpx.Response(200, json={"Error": "Not found", "email": None})
+    )
+    respx.get(f"{main.XPOSEDORNOT_BASE}/v1/check-email/throttled@example.com").mock(
+        return_value=httpx.Response(429, json={"detail": {"error": "dropped"}})
+    )
+    respx.get(f"{main.XPOSEDORNOT_BASE}/v1/breach-analytics").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "BreachMetrics": {"risk": [{"risk_label": "Low", "risk_score": 2}]},
+                "BreachesSummary": {"site": "B1"},
+                "ExposedBreaches": {"breaches_details": []},
+            },
+        )
+    )
+
+    supplied = "hit@example.com\nclean@example.com\nthrottled@example.com"
+    async with httpx.AsyncClient() as c:
+        main.app.state.client = c
+        if hasattr(main.app.state, "probe_client"):
+            delattr(main.app.state, "probe_client")
+        main.BREACH_JOBS["mix"] = main.BreachJobState(job_id="mix", domain="example.com")
+        await main.run_breach("mix", "example.com", supplied, None)
+
+    job = main.BREACH_JOBS["mix"]
+    assert job.status == "done"
+    emails = {r["email"] for r in job.results}
+    assert job.exposed_count == 1
+    assert "hit@example.com" in emails
+    # The throttled address is NOT surfaced as exposed and NOT counted clean.
+    assert "throttled@example.com" not in emails
+    assert job.checked_clean == 1  # only the genuine Not-found
+    assert job.checked_unknown == 1  # the perpetually-429 one
+
+    # The summary exposes the indeterminate count distinctly.
+    summ = main._summarize_breach(
+        job.results, job.emails_checked, job.checked_clean, job.checked_unknown
+    )
+    assert summ["checked_unknown"] == 1
+    assert summ["exposed_count"] == 1
+
+
+@respx.mock
+async def test_run_breach_supplied_three_known_exposed(no_sleep, monkeypatch):
+    # Regression: the three known example.com emails still resolve to 3 exposed
+    # with the serialized delay + backoff in place (mocked).
+    async def fake_rich(verified, probe, domain, job):
+        return {"discovered": set(), "names": set()}
+
+    monkeypatch.setattr(main, "discover_emails_rich", fake_rich)
+    # Only the three supplied addresses should be checked here.
+    monkeypatch.setattr(main, "BREACH_ROLE_LOCALS", ())
+
+    known = ("careers@example.com", "aruna.vr@example.com", "sooraj.s@example.com")
+    for addr in known:
+        # First call 429 (throttle), retry succeeds -> exercises backoff path.
+        respx.get(f"{main.XPOSEDORNOT_BASE}/v1/check-email/{addr}").mock(
+            side_effect=[
+                httpx.Response(429, json={"detail": {"error": "dropped"}}),
+                httpx.Response(200, json={"breaches": [["AlienStealerLogs"]], "status": "success"}),
+            ]
+        )
+    respx.get(f"{main.XPOSEDORNOT_BASE}/v1/breach-analytics").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "BreachMetrics": {"risk": [{"risk_label": "High", "risk_score": 7}]},
+                "BreachesSummary": {"site": "AlienStealerLogs"},
+                "ExposedBreaches": {"breaches_details": []},
+            },
+        )
+    )
+
+    supplied = "\n".join(known)
+    async with httpx.AsyncClient() as c:
+        main.app.state.client = c
+        if hasattr(main.app.state, "probe_client"):
+            delattr(main.app.state, "probe_client")
+        main.BREACH_JOBS["known"] = main.BreachJobState(job_id="known", domain="example.com")
+        await main.run_breach("known", "example.com", supplied, None)
+
+    job = main.BREACH_JOBS["known"]
+    assert job.status == "done"
+    assert job.exposed_count == 3
+    emails = {r["email"] for r in job.results}
+    assert emails == set(known)
+    assert job.checked_unknown == 0  # backoff defeated the throttle
+
+
+@respx.mock
+async def test_run_breach_calls_do_not_overlap(no_sleep, monkeypatch):
+    # The XposedOrNot per-email checks must run one at a time (no overlap) given
+    # BREACH_CONCURRENCY == 1. Record max in-flight concurrency via the mock.
+    async def fake_rich(verified, probe, domain, job):
+        return {"discovered": set(), "names": set()}
+
+    monkeypatch.setattr(main, "discover_emails_rich", fake_rich)
+
+    state = {"inflight": 0, "max": 0}
+
+    async def record(request):
+        state["inflight"] += 1
+        state["max"] = max(state["max"], state["inflight"])
+        # Yield control so an overlapping call could be observed if concurrent.
+        await asyncio.sleep(0)
+        state["inflight"] -= 1
+        return httpx.Response(200, json={"Error": "Not found", "email": None})
+
+    respx.get(url__regex=r"https://api\.xposedornot\.com/v1/check-email/.*").mock(
+        side_effect=record
+    )
+
+    supplied = "a@example.com\nb@example.com\nc@example.com\nd@example.com"
+    async with httpx.AsyncClient() as c:
+        main.app.state.client = c
+        if hasattr(main.app.state, "probe_client"):
+            delattr(main.app.state, "probe_client")
+        main.BREACH_JOBS["serial"] = main.BreachJobState(job_id="serial", domain="example.com")
+        await main.run_breach("serial", "example.com", supplied, None)
+
+    assert state["max"] == 1  # never more than one check in flight

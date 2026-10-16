@@ -422,7 +422,10 @@ public pages for published `mailto:`/inline addresses and names, plus crt.sh and
 common role locals) **or supplied by you**, then verified against the breach
 API. An address you did not supply is surfaced only when the breach database
 already knows it; unknown addresses are not reported. Treat the output as a
-floor, not a ceiling.
+floor, not a ceiling. Because the keyless API is rate-limited, checks are
+serialized with backoff (slower but reliable) and any check that stays
+indeterminate after backoff is reported as `UNKNOWN`, never as confirmed clean
+(see [Rate-limit handling](#rate-limit-handling-serialized--backoff) below).
 
 ### Discovery approach
 
@@ -470,20 +473,47 @@ a resolved IP passes `_is_safe_public_ip` (private/internal/loopback/link-local
 and the cloud-metadata address are never fetched), through the dedicated probe
 client under a low bounded `asyncio.Semaphore`, a short timeout, and the
 `MAX_RESPONSE_BYTES` body cap. Every scraped address is re-validated with
-`_valid_email_for_domain` before any use. The per-email breach calls still run
-under the deliberately low bounded `asyncio.Semaphore(BREACH_CONCURRENCY = 3)`
-with a polite inter-call delay (the XposedOrNot API is rate-limited) and go
-through the **verified** TLS client to the fixed host `api.xposedornot.com`; no
+`_valid_email_for_domain` before any use. The per-email breach calls go through
+the **verified** TLS client to the fixed host `api.xposedornot.com`; no
 arbitrary user-controlled host is ever fetched, and scraped page content is
 never logged.
+
+### Rate-limit handling (serialized + backoff)
+
+The keyless XposedOrNot per-email endpoint throttles **hard and fast**: a few
+checks in quick succession earn HTTP 429 plus a Cloudflare *"Just a moment"*
+challenge, and the throttle has memory (a growing "violation history" keeps
+dropping later calls). Firing several checks in parallel therefore made a
+domain-only run report *"0 exposed"* even when addresses were genuinely
+breached, because most checks were dropped and silently treated as clean.
+
+To make keyless checks **reliable**, the breach path now:
+
+- **Serializes the XposedOrNot calls** — `BREACH_CONCURRENCY = 1` (the API
+  cannot tolerate parallelism). Page-scrape discovery keeps its own
+  `SCRAPE_CONCURRENCY` and is unaffected.
+- **Paces the calls** with an inter-request delay (`BREACH_REQUEST_DELAY`,
+  ~1.2s) to stay under the throttle. This makes large lists **slower but
+  correct**.
+- **Backs off and retries** on a throttle (HTTP 429/403, a Cloudflare HTML
+  challenge, or a *"violation history"* body) with **exponential backoff**
+  (~2s, 4s, 8s; up to `BREACH_MAX_RETRIES`), honoring a `Retry-After` header
+  when present. A one-off 429 is also treated as an **adaptive** signal that
+  slows the remaining calls in the job so a single throttle does not cascade.
+- **Reports `UNKNOWN` distinctly from clean.** A check that stays indeterminate
+  after backoff is counted as `checked_unknown` (surfaced in the status and
+  results summary) and is **never** silently reported as *"not exposed"*. A
+  genuine *"Not found"* is still counted as clean and excluded from the exposed
+  list. This way a `0 exposed` can no longer masquerade as *"confirmed clean"*
+  when it was really *"throttled / indeterminate"*.
 
 ### Breach API
 
 | Method | Path | Description |
 | --- | --- | --- |
 | POST | `/api/breach` | Start a breach-exposure job. Body: `{domain, emails?, names?}` where `emails`/`names` are newline-separated strings. Returns `{job_id}`. |
-| GET | `/api/breach/status/{job_id}` | Poll `status`, `progress`, `emails_discovered`, `emails_checked`, and `exposed_count`. |
-| GET | `/api/breach/results/{job_id}` | Once `done`, returns `{domain, exposed: [...], summary: {...}, coverage_note}`. Each exposed entry carries `email`, `breaches`, `exposed_data`, `risk_label`, `risk_score`, and `source` (`supplied` / `discovered` / `pattern`). |
+| GET | `/api/breach/status/{job_id}` | Poll `status`, `progress`, `emails_discovered`, `emails_checked`, `exposed_count`, and `checked_unknown` (indeterminate/throttled checks). |
+| GET | `/api/breach/results/{job_id}` | Once `done`, returns `{domain, exposed: [...], summary: {...}, coverage_note}`. The `summary` carries `checked_clean` and `checked_unknown` so throttled/indeterminate checks are distinct from confirmed-clean ones. Each exposed entry carries `email`, `breaches`, `exposed_data`, `risk_label`, `risk_score`, and `source` (`supplied` / `discovered` / `pattern`). |
 | GET | `/api/breach/download/{job_id}` | Download the breach CSV report. |
 
 These endpoints are keyless, reuse the per-client rate limit and the combined
