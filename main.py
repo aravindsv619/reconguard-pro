@@ -167,6 +167,84 @@ MAX_ACTIVE_CANDIDATES = 20000
 # the intended active concurrency and is currently equal to ANALYSIS_CONCURRENCY.
 ACTIVE_RESOLVE_CONCURRENCY = 50
 
+# ---------------------------------------------------------------------------
+# Lookalike / typosquat domain discovery (keyless) — FEAT-001.
+# ---------------------------------------------------------------------------
+# These power the SEPARATE /api/lookalike* job API. The engine is pure/offline
+# for candidate generation and reuses every existing guard
+# (is_valid_hostname/DOMAIN_RE, _is_safe_public_ip SSRF, _csv_safe,
+# resolve_dns_detailed, _dig_records, check_http, the verified RDAP client,
+# _rate_limit_ok, MAX_ACTIVE_JOBS, MAX_RESPONSE_BYTES, bounded Semaphores) for
+# the network/analysis phase.
+
+# Candidate-level DoS bound: generate_lookalikes stops producing candidates at
+# this cap, enforced at EVERY growth step (mirrors MAX_ACTIVE_CANDIDATES for
+# the active-discovery generators). Chosen smaller than MAX_ACTIVE_CANDIDATES
+# because every surviving candidate is independently DNS/HTTP/RDAP probed.
+MAX_LOOKALIKE_CANDIDATES = 5000
+
+# TLDs tried for the TLD-swap and combosquat techniques. A pragmatic set of the
+# TLDs most abused for brand impersonation (not an exhaustive IANA list).
+LOOKALIKE_TLDS = [
+    "com", "net", "org", "io", "co", "ai", "app", "dev", "info", "biz",
+    "online", "site", "xyz", "cc", "me", "tech", "store", "us", "uk", "in",
+]
+
+# QWERTY physical-keyboard adjacency (lowercase letters only) used by the
+# insertion and replacement (fat-finger) techniques: each key maps to the keys
+# physically next to it on a US QWERTY layout.
+QWERTY_ADJACENCY = {
+    "q": "wa", "w": "qeas", "e": "wrsd", "r": "etdf", "t": "ryfg",
+    "y": "tugh", "u": "yihj", "i": "uojk", "o": "ipkl", "p": "ol",
+    "a": "qwsz", "s": "awedxz", "d": "serfcx", "f": "drtgvc", "g": "ftyhbv",
+    "h": "gyujnb", "j": "huikmn", "k": "jiolm", "l": "kop",
+    "z": "asx", "x": "zsdc", "c": "xdfv", "v": "cfgb", "b": "vghn",
+    "n": "bhjm", "m": "njk",
+}
+
+# Homoglyph substitutions (ASCII-only, visually-confusable) applied by the
+# homoglyph technique. Each key may be replaced by any string in its list
+# (single and multi-char pairs kept bidirectionally where it makes sense).
+HOMOGLYPHS = {
+    "o": ["0"],
+    "0": ["o"],
+    "l": ["1", "i"],
+    "1": ["l", "i"],
+    "i": ["1", "l"],
+    "m": ["rn"],
+    "w": ["vv"],
+    "d": ["cl"],
+    "b": ["6"],
+    "6": ["b"],
+    "g": ["9"],
+    "9": ["g"],
+    "s": ["5"],
+    "5": ["s"],
+}
+
+# Words prepended/appended (hyphenated) by the combosquatting technique
+# (e.g. ``login-brandco.com`` / ``brandco-secure.com``).
+COMBOSQUAT_WORDS = [
+    "login", "secure", "account", "support", "verify", "auth",
+    "mail", "help", "app", "portal", "pay", "update",
+]
+
+# Best-effort multi-label public suffixes so split_domain keeps the full
+# registrable label for domains like ``example.co.uk``. This is NOT a complete
+# Public Suffix List — it covers the common ccTLD SLDs only.
+MULTI_LABEL_SLDS = {
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "com.au", "net.au", "org.au",
+    "co.in", "net.in", "org.in", "com.br", "com.cn", "co.jp", "co.nz",
+    "co.za", "com.mx", "com.sg", "com.tr",
+}
+
+# RDAP (whois) lookup settings for the OPTIONAL registration check. Uses the
+# verified (TLS-validated) client. Bounded concurrency + a hard per-lookup
+# timeout so a slow RDAP server can never stall a job.
+RDAP_CONCURRENCY = 5
+RDAP_TIMEOUT = 8.0
+RDAP_ENDPOINT = "https://rdap.org/domain/{}"
+
 # Absolute path to the bundled default wordlist, resolved relative to this file.
 DEFAULT_WORDLIST_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "wordlists", "default.txt"
@@ -433,6 +511,419 @@ def _csv_safe(value) -> str:
         return "'" + text
     return text
 
+
+# ---------------------------------------------------------------------------
+# Lookalike / typosquat engine (FEAT-001) — keyless; generation is pure/offline
+# ---------------------------------------------------------------------------
+def split_domain(domain: str) -> tuple[str, str]:
+    """Split ``domain`` into (registrable_label, tld).
+
+    If the domain ends with one of the MULTI_LABEL_SLDS suffixes (e.g.
+    ``co.uk``), the TLD is that two-label suffix and the registrable label is
+    everything before it. Otherwise the split is on the LAST dot. A bare label
+    with no dot returns (label, "").
+
+    Best-effort only: MULTI_LABEL_SLDS is a short hand-curated set, NOT the full
+    Public Suffix List, so exotic multi-label suffixes may split imperfectly.
+    """
+    domain = (domain or "").strip().lower().rstrip(".")
+    for suffix in MULTI_LABEL_SLDS:
+        dotted = "." + suffix
+        if domain.endswith(dotted) and len(domain) > len(dotted):
+            label = domain[: -len(dotted)]
+            # Only the left-most label is the registrable part of interest.
+            return label, suffix
+    if "." in domain:
+        label, _, tld = domain.rpartition(".")
+        return label, tld
+    return domain, ""
+
+
+def generate_lookalikes(domain: str) -> set[str]:
+    """Generate lookalike/typosquat candidates for ``domain``.
+
+    PURE and KEYLESS: no network I/O. Each technique runs in its own documented
+    block and emits via a bounded ``emit`` helper that lowercases, dedups,
+    excludes the input domain, keeps only ``is_valid_hostname``-valid hosts, and
+    stops the whole generation once MAX_LOOKALIKE_CANDIDATES is reached (the cap
+    is checked at every growth step, like generate_permutations).
+    """
+    domain = (domain or "").strip().lower().rstrip(".")
+    label, tld = split_domain(domain)
+    out: set[str] = set()
+    # Sentinel raised internally once the cap is hit to unwind all technique
+    # loops cleanly (each technique is wrapped in try/except below).
+    if not label:
+        return out
+
+    class _CapReached(Exception):
+        pass
+
+    def emit(host: str) -> None:
+        host = (host or "").lower()
+        if not host or host == domain or host in out:
+            return
+        if not is_valid_hostname(host):
+            return
+        if len(out) >= MAX_LOOKALIKE_CANDIDATES:
+            raise _CapReached
+        out.add(host)
+        if len(out) >= MAX_LOOKALIKE_CANDIDATES:
+            raise _CapReached
+
+    def with_tld(new_label: str, new_tld: Optional[str] = None) -> str:
+        t = new_tld if new_tld is not None else tld
+        return f"{new_label}.{t}" if t else new_label
+
+    alpha = "abcdefghijklmnopqrstuvwxyz"
+    try:
+        # --- Hyphenation: insert a single hyphen between adjacent char groups.
+        # Emit under the original TLD (e.g. brandco -> brand-co.ai) AND a
+        # bounded subset of the lookalike TLDs (so brand-co.com is covered —
+        # the common cross-TLD hyphenated impersonation). ---
+        hyphen_tlds = ([tld] if tld else []) + LOOKALIKE_TLDS[:5]
+        for i in range(1, len(label)):
+            if label[i - 1] != "-" and label[i] != "-":
+                hyphenated = label[:i] + "-" + label[i:]
+                for t in hyphen_tlds:
+                    if t:
+                        emit(f"{hyphenated}.{t}")
+
+        # --- TLD swap: same label with each LOOKALIKE_TLD plus the original. ---
+        for t in LOOKALIKE_TLDS:
+            emit(f"{label}.{t}")
+        if tld:
+            emit(f"{label}.{tld}")
+
+        # --- Omission: remove one character. ---
+        for i in range(len(label)):
+            emit(with_tld(label[:i] + label[i + 1:]))
+
+        # --- Insertion: insert a keyboard-adjacent char between letters. ---
+        for i in range(len(label)):
+            for adj in QWERTY_ADJACENCY.get(label[i], ""):
+                emit(with_tld(label[:i] + adj + label[i:]))
+                emit(with_tld(label[: i + 1] + adj + label[i + 1:]))
+
+        # --- Repetition: double a character. ---
+        for i in range(len(label)):
+            emit(with_tld(label[:i] + label[i] + label[i:]))
+
+        # --- Transposition: swap two adjacent characters. ---
+        for i in range(len(label) - 1):
+            swapped = label[:i] + label[i + 1] + label[i] + label[i + 2:]
+            emit(with_tld(swapped))
+
+        # --- Replacement: replace a char with a QWERTY-adjacent char. ---
+        for i in range(len(label)):
+            for adj in QWERTY_ADJACENCY.get(label[i], ""):
+                emit(with_tld(label[:i] + adj + label[i + 1:]))
+
+        # --- Homoglyph: apply confusable substitutions one position at a time
+        # (bounded — one substitution per emitted candidate). ---
+        for i in range(len(label)):
+            for repl in HOMOGLYPHS.get(label[i], []):
+                emit(with_tld(label[:i] + repl + label[i + 1:]))
+
+        # --- Combosquatting: prepend/append each word with a hyphen, keeping
+        # the original TLD plus a bounded subset of the TLD-swap set. ---
+        combo_tlds = [tld] if tld else []
+        combo_tlds += LOOKALIKE_TLDS[:5]
+        for word in COMBOSQUAT_WORDS:
+            for t in combo_tlds:
+                if not t:
+                    continue
+                emit(f"{word}-{label}.{t}")
+                emit(f"{label}-{word}.{t}")
+
+        # --- Subdomain / dot-insert: insert a dot splitting the label, e.g.
+        # brandco -> brand.co.tld. ---
+        for i in range(1, len(label)):
+            emit(with_tld(label[:i] + "." + label[i:]))
+
+        # --- Bitsquatting: flip one bit of each alpha char, keep valid hosts. ---
+        for i, ch in enumerate(label):
+            for bit in range(8):
+                flipped = chr(ord(ch) ^ (1 << bit))
+                if flipped in alpha and flipped != ch:
+                    emit(with_tld(label[:i] + flipped + label[i + 1:]))
+    except _CapReached:
+        pass
+
+    return out
+
+
+def score_lookalike(
+    dns_status: Optional[str],
+    http_status: Optional[int],
+    https_status: Optional[int],
+    has_mx: bool,
+    resembles_original: bool,
+    registered,
+) -> tuple[str, str]:
+    """Return (risk, recommended_action) for a lookalike candidate.
+
+    Tiers (honest wording — a candidate to INVESTIGATE, never an assertion of
+    malice):
+      HIGH     — resolves AND a live HTTP site (2xx/3xx) AND (has MX OR the page
+                 resembles the original). Likely active impersonation infra.
+      MEDIUM   — resolves + live but no MX and no mimicry, OR registered but
+                 parked / no live site.
+      LOW      — resolves (DNS only), no live site.
+      AVAILABLE— does not resolve and (when whois was checked) appears
+                 unregistered. A defensive-registration opportunity.
+      NONE     — anything else (e.g. unresolved with unknown registration).
+    """
+    resolves = dns_status == "RESOLVED"
+    live = _http_live(http_status) or _http_live(https_status)
+
+    if resolves and live and (has_mx or resembles_original):
+        return (
+            "HIGH",
+            "Candidate to investigate for possible phishing/brand-abuse: it "
+            "resolves and serves a live site" + (" with mail (MX)" if has_mx else "")
+            + ". Consider monitoring and, if confirmed malicious, takedown; "
+            "first confirm it is not owned by you.",
+        )
+    if resolves and live:
+        return (
+            "MEDIUM",
+            "Resolves and is live but shows no mail records or page mimicry. "
+            "Worth a periodic re-check; confirm ownership.",
+        )
+    if resolves and registered is True and not live:
+        return (
+            "MEDIUM",
+            "Registered and resolves but no live site (possibly parked). "
+            "Monitor for activation.",
+        )
+    if resolves:
+        return (
+            "LOW",
+            "Resolves at the DNS level but has no live site. Low priority; "
+            "re-check periodically.",
+        )
+    if registered is False:
+        return (
+            "AVAILABLE",
+            "Unregistered lookalike. Consider defensive registration to keep it "
+            "out of an impersonator's hands.",
+        )
+    return (
+        "NONE",
+        "Does not resolve; registration status unknown. No action needed now.",
+    )
+
+
+def _http_live(status: Optional[int]) -> bool:
+    """True iff an HTTP status indicates a live site (2xx or 3xx)."""
+    return status is not None and 200 <= status < 400
+
+
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+def _extract_title(body: str) -> Optional[str]:
+    """Cheaply extract the <title> text from a bounded HTML slice.
+
+    Operates on a bounded prefix of ``body`` (the title is always near the top)
+    and collapses whitespace. Returns None when no title is found. Never raises.
+    """
+    try:
+        if not body:
+            return None
+        match = _TITLE_RE.search(body[:65536])
+        if not match:
+            return None
+        title = re.sub(r"\s+", " ", match.group(1)).strip()
+        return title or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def fetch_title(probe_client: httpx.AsyncClient, host: str) -> Optional[str]:
+    """Best-effort page title for ``host`` (SSRF-guarded). Never raises.
+
+    Mirrors analyze_subdomain's guard: validate the hostname, resolve it, and
+    only probe when at least one resolved IP passes _is_safe_public_ip (so the
+    probe can never reach a private/metadata address). The body is bounded by
+    check_http/_read_capped_body. Returns None on any failure.
+    """
+    try:
+        if not is_valid_hostname(host):
+            return None
+        ip_addresses, _ = await resolve_dns_detailed(host)
+        if ip_addresses and not any(_is_safe_public_ip(ip) for ip in ip_addresses):
+            return None
+        _http, _https, body = await check_http(probe_client, host)
+        return _extract_title(body)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def rdap_lookup(verified_client: httpx.AsyncClient, candidate: str) -> dict:
+    """Look up registration data for ``candidate`` via RDAP. Never raises.
+
+    Issues a single GET to RDAP_ENDPOINT on the VERIFIED (TLS-validated) client,
+    bounded by RDAP_TIMEOUT. On success parses ``registered`` (True when the
+    RDAP object exists), the registrar name, and the registration/creation date
+    from the RDAP JSON. On ANY error/timeout/non-200 returns a neutral
+    ``{"registered": "unknown", "registrar": "", "creation_date": ""}`` so a job
+    is never blocked by whois.
+    """
+    unknown = {"registered": "unknown", "registrar": "", "creation_date": ""}
+    try:
+        resp = await asyncio.wait_for(
+            verified_client.get(RDAP_ENDPOINT.format(candidate)),
+            timeout=RDAP_TIMEOUT,
+        )
+        if resp.status_code == 404:
+            # RDAP 404 is an authoritative "no such registration".
+            return {"registered": False, "registrar": "", "creation_date": ""}
+        if resp.status_code != 200:
+            return dict(unknown)
+        data = resp.json()
+        if not isinstance(data, dict):
+            return dict(unknown)
+        registrar = ""
+        for ent in data.get("entities", []) or []:
+            if not isinstance(ent, dict):
+                continue
+            roles = ent.get("roles", []) or []
+            if "registrar" in roles:
+                registrar = _rdap_entity_name(ent)
+                if registrar:
+                    break
+        creation_date = ""
+        for ev in data.get("events", []) or []:
+            if not isinstance(ev, dict):
+                continue
+            if ev.get("eventAction") == "registration":
+                creation_date = str(ev.get("eventDate", "") or "")
+                break
+        return {
+            "registered": True,
+            "registrar": registrar,
+            "creation_date": creation_date,
+        }
+    except Exception:  # noqa: BLE001
+        return dict(unknown)
+
+
+def _rdap_entity_name(entity: dict) -> str:
+    """Pull a human-readable name from an RDAP entity's vCard, best-effort."""
+    try:
+        vcard = entity.get("vcardArray")
+        if isinstance(vcard, list) and len(vcard) == 2:
+            for item in vcard[1]:
+                if isinstance(item, list) and len(item) >= 4 and item[0] == "fn":
+                    return str(item[3] or "")
+        return str(entity.get("handle", "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def analyze_candidate(
+    probe_client: httpx.AsyncClient,
+    verified_client: httpx.AsyncClient,
+    candidate: str,
+    technique: str,
+    original_title: Optional[str],
+    check_whois: bool,
+    sem: asyncio.Semaphore,
+    rdap_sem: asyncio.Semaphore,
+) -> dict:
+    """Analyze one lookalike candidate. Returns a fixed-shape result dict.
+
+    All probing happens under ``sem`` (bounded concurrency, NO unbounded
+    fan-out). Flow mirrors analyze_subdomain: is_valid_hostname gate ->
+    resolve_dns_detailed -> HTTP probe ONLY when a resolved IP passes
+    _is_safe_public_ip (SSRF guard). MX comes from _dig_records; mimicry is a
+    best-effort case-insensitive title match. RDAP runs under ``rdap_sem`` only
+    when ``check_whois`` is set.
+    """
+    dns_status = "ERROR"
+    ip_addresses: list[str] = []
+    http_status: Optional[int] = None
+    https_status: Optional[int] = None
+    page_title: Optional[str] = None
+    has_mx = False
+    registered = "unknown"
+    registrar = ""
+    creation_date = ""
+
+    async with sem:
+        if not is_valid_hostname(candidate):
+            return {
+                "candidate": candidate,
+                "technique": technique,
+                "dns_status": "ERROR",
+                "ip_addresses": [],
+                "http_status": None,
+                "https_status": None,
+                "page_title": None,
+                "has_mx": False,
+                "registered": "unknown",
+                "registrar": "",
+                "creation_date": "",
+                "resembles_original": False,
+                "risk": "NONE",
+                "recommended_action": "Invalid hostname; skipped.",
+            }
+
+        ip_addresses, dns_status = await resolve_dns_detailed(candidate)
+        if dns_status == "RESOLVED":
+            # SSRF guard: only probe when at least one resolved IP is public.
+            if ip_addresses and not any(_is_safe_public_ip(ip) for ip in ip_addresses):
+                http_status, https_status, body = None, None, ""
+            else:
+                http_status, https_status, body = await check_http(
+                    probe_client, candidate
+                )
+                page_title = _extract_title(body)
+            try:
+                has_mx = bool(_dig_records(candidate).get("MX"))
+            except Exception:  # noqa: BLE001
+                has_mx = False
+
+        if check_whois:
+            async with rdap_sem:
+                info = await rdap_lookup(verified_client, candidate)
+            registered = info.get("registered", "unknown")
+            registrar = info.get("registrar", "")
+            creation_date = info.get("creation_date", "")
+
+    resembles_original = bool(
+        original_title
+        and page_title
+        and original_title.strip().lower() == page_title.strip().lower()
+    )
+    risk, recommended_action = score_lookalike(
+        dns_status,
+        http_status,
+        https_status,
+        has_mx,
+        resembles_original,
+        registered,
+    )
+    return {
+        "candidate": candidate,
+        "technique": technique,
+        "dns_status": dns_status,
+        "ip_addresses": ip_addresses,
+        "http_status": http_status,
+        "https_status": https_status,
+        "page_title": page_title,
+        "has_mx": has_mx,
+        "registered": registered,
+        "registrar": registrar,
+        "creation_date": creation_date,
+        "resembles_original": resembles_original,
+        "risk": risk,
+        "recommended_action": recommended_action,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Takeover fingerprints
 # ---------------------------------------------------------------------------
@@ -633,6 +1124,30 @@ class JobState:
 
 
 JOBS: dict[str, JobState] = {}
+
+
+@dataclass
+class LookalikeJobState:
+    """In-memory state for a lookalike-domain job.
+
+    SEPARATE from JobState/JOBS: lookalike jobs have their own store and TTL
+    cleanup so the subdomain path is never touched. ``results`` holds the
+    per-candidate dicts returned by analyze_candidate.
+    """
+    job_id: str
+    domain: str
+    check_whois: bool
+    status: str = "pending"
+    progress: int = 0
+    candidates_generated: int = 0
+    candidates_checked: int = 0
+    registered_count: int = 0
+    results: list = field(default_factory=list)
+    error: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
+
+
+LOOKALIKE_JOBS: dict[str, LookalikeJobState] = {}
 
 
 class EnumerateRequest(BaseModel):
@@ -2442,15 +2957,106 @@ def cleanup_old_jobs() -> None:
         JOBS.pop(jid, None)
 
 
+def cleanup_old_lookalike_jobs() -> None:
+    """Prune finished lookalike jobs older than JOB_TTL_SECONDS.
+
+    Mirrors cleanup_old_jobs() for the SEPARATE LOOKALIKE_JOBS store; running
+    jobs are never pruned.
+    """
+    now = time.time()
+    stale = [
+        jid
+        for jid, job in LOOKALIKE_JOBS.items()
+        if now - job.created_at > JOB_TTL_SECONDS and job.status != "running"
+    ]
+    for jid in stale:
+        LOOKALIKE_JOBS.pop(jid, None)
+
+
 async def _periodic_cleanup() -> None:
     while True:
         try:
             await asyncio.sleep(300)
             cleanup_old_jobs()
+            cleanup_old_lookalike_jobs()
         except asyncio.CancelledError:
             break
         except Exception as exc:  # noqa: BLE001
             logger.debug("cleanup error: %s", exc)
+
+
+async def run_lookalike(job_id: str, domain: str, check_whois: bool) -> None:
+    """Run a lookalike-domain job: generate candidates, analyze, score.
+
+    Wraps the whole body in try/except like run_enumeration so a failure marks
+    the job ``error`` instead of crashing the task. Candidate generation is
+    already capped by MAX_LOOKALIKE_CANDIDATES. All network work is bounded by
+    two semaphores (analysis + RDAP). A09 logging records job_id + domain +
+    check_whois ONLY (never bodies/titles).
+    """
+    job = LOOKALIKE_JOBS.get(job_id)
+    if job is None:
+        return
+    probe_client: httpx.AsyncClient = app.state.probe_client
+    verified_client: httpx.AsyncClient = app.state.client
+    cleanup_old_lookalike_jobs()
+
+    logger.info(
+        "lookalike job %s started: domain=%s check_whois=%s",
+        job_id,
+        domain,
+        check_whois,
+    )
+
+    job.status = "running"
+    job.progress = 0
+    try:
+        candidates = sorted(generate_lookalikes(domain))
+        job.candidates_generated = len(candidates)
+
+        # Best-effort original page title (once), never fatal.
+        original_title = await fetch_title(probe_client, domain)
+
+        sem = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
+        rdap_sem = asyncio.Semaphore(RDAP_CONCURRENCY)
+        total = len(candidates) or 1
+
+        async def _analyze(cand: str) -> dict:
+            res = await analyze_candidate(
+                probe_client,
+                verified_client,
+                cand,
+                "lookalike",
+                original_title,
+                check_whois,
+                sem,
+                rdap_sem,
+            )
+            job.candidates_checked += 1
+            if res.get("registered") is True:
+                job.registered_count += 1
+            # Progress 0->100 across the analysis phase.
+            job.progress = min(100, int(job.candidates_checked * 100 / total))
+            return res
+
+        gathered = await asyncio.gather(
+            *(_analyze(c) for c in candidates),
+            return_exceptions=True,
+        )
+        job.results = [r for r in gathered if isinstance(r, dict)]
+        job.progress = 100
+        job.status = "done"
+        logger.info(
+            "lookalike job %s done: domain=%s candidates=%s registered=%s",
+            job_id,
+            domain,
+            job.candidates_generated,
+            job.registered_count,
+        )
+    except Exception as exc:  # noqa: BLE001
+        job.status = "error"
+        job.error = str(exc)
+        logger.debug("lookalike job %s failed: %s", job_id, exc)
 
 
 async def run_enumeration(
@@ -2962,6 +3568,159 @@ async def download_csv(job_id: str):
     filename = f"subrecon_{safe_domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     return StreamingResponse(
         iter([buffer.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lookalike domain API (FEAT-001) — SEPARATE from the subdomain routes.
+# ---------------------------------------------------------------------------
+LOOKALIKE_CSV_COLUMNS = [
+    "candidate",
+    "technique",
+    "dns_status",
+    "ip_addresses",
+    "http_status",
+    "https_status",
+    "page_title",
+    "has_mx",
+    "registered",
+    "registrar",
+    "creation_date",
+    "resembles_original",
+    "risk",
+    "recommended_action",
+]
+
+
+def _build_lookalike_csv(results: list) -> str:
+    """Serialize lookalike results into CSV using LOOKALIKE_CSV_COLUMNS order.
+
+    Every text column is passed through _csv_safe (page_title and registrar are
+    attacker-influenced, as is candidate). ip_addresses (a list) is joined with
+    ';'. Numeric/bool columns pass through as-is (blank for None).
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(LOOKALIKE_CSV_COLUMNS)
+    for r in results:
+        writer.writerow([
+            _csv_safe(r.get("candidate", "")),
+            _csv_safe(r.get("technique", "")),
+            _csv_safe(r.get("dns_status", "")),
+            _csv_safe(";".join(r.get("ip_addresses") or [])),
+            r["http_status"] if r.get("http_status") is not None else "",
+            r["https_status"] if r.get("https_status") is not None else "",
+            _csv_safe(r.get("page_title") or ""),
+            r.get("has_mx", False),
+            _csv_safe(r.get("registered", "")),
+            _csv_safe(r.get("registrar", "")),
+            _csv_safe(r.get("creation_date", "")),
+            r.get("resembles_original", False),
+            _csv_safe(r.get("risk", "")),
+            _csv_safe(r.get("recommended_action", "")),
+        ])
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _summarize_lookalike(results: list) -> dict:
+    """Summary counts for the lookalike results payload."""
+    total = len(results)
+    registered = sum(1 for r in results if r.get("registered") is True)
+    live = sum(
+        1
+        for r in results
+        if _http_live(r.get("http_status")) or _http_live(r.get("https_status"))
+    )
+    high = sum(1 for r in results if r.get("risk") == "HIGH")
+    available = sum(1 for r in results if r.get("risk") == "AVAILABLE")
+    return {
+        "total": total,
+        "registered": registered,
+        "live": live,
+        "high": high,
+        "available": available,
+    }
+
+
+class LookalikeRequest(BaseModel):
+    domain: str
+    check_whois: bool = False
+
+
+@app.post("/api/lookalike")
+async def lookalike_start(req: LookalikeRequest, request: Request):
+    # Per-client rate limit (A04/API4), shared limiter with /api/enumerate.
+    client_ip = request.client.host if request.client else None
+    if not _rate_limit_ok(client_ip):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded, retry later")
+
+    domain = req.domain.strip().lower().rstrip(".")
+    if not is_valid_hostname(domain):
+        raise HTTPException(status_code=400, detail="Invalid domain format")
+
+    cleanup_old_lookalike_jobs()
+    # DoS cap over the COMBINED in-flight jobs of BOTH stores.
+    active = sum(
+        1 for j in JOBS.values() if j.status in ("pending", "running")
+    ) + sum(
+        1 for j in LOOKALIKE_JOBS.values() if j.status in ("pending", "running")
+    )
+    if active >= MAX_ACTIVE_JOBS:
+        raise HTTPException(status_code=429, detail="Too many active jobs, retry later")
+
+    job_id = uuid.uuid4().hex
+    LOOKALIKE_JOBS[job_id] = LookalikeJobState(
+        job_id=job_id, domain=domain, check_whois=req.check_whois
+    )
+    asyncio.create_task(run_lookalike(job_id, domain, req.check_whois))
+    return {"job_id": job_id}
+
+
+@app.get("/api/lookalike/status/{job_id}")
+async def lookalike_status(job_id: str):
+    job = LOOKALIKE_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "status": job.status,
+        "progress": job.progress,
+        "candidates_generated": job.candidates_generated,
+        "candidates_checked": job.candidates_checked,
+        "registered_count": job.registered_count,
+        "error": job.error,
+    }
+
+
+@app.get("/api/lookalike/results/{job_id}")
+async def lookalike_results(job_id: str):
+    job = LOOKALIKE_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "done":
+        raise HTTPException(status_code=409, detail=f"Job not ready (status={job.status})")
+    return {
+        "job_id": job.job_id,
+        "domain": job.domain,
+        "candidates": job.results,
+        "summary": _summarize_lookalike(job.results),
+    }
+
+
+@app.get("/api/lookalike/download/{job_id}")
+async def lookalike_download(job_id: str):
+    job = LOOKALIKE_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "done":
+        raise HTTPException(status_code=409, detail=f"Job not ready (status={job.status})")
+    content = _build_lookalike_csv(job.results)
+    safe_domain = re.sub(r"[^a-z0-9.-]", "_", job.domain.lower()) or "domain"
+    filename = f"lookalike_{safe_domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    return StreamingResponse(
+        iter([content]),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
