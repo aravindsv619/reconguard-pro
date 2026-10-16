@@ -423,6 +423,263 @@
       if (currentJobId) window.open(`/api/download/${currentJobId}`);
     }
 
+    // --- Lookalike Domains mode -------------------------------------------
+    // Separate state from the subdomain scan above so switching modes never
+    // mutates the other mode's DOM or data. Drives the FEAT-001 endpoints:
+    //   POST /api/lookalike {domain, check_whois}
+    //   GET  /api/lookalike/status/{id}  -> candidates_generated/checked/registered_count
+    //   GET  /api/lookalike/results/{id} -> {domain, candidates:[...], summary:{...}}
+    //   GET  /api/lookalike/download/{id}
+    let lookalikeJobId = null;
+    let lookalikePollInterval = null;
+    let lookalikeResults = [];
+    let lookalikeFilteredResults = [];
+    let lookalikeSort = { column: null, asc: true };
+    let lookalikeFilter = 'all';
+
+    function switchMode(mode) {
+      // Toggle visibility of the two mode containers and the active-tab styling.
+      // Neither container's inner state is touched, so each mode keeps its DOM.
+      const sub = document.getElementById('subdomainMode');
+      const look = document.getElementById('lookalikeMode');
+      const subBtn = document.getElementById('modeSubdomains');
+      const lookBtn = document.getElementById('modeLookalike');
+      const active = 'px-5 py-2 rounded-lg text-sm font-semibold bg-brand-600 text-white';
+      const inactive = 'px-5 py-2 rounded-lg text-sm font-semibold bg-transparent text-gray-300';
+      if (mode === 'lookalike') {
+        sub.classList.add('hidden');
+        look.classList.remove('hidden');
+        lookBtn.className = active;
+        subBtn.className = inactive;
+      } else {
+        look.classList.add('hidden');
+        sub.classList.remove('hidden');
+        subBtn.className = active;
+        lookBtn.className = inactive;
+      }
+    }
+
+    async function startLookalike() {
+      const input = document.getElementById('lookalikeDomainInput');
+      const domain = input.value.trim().toLowerCase();
+      const err = document.getElementById('lookalikeDomainError');
+      if (!DOMAIN_RE.test(domain)) {
+        err.classList.remove('hidden');
+        return;
+      }
+      err.classList.add('hidden');
+
+      const check_whois = document.getElementById('lookalikeWhois').checked;
+      const body = { domain, check_whois };
+
+      document.getElementById('findLookalikesBtn').disabled = true;
+      document.getElementById('lookalikeResultsPanel').classList.add('hidden');
+      document.getElementById('lookalikeProgressPanel').classList.remove('hidden');
+      updateLookalikeProgress(0, 0, 0, 0);
+
+      try {
+        const resp = await fetch('/api/lookalike', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (!resp.ok) {
+          const e = await resp.json().catch(() => ({}));
+          throw new Error(e.detail || 'Request failed');
+        }
+        const data = await resp.json();
+        lookalikeJobId = data.job_id;
+        lookalikePollInterval = setInterval(pollLookalikeStatus, 2000);
+        pollLookalikeStatus();
+      } catch (e) {
+        alert('Failed to start lookalike scan: ' + e.message);
+        document.getElementById('findLookalikesBtn').disabled = false;
+        document.getElementById('lookalikeProgressPanel').classList.add('hidden');
+      }
+    }
+
+    function updateLookalikeProgress(pct, generated, checked, registered) {
+      document.getElementById('lookalikeProgressBar').style.width = pct + '%';
+      document.getElementById('lookalikeProgressText').textContent =
+        `${generated} candidates generated, ${checked} checked, ${registered} registered`;
+    }
+
+    async function pollLookalikeStatus() {
+      if (!lookalikeJobId) return;
+      try {
+        const resp = await fetch(`/api/lookalike/status/${lookalikeJobId}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        updateLookalikeProgress(
+          data.progress || 0,
+          data.candidates_generated || 0,
+          data.candidates_checked || 0,
+          data.registered_count || 0
+        );
+
+        if (data.status === 'done') {
+          clearInterval(lookalikePollInterval);
+          lookalikePollInterval = null;
+          await loadLookalikeResults();
+        } else if (data.status === 'error') {
+          clearInterval(lookalikePollInterval);
+          lookalikePollInterval = null;
+          alert('Lookalike scan failed: ' + (data.error || 'unknown error'));
+          document.getElementById('findLookalikesBtn').disabled = false;
+        }
+      } catch (e) {
+        // transient; keep polling
+      }
+    }
+
+    async function loadLookalikeResults() {
+      const resp = await fetch(`/api/lookalike/results/${lookalikeJobId}`);
+      if (!resp.ok) {
+        alert('Failed to load lookalike results');
+        document.getElementById('findLookalikesBtn').disabled = false;
+        return;
+      }
+      const data = await resp.json();
+      displayLookalikeResults(data);
+    }
+
+    function displayLookalikeResults(data) {
+      lookalikeResults = data.candidates || [];
+      document.getElementById('lookalikeProgressPanel').classList.add('hidden');
+      document.getElementById('lookalikeResultsPanel').classList.remove('hidden');
+      document.getElementById('findLookalikesBtn').disabled = false;
+      document.getElementById('lookalikeResultDomain').textContent = data.domain || '';
+
+      const summary = data.summary || {};
+      document.getElementById('lookalikeCardTotal').textContent = summary.total || 0;
+      document.getElementById('lookalikeCardLive').textContent =
+        summary.registered != null ? summary.registered : (summary.live || 0);
+      document.getElementById('lookalikeCardHigh').textContent = summary.high || 0;
+      document.getElementById('lookalikeCardAvailable').textContent = summary.available || 0;
+
+      lookalikeFilter = 'all';
+      setLookalikeFilterButton();
+      applyLookalikeFilters();
+    }
+
+    function setLookalikeFilterButton() {
+      document.querySelectorAll('.lookalike-filter-btn').forEach(btn => {
+        if (btn.dataset.filter === lookalikeFilter) {
+          btn.className = 'lookalike-filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm';
+        } else {
+          btn.className = 'lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm';
+        }
+      });
+    }
+
+    function applyLookalikeFilters() {
+      const search = document.getElementById('lookalikeSearchInput').value.trim().toLowerCase();
+      lookalikeFilteredResults = lookalikeResults.filter(r => {
+        if (search && !String(r.candidate || '').toLowerCase().includes(search)) return false;
+        switch (lookalikeFilter) {
+          case 'live': return r.registered === true || Number.isInteger(r.http_status) || Number.isInteger(r.https_status);
+          case 'high': return r.risk === 'HIGH';
+          case 'medium': return r.risk === 'MEDIUM';
+          case 'available': return r.risk === 'AVAILABLE';
+          default: return true;
+        }
+      });
+      if (lookalikeSort.column) applyLookalikeSort();
+      renderLookalikeTable();
+    }
+
+    function sortLookalikeResults(column) {
+      if (lookalikeSort.column === column) {
+        lookalikeSort.asc = !lookalikeSort.asc;
+      } else {
+        lookalikeSort.column = column;
+        lookalikeSort.asc = true;
+      }
+      applyLookalikeSort();
+      renderLookalikeTable();
+    }
+
+    function applyLookalikeSort() {
+      const col = lookalikeSort.column;
+      const dir = lookalikeSort.asc ? 1 : -1;
+      const riskOrder = { HIGH: 4, MEDIUM: 3, LOW: 2, AVAILABLE: 1, NONE: 0 };
+      lookalikeFilteredResults.sort((a, b) => {
+        let va = a[col], vb = b[col];
+        if (col === 'risk') { va = riskOrder[va] ?? 0; vb = riskOrder[vb] ?? 0; }
+        if (va == null) va = -Infinity;
+        if (vb == null) vb = -Infinity;
+        if (typeof va === 'string') return va.localeCompare(vb) * dir;
+        return (va - vb) * dir;
+      });
+    }
+
+    function lookalikeRiskBadge(risk) {
+      // Whitelist the risk enum before it reaches innerHTML. Values come from
+      // the backend score_lookalike(), but are whitelisted here as defense in
+      // depth (never trust server data raw). AVAILABLE uses a distinct sky/info
+      // color to stand apart from the HIGH/MEDIUM/LOW scale.
+      const label = (risk === 'HIGH' || risk === 'MEDIUM' || risk === 'LOW'
+        || risk === 'AVAILABLE' || risk === 'NONE') ? risk : 'NONE';
+      let cls = 'bg-gray-500';
+      let text = 'text-white';
+      if (label === 'HIGH') cls = 'bg-red-500';
+      else if (label === 'MEDIUM') { cls = 'bg-amber-500'; text = 'text-black'; }
+      else if (label === 'LOW') cls = 'bg-gray-600';
+      else if (label === 'AVAILABLE') cls = 'bg-sky-500';
+      return `<span class="${cls} ${text} text-xs font-semibold px-2 py-0.5 rounded">${label}</span>`;
+    }
+
+    function registeredCell(v) {
+      // registered is True | False | 'unknown' from the backend. Render a fixed
+      // label from a whitelist so no raw server value reaches innerHTML.
+      if (v === true) return '<span class="text-amber-400">Yes</span>';
+      if (v === false) return '<span class="text-emerald-400">No</span>';
+      return '<span class="text-gray-500">—</span>';
+    }
+
+    function renderLookalikeTable() {
+      const tbody = document.getElementById('lookalikeResultsTable');
+      const empty = document.getElementById('lookalikeEmptyRow');
+      if (!lookalikeFilteredResults.length) {
+        tbody.innerHTML = '';
+        empty.classList.remove('hidden');
+        return;
+      }
+      empty.classList.add('hidden');
+      tbody.innerHTML = lookalikeFilteredResults.map((r) => {
+        // Every candidate/page_title/registrar/technique value is attacker-
+        // influenced (generated from or fetched about an arbitrary domain), so
+        // each is escapeHtml-ed before reaching innerHTML. http/https statuses
+        // are coerced to ints via statusCell; risk via the whitelisted badge.
+        const mx = r.has_mx ? '<span class="text-amber-400">MX</span>' : '<span class="text-gray-600">—</span>';
+        const registrar = r.registrar
+          ? ` title="${escapeHtml(String(r.registrar))}"`
+          : '';
+        return `<tr class="border-b border-gray-800/60 animate-fadein hover:bg-gray-800/40">
+          <td class="sticky-col py-2 px-3 font-mono text-brand-300 whitespace-nowrap">${escapeHtml(r.candidate || '')}</td>
+          <td class="py-2 px-3 text-gray-400 text-xs whitespace-nowrap">${escapeHtml(r.technique || '') || '—'}</td>
+          <td class="py-2 px-3 text-gray-400 font-mono text-xs whitespace-nowrap">${escapeHtml(r.dns_status || '') || '—'}</td>
+          <td class="py-2 px-3 whitespace-nowrap">${statusCell(r.http_status)} / ${statusCell(r.https_status)}</td>
+          <td class="py-2 px-3 text-gray-400 text-xs max-w-xs truncate">${escapeHtml(r.page_title || '') || '—'}</td>
+          <td class="py-2 px-3 text-center whitespace-nowrap">${mx}</td>
+          <td class="py-2 px-3 whitespace-nowrap"${registrar}>${registeredCell(r.registered)}</td>
+          <td class="py-2 px-3 whitespace-nowrap">${lookalikeRiskBadge(r.risk)}</td>
+          <td class="py-2 px-3 text-gray-300 text-xs max-w-xs truncate">${escapeHtml(r.recommended_action || '') || '—'}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    function cancelLookalike() {
+      if (lookalikePollInterval) { clearInterval(lookalikePollInterval); lookalikePollInterval = null; }
+      lookalikeJobId = null;
+      document.getElementById('lookalikeProgressPanel').classList.add('hidden');
+      document.getElementById('findLookalikesBtn').disabled = false;
+    }
+
+    function downloadLookalikeCSV() {
+      if (lookalikeJobId) window.open(`/api/lookalike/download/${lookalikeJobId}`);
+    }
+
     document.getElementById('domainInput').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') startScan();
     });
@@ -440,8 +697,9 @@
     document.getElementById('searchInput').addEventListener('input', applyFilters);
 
     // Sortable column headers carry a data-sort attribute (formerly an inline
-    // onclick="sortResults(...)"). Delegated from the results table header.
-    document.querySelectorAll('th[data-sort]').forEach((th) => {
+    // onclick="sortResults(...)"). Scoped to #subdomainMode so the lookalike
+    // table's own data-sort headers are wired separately below.
+    document.querySelectorAll('#subdomainMode th[data-sort]').forEach((th) => {
       th.addEventListener('click', () => sortResults(th.dataset.sort));
     });
 
@@ -452,4 +710,29 @@
       const btn = e.target.closest('button[data-rec]');
       if (!btn) return;
       toggleRecords(Number(btn.dataset.rec));
+    });
+
+    // --- Lookalike mode wiring (CSP-safe, addEventListener only) -----------
+    document.getElementById('modeSubdomains').addEventListener('click', () => switchMode('subdomains'));
+    document.getElementById('modeLookalike').addEventListener('click', () => switchMode('lookalike'));
+    document.getElementById('findLookalikesBtn').addEventListener('click', startLookalike);
+    document.getElementById('lookalikeCancelBtn').addEventListener('click', cancelLookalike);
+    document.getElementById('lookalikeDownloadBtn').addEventListener('click', downloadLookalikeCSV);
+    document.getElementById('lookalikeSearchInput').addEventListener('input', applyLookalikeFilters);
+    document.getElementById('lookalikeDomainInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') startLookalike();
+    });
+
+    // Lookalike filter buttons via delegation on their container.
+    document.getElementById('lookalikeFilterBtns').addEventListener('click', (e) => {
+      const btn = e.target.closest('.lookalike-filter-btn');
+      if (!btn) return;
+      lookalikeFilter = btn.dataset.filter;
+      setLookalikeFilterButton();
+      applyLookalikeFilters();
+    });
+
+    // Lookalike sortable column headers, scoped to #lookalikeMode.
+    document.querySelectorAll('#lookalikeMode th[data-sort]').forEach((th) => {
+      th.addEventListener('click', () => sortLookalikeResults(th.dataset.sort));
     });

@@ -47,6 +47,27 @@
       <p class="text-gray-400 mt-2">Subdomain Enumeration &amp; Takeover Risk Analysis</p>
     </header>
 
+    <!-- Mode switch: Subdomains (default) | Lookalike Domains. Toggling these
+         buttons shows/hides #subdomainMode / #lookalikeMode via switchMode() in
+         app.js (wired with addEventListener — no inline handlers). Subdomains is
+         active by default so existing behavior is byte-for-byte unchanged. -->
+    <div class="flex justify-center mb-8">
+      <div class="inline-flex bg-gray-900 border border-gray-800 rounded-xl p-1">
+        <button id="modeSubdomains"
+          class="px-5 py-2 rounded-lg text-sm font-semibold bg-brand-600 text-white">
+          Subdomains
+        </button>
+        <button id="modeLookalike"
+          class="px-5 py-2 rounded-lg text-sm font-semibold bg-transparent text-gray-300">
+          Lookalike Domains
+        </button>
+      </div>
+    </div>
+
+    <!-- Subdomains mode (default-visible): the original scan form, progress
+         panel, and results dashboard are wrapped here untouched. -->
+    <div id="subdomainMode">
+
     <!-- Scan Form -->
     <section class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg">
       <div class="flex flex-col sm:flex-row gap-3">
@@ -236,6 +257,114 @@
         <p id="emptyRow" class="text-center text-gray-500 py-6 hidden">No subdomains match the current filter.</p>
       </div>
     </section>
+
+    </div><!-- /#subdomainMode -->
+
+    <!-- Lookalike Domains mode (hidden by default). Drives the FEAT-001 API:
+         POST /api/lookalike, GET /api/lookalike/status|results|download/{id}.
+         One domain at a time. All interactivity is wired in app.js via
+         addEventListener — no inline <script>, no inline on* handlers. -->
+    <div id="lookalikeMode" class="hidden">
+
+      <!-- Lookalike scan form -->
+      <section class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg">
+        <div class="flex flex-col sm:flex-row gap-3">
+          <input id="lookalikeDomainInput" type="text" placeholder="target.com" autocomplete="off"
+            class="flex-1 bg-gray-950 border border-gray-700 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-brand-500" />
+          <button id="findLookalikesBtn"
+            class="bg-brand-600 hover:bg-brand-700 transition-colors px-6 py-3 rounded-lg font-semibold text-white">
+            Find Lookalikes
+          </button>
+        </div>
+        <p id="lookalikeDomainError" class="text-red-400 text-sm mt-2 hidden">Please enter a valid domain (e.g. example.com).</p>
+        <label class="flex items-center gap-2 text-sm text-gray-200 cursor-pointer mt-4">
+          <input id="lookalikeWhois" type="checkbox" class="accent-brand-600" />
+          Check WHOIS/RDAP (slower)
+        </label>
+        <p class="text-xs text-gray-500 mt-1">
+          Generates keyless lookalike candidates and checks DNS/HTTP; WHOIS/RDAP
+          adds registration details but is slower. One domain at a time.
+        </p>
+      </section>
+
+      <!-- Lookalike progress panel -->
+      <section id="lookalikeProgressPanel" class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg hidden">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-lg font-semibold">Finding lookalikes…</h2>
+          <button id="lookalikeCancelBtn" class="text-sm text-red-400 hover:text-red-300 border border-red-500/40 rounded px-3 py-1">Cancel</button>
+        </div>
+        <div class="w-full bg-gray-800 rounded-full h-4 overflow-hidden mb-2">
+          <div id="lookalikeProgressBar" class="progress-stripes bg-brand-600 h-4 rounded-full transition-all duration-500" style="width:0%"></div>
+        </div>
+        <p id="lookalikeProgressText" class="text-sm text-gray-400">0 candidates generated, 0 checked, 0 registered</p>
+      </section>
+
+      <!-- Lookalike results dashboard -->
+      <section id="lookalikeResultsPanel" class="hidden">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-2xl font-bold">Lookalikes for <span id="lookalikeResultDomain" class="text-brand-400"></span></h2>
+          <button id="lookalikeDownloadBtn"
+            class="bg-emerald-600 hover:bg-emerald-700 transition-colors px-5 py-2.5 rounded-lg font-semibold text-white flex items-center gap-2">
+            ⬇ Download CSV
+          </button>
+        </div>
+
+        <!-- Summary cards -->
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+          <div class="bg-gray-900 border border-blue-500/30 rounded-xl p-4">
+            <div class="text-3xl font-bold text-blue-400" id="lookalikeCardTotal">0</div>
+            <div class="text-xs text-gray-400 mt-1">Total Candidates</div>
+          </div>
+          <div class="bg-gray-900 border border-emerald-500/30 rounded-xl p-4">
+            <div class="text-3xl font-bold text-emerald-400" id="lookalikeCardLive">0</div>
+            <div class="text-xs text-gray-400 mt-1">Registered / Live</div>
+          </div>
+          <div class="bg-gray-900 border border-red-500/30 rounded-xl p-4">
+            <div class="text-3xl font-bold text-red-400" id="lookalikeCardHigh">0</div>
+            <div class="text-xs text-gray-400 mt-1">HIGH Risk</div>
+          </div>
+          <div class="bg-gray-900 border border-sky-500/30 rounded-xl p-4">
+            <div class="text-3xl font-bold text-sky-400" id="lookalikeCardAvailable">0</div>
+            <div class="text-xs text-gray-400 mt-1">Available to Register</div>
+          </div>
+        </div>
+
+        <!-- Filters -->
+        <div class="flex flex-wrap items-center gap-2 mb-4">
+          <div class="flex flex-wrap gap-2" id="lookalikeFilterBtns">
+            <button data-filter="all" class="lookalike-filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm">All</button>
+            <button data-filter="live" class="lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Registered/Live</button>
+            <button data-filter="high" class="lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">HIGH Risk</button>
+            <button data-filter="medium" class="lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">MEDIUM Risk</button>
+            <button data-filter="available" class="lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Available</button>
+          </div>
+          <input id="lookalikeSearchInput" type="text" placeholder="Search candidates…"
+            class="ml-auto bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
+        </div>
+
+        <!-- Results table -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto">
+          <table class="w-full min-w-[1024px] text-sm">
+            <thead>
+              <tr class="text-gray-400 text-left border-b border-gray-800">
+                <th class="sortable sticky-col py-3 px-3 whitespace-nowrap sticky top-0 z-10" data-sort="candidate">Candidate</th>
+                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Technique</th>
+                <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="dns_status">DNS</th>
+                <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="http_status">HTTP</th>
+                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Title</th>
+                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">MX</th>
+                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Registered</th>
+                <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="risk">Risk</th>
+                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Action</th>
+              </tr>
+            </thead>
+            <tbody id="lookalikeResultsTable"></tbody>
+          </table>
+          <p id="lookalikeEmptyRow" class="text-center text-gray-500 py-6 hidden">No candidates match the current filter.</p>
+        </div>
+      </section>
+
+    </div><!-- /#lookalikeMode -->
 
     <!-- Footer -->
     <footer class="text-center text-xs text-gray-600 mt-12">
