@@ -1,7 +1,7 @@
-# SubRecon Pro
+# ReconGuard Pro
 
-Subdomain enumeration and subdomain-takeover risk analysis in a single
-self-contained web tool. SubRecon Pro aggregates subdomains from 12 keyless
+Subdomain Enumeration, Takeover Risk & Lookalike Domain Recon in a single
+self-contained web tool. ReconGuard Pro aggregates subdomains from 12 keyless
 public passive-DNS sources (no API key needed for any of them), resolves and
 HTTP-probes each one, scores takeover risk against a library of service
 fingerprints, and lets you export everything to CSV — all from a dark-themed
@@ -218,7 +218,7 @@ request, so the SSRF guard is preserved.
 
 ## Active takeover verification
 
-The VERIFY tier is a heuristic. On top of it, SubRecon Pro runs an **active
+The VERIFY tier is a heuristic. On top of it, ReconGuard Pro runs an **active
 confirmation pass** that resolves the dangling CNAME target's own DNS, probes
 it once (guarded), and turns the tier into a concrete verdict with evidence.
 Only VERIFY/HIGH rows are verified; every other row carries an empty verdict.
@@ -285,7 +285,7 @@ column (see [CSV report format](#csv-report-format)).
 
 ## Lookalike Domains mode
 
-Alongside subdomain enumeration, SubRecon Pro has a second mode that works the
+Alongside subdomain enumeration, ReconGuard Pro has a second mode that works the
 other way round: instead of finding hosts *under* your domain, it proactively
 hunts for confusingly-similar domains that **someone else** might register for
 phishing or brand abuse. You give it one domain at a time; it generates
@@ -480,7 +480,7 @@ To allow other origins, set the `SUBRECON_CORS_ORIGINS` environment variable to
 a comma-separated list of origins (e.g.
 `SUBRECON_CORS_ORIGINS="https://recon.example.com"`). Credentials are not
 enabled, so a wildcard origin is never paired with cookie/credential sharing.
-If you deploy SubRecon Pro to a shared or public host, keep the origin list
+If you deploy ReconGuard Pro to a shared or public host, keep the origin list
 tight and place the service behind authentication.
 
 Additional hardening: the `domain` input is validated against a strict
@@ -522,7 +522,7 @@ and request wordlists are byte-capped to bound memory use.
 
 ### Deployment warning
 
-SubRecon Pro has **no authentication** — it is a single-user local tool. Run it
+ReconGuard Pro has **no authentication** — it is a single-user local tool. Run it
 on localhost (the default) or behind an authenticating reverse proxy. **Do not
 expose the raw API publicly.** Anyone who can reach the API can start scans and
 read any job's results.

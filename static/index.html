@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SubRecon Pro</title>
+  <title>ReconGuard Pro</title>
   <!-- Tailwind utilities are vendored locally (static/tailwind.css) instead of
        the former Tailwind CDN runtime script. This keeps the app fully offline
        and lets the server's Content-Security-Policy stay strict
@@ -42,9 +42,9 @@
     <header class="text-center mb-10">
       <div class="text-5xl mb-2">🛡️🔍</div>
       <h1 class="text-4xl font-extrabold bg-gradient-to-r from-indigo-400 via-sky-400 to-emerald-400 bg-clip-text text-transparent">
-        SubRecon Pro
+        ReconGuard Pro
       </h1>
-      <p class="text-gray-400 mt-2">Subdomain Enumeration &amp; Takeover Risk Analysis</p>
+      <p class="text-gray-400 mt-2">Subdomain Enumeration, Takeover Risk &amp; Lookalike Domain Recon</p>
     </header>
 
     <!-- Mode switch: Subdomains (default) | Lookalike Domains. Toggling these
@@ -381,6 +381,6 @@
   <!-- ?v= is a cache-buster: bump it whenever app.js changes so browsers
        re-fetch instead of running a stale cached copy (which previously left
        the mode switch / buttons dead after an update). -->
-  <script src="/app.js?v=2"></script>
+  <script src="/app.js?v=3"></script>
 </body>
 </html>

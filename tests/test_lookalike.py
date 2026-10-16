@@ -71,6 +71,25 @@ def test_generate_generality_other_domain():
     assert all(main.is_valid_hostname(h) for h in out)
 
 
+def test_generate_covers_ai_tld_for_any_input():
+    # 'ai' is in LOOKALIKE_TLDS, so the TLD-swap technique emits <label>.ai for
+    # any input regardless of its own TLD. Locks in .ai coverage.
+    assert "ai" in main.LOOKALIKE_TLDS
+    assert "brandco.ai" in main.generate_lookalikes("brandco.com")
+    assert "foo.ai" in main.generate_lookalikes("foo.io")
+
+
+def test_generate_every_candidate_is_valid_hostname():
+    # Safety net: every candidate emitted for a sample domain must be a
+    # syntactically valid hostname (no empty labels, no leading/trailing
+    # hyphens/dots, valid chars, labels <=63, total <=253). The emit() helper
+    # filters through is_valid_hostname, so no invalid candidate can slip out.
+    for sample in ("brandco.com", "example.io", "google.com", "a.co.uk"):
+        out = main.generate_lookalikes(sample)
+        invalid = [h for h in out if not main.is_valid_hostname(h)]
+        assert invalid == [], f"invalid candidates for {sample}: {invalid}"
+
+
 def test_generate_respects_cap(monkeypatch):
     monkeypatch.setattr(main, "MAX_LOOKALIKE_CANDIDATES", 15)
     out = main.generate_lookalikes("brandco.ai")

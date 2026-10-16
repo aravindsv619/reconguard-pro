@@ -1,4 +1,4 @@
-"""SubRecon Pro — subdomain enumeration and takeover-risk analysis backend.
+"""ReconGuard Pro — subdomain enumeration, takeover-risk, and lookalike-domain backend.
 
 A FastAPI application that aggregates subdomains from 11 public passive-DNS
 sources, resolves and probes each one, scores subdomain-takeover risk, and
@@ -31,9 +31,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("subrecon")
+logger = logging.getLogger("reconguard")
 
-USER_AGENT = "Mozilla/5.0 (compatible; SubRecon/1.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; ReconGuard/1.0)"
 SOURCE_TIMEOUT = 15.0
 HTTP_PROBE_TIMEOUT = 5.0
 ANALYSIS_CONCURRENCY = 50
@@ -3478,7 +3478,7 @@ async def lifespan(app: FastAPI):
 # FastAPI debug is left OFF (default) so tracebacks are never returned to
 # clients; handlers raise HTTPException with generic messages and the generic
 # 500 handler returns {"detail": "Internal Server Error"} with no stack trace.
-app = FastAPI(title="SubRecon Pro", lifespan=lifespan)
+app = FastAPI(title="ReconGuard Pro", lifespan=lifespan)
 
 # CORS: scoped to localhost origins by default for this local single-user tool.
 # Override with the SUBRECON_CORS_ORIGINS env var (comma-separated list of
@@ -3738,7 +3738,7 @@ async def download_csv(job_id: str):
     # header. job.domain is already is_valid_hostname-validated, but strip to a
     # safe charset as defense-in-depth.
     safe_domain = re.sub(r"[^a-z0-9.-]", "_", job.domain.lower()) or "domain"
-    filename = f"subrecon_{safe_domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    filename = f"reconguard_{safe_domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     return StreamingResponse(
         iter([buffer.getvalue()]),
         media_type="text/csv",
