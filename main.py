@@ -245,6 +245,49 @@ RDAP_CONCURRENCY = 5
 RDAP_TIMEOUT = 8.0
 RDAP_ENDPOINT = "https://rdap.org/domain/{}"
 
+# ---------------------------------------------------------------------------
+# Breach-exposure engine (FEAT-001) — keyless XposedOrNot.
+# ---------------------------------------------------------------------------
+# These power the SEPARATE /api/breach* job API. All outbound breach calls go
+# through the VERIFIED client (app.state.client) to the FIXED trusted host
+# api.xposedornot.com ONLY; no user-controlled host is ever fetched. Email
+# discovery reuses the existing crt.sh fetch via _get. A09: the engine NEVER
+# logs emails, breach names, or exposed data — only job_id + domain + counts.
+XPOSEDORNOT_BASE = "https://api.xposedornot.com"
+
+# Dedicated LOW concurrency for breach checks — the keyless XposedOrNot API
+# rate-limits aggressively, so a small bounded Semaphore + a polite inter-call
+# sleep keeps the job within budget. MUST stay <= 4.
+BREACH_CONCURRENCY = 3
+# Polite pause between successive breach calls (per worker) to avoid 429s.
+BREACH_CALL_DELAY = 0.2
+BREACH_CHECK_TIMEOUT = 15.0
+# Short backoff before the single 429 retry in check_email_exposed.
+BREACH_RETRY_BACKOFF = 2.0
+# DoS cap: the total candidate address set a single breach job will check.
+MAX_BREACH_EMAILS = 2000
+
+# Sentinel the breach client returns when the API outcome is indeterminate
+# (persistent error / non-200 after retry) — DISTINCT from None ("Not found").
+BREACH_UNKNOWN = "UNKNOWN"
+
+# Permissive-but-safe RFC-ish local part: letters, digits, and the common
+# punctuation (. _ % + -). Anchored, no whitespace / URL-breaking chars, so a
+# validated address is always safe to interpolate into the FIXED-host URL.
+BREACH_EMAIL_RE = re.compile(r"^[a-z0-9][a-z0-9._%+-]{0,63}$")
+
+# Email-pattern templates for name-based candidate generation. Each entry is a
+# callable mapping (first, last, f) -> local part; generate_email_patterns
+# applies, validates and dedupes them. 'f' is the first-name initial.
+EMAIL_PATTERNS = [
+    lambda first, last, f: f"{first}.{last}",   # first.last
+    lambda first, last, f: f"{first}",          # first
+    lambda first, last, f: f"{f}{last}",        # flast
+    lambda first, last, f: f"{first}{last}",    # firstlast
+    lambda first, last, f: f"{last}.{first}",   # last.first
+    lambda first, last, f: f"{first}_{last}",   # first_last
+]
+
 # Absolute path to the bundled default wordlist, resolved relative to this file.
 DEFAULT_WORDLIST_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "wordlists", "default.txt"
@@ -975,6 +1018,287 @@ def _rdap_entity_name(entity: dict) -> str:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# Breach-exposure helpers (pure/offline) + keyless XposedOrNot client (FEAT-001)
+# ---------------------------------------------------------------------------
+def _valid_email_for_domain(email: str, domain: str) -> bool:
+    """True iff ``email`` is a syntactically safe address at exactly ``domain``.
+
+    Lowercases, requires exactly one '@', the local part must match
+    BREACH_EMAIL_RE (no whitespace / URL-breaking chars), and the domain part
+    must equal the target domain exactly. The validated address is always safe
+    to interpolate into the FIXED-host XposedOrNot URL.
+    """
+    try:
+        if not email or not domain:
+            return False
+        email = email.strip().lower()
+        domain = domain.strip().lower().rstrip(".")
+        if email.count("@") != 1:
+            return False
+        local, _, dom = email.partition("@")
+        if dom != domain:
+            return False
+        return bool(BREACH_EMAIL_RE.match(local))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def generate_email_patterns(names: list[str], domain: str) -> set[str]:
+    """Build candidate addresses at ``domain`` from a list of person names.
+
+    For each name: a single token -> only ``{first}@``; a multi-token name uses
+    the FIRST token as ``first`` and the LAST token as ``last`` and applies the
+    EMAIL_PATTERNS templates ({first}.{last}, {first}, {flast}, {firstlast},
+    {last}.{first}, {first}_{last}). All addresses are lowercased, validated via
+    _valid_email_for_domain, deduped, and the set is capped at MAX_BREACH_EMAILS.
+    """
+    out: set[str] = set()
+    domain = (domain or "").strip().lower().rstrip(".")
+    if not domain:
+        return out
+    for raw in names or []:
+        if len(out) >= MAX_BREACH_EMAILS:
+            break
+        # Keep only alphanumeric tokens so "O'Brien" / punctuation don't leak
+        # URL-breaking chars; the final _valid_email_for_domain gate is the
+        # authoritative filter.
+        tokens = [re.sub(r"[^a-z0-9]", "", t.lower()) for t in (raw or "").split()]
+        tokens = [t for t in tokens if t]
+        if not tokens:
+            continue
+        locals_: list[str] = []
+        if len(tokens) == 1:
+            locals_.append(tokens[0])  # single-token name -> {first}@
+        else:
+            first, last = tokens[0], tokens[-1]
+            f = first[0]
+            for tmpl in EMAIL_PATTERNS:
+                try:
+                    locals_.append(tmpl(first, last, f))
+                except Exception:  # noqa: BLE001
+                    continue
+        for local in locals_:
+            if len(out) >= MAX_BREACH_EMAILS:
+                break
+            candidate = f"{local}@{domain}"
+            if _valid_email_for_domain(candidate, domain):
+                out.add(candidate)
+    return out
+
+
+def parse_email_lines(text: Optional[str], domain: str) -> list[str]:
+    """Parse supplied email lines, keeping only valid addresses at ``domain``.
+
+    Splits on newlines, strips, drops blanks and '#' comment lines, lowercases,
+    validates with _valid_email_for_domain, and dedupes preserving first-seen
+    order (capped at MAX_BREACH_EMAILS). The byte-cap on the raw text is the
+    BreachRequest field's ``max_length`` (not enforced here).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in (text or "").splitlines():
+        if len(out) >= MAX_BREACH_EMAILS:
+            break
+        line = line.strip().lower()
+        if not line or line.startswith("#"):
+            continue
+        if _valid_email_for_domain(line, domain) and line not in seen:
+            seen.add(line)
+            out.append(line)
+    return out
+
+
+def parse_name_lines(text: Optional[str]) -> list[str]:
+    """Parse supplied person-name lines, deduped preserving first-seen order.
+
+    Splits on newlines, strips, drops blanks and '#' comment lines. Dedupe is
+    case-insensitive; the original-cased first occurrence is kept.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in (text or "").splitlines():
+        if len(out) >= MAX_BREACH_EMAILS:
+            break
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key = line.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(line)
+    return out
+
+
+async def check_email_exposed(
+    client: httpx.AsyncClient, email: str
+):
+    """Keyless XposedOrNot per-email breach check. Never raises.
+
+    GET {XPOSEDORNOT_BASE}/v1/check-email/{email} on the VERIFIED client,
+    bounded by BREACH_CHECK_TIMEOUT. Returns:
+      * a flattened list[str] of breach names when status == 'success';
+      * ``None`` when the API reports {'Error': 'Not found'} (clean/unknown
+        address the breach DB does not know);
+      * the BREACH_UNKNOWN sentinel on any remaining error / non-200 after a
+        single short-backoff retry on 429.
+    NEVER logs the email or the response body (A09).
+    """
+    url = f"{XPOSEDORNOT_BASE}/v1/check-email/{email}"
+
+    async def _fetch():
+        return await asyncio.wait_for(
+            client.get(url), timeout=BREACH_CHECK_TIMEOUT
+        )
+
+    try:
+        resp = await _fetch()
+        if resp.status_code == 429:
+            # ONE polite backoff + retry; the API rate-limits keyless callers.
+            await asyncio.sleep(BREACH_RETRY_BACKOFF)
+            resp = await _fetch()
+        if resp.status_code != 200:
+            return BREACH_UNKNOWN
+        data = resp.json()
+        if not isinstance(data, dict):
+            return BREACH_UNKNOWN
+        # Authoritative "no breach record" marker.
+        if data.get("Error") == "Not found":
+            return None
+        if data.get("status") == "success":
+            names: list[str] = []
+            # 'breaches' is shaped [[name, name, ...]] (a single-element outer
+            # list wrapping the breach-name list). Flatten defensively.
+            for group in data.get("breaches", []) or []:
+                if isinstance(group, (list, tuple)):
+                    for name in group:
+                        if name:
+                            names.append(str(name))
+                elif group:
+                    names.append(str(group))
+            return names
+        # Unexpected-but-not-error payload: treat as indeterminate.
+        return BREACH_UNKNOWN
+    except Exception:  # noqa: BLE001 — never raise; caller treats as unknown.
+        return BREACH_UNKNOWN
+
+
+async def breach_analytics(client: httpx.AsyncClient, email: str) -> dict:
+    """Keyless XposedOrNot detailed analytics for an exposed email. Never raises.
+
+    GET {XPOSEDORNOT_BASE}/v1/breach-analytics?email={email} on the VERIFIED
+    client, bounded by BREACH_CHECK_TIMEOUT. Parses defensively with .get()
+    fallbacks and returns a fixed-shape dict:
+      {'breaches': [names...], 'exposed_data': [categories...],
+       'risk_label': str, 'risk_score': int|''}.
+    NEVER logs the email or the body (A09).
+    """
+    neutral = {"breaches": [], "exposed_data": [], "risk_label": "", "risk_score": ""}
+    url = f"{XPOSEDORNOT_BASE}/v1/breach-analytics?email={email}"
+    try:
+        resp = await asyncio.wait_for(
+            client.get(url), timeout=BREACH_CHECK_TIMEOUT
+        )
+        if resp.status_code != 200:
+            return dict(neutral)
+        data = resp.json()
+        if not isinstance(data, dict):
+            return dict(neutral)
+
+        breaches: set[str] = set()
+        exposed: set[str] = set()
+        risk_label = ""
+        risk_score: object = ""
+
+        metrics = data.get("BreachMetrics")
+        if isinstance(metrics, dict):
+            risk = metrics.get("risk")
+            if isinstance(risk, list) and risk and isinstance(risk[0], dict):
+                risk_label = str(risk[0].get("risk_label", "") or "")
+                rs = risk[0].get("risk_score", "")
+                try:
+                    risk_score = int(rs)
+                except (TypeError, ValueError):
+                    risk_score = ""
+            # xposed_data may live under BreachMetrics as a fallback.
+            for item in metrics.get("xposed_data", []) or []:
+                if isinstance(item, dict):
+                    cat = item.get("children") or item.get("name")
+                    if isinstance(cat, list):
+                        for c in cat:
+                            if isinstance(c, dict) and c.get("name"):
+                                exposed.add(str(c["name"]))
+                    elif cat:
+                        exposed.add(str(cat))
+
+        summary = data.get("BreachesSummary")
+        if isinstance(summary, dict):
+            site = summary.get("site", "") or ""
+            for name in str(site).split(";"):
+                name = name.strip()
+                if name:
+                    breaches.add(name)
+
+        exposed_breaches = data.get("ExposedBreaches")
+        if isinstance(exposed_breaches, dict):
+            for det in exposed_breaches.get("breaches_details", []) or []:
+                if not isinstance(det, dict):
+                    continue
+                bname = det.get("breach")
+                if bname:
+                    breaches.add(str(bname))
+                xd = det.get("xposed_data", "")
+                if isinstance(xd, str):
+                    for cat in xd.split(";"):
+                        cat = cat.strip()
+                        if cat:
+                            exposed.add(cat)
+                elif isinstance(xd, (list, tuple)):
+                    for cat in xd:
+                        if cat:
+                            exposed.add(str(cat))
+
+        return {
+            "breaches": sorted(breaches),
+            "exposed_data": sorted(exposed),
+            "risk_label": risk_label,
+            "risk_score": risk_score,
+        }
+    except Exception:  # noqa: BLE001 — never raise.
+        return dict(neutral)
+
+
+async def discover_emails(client: httpx.AsyncClient, domain: str) -> set[str]:
+    """Best-effort email discovery at ``domain`` from crt.sh. Never raises.
+
+    Fetches the crt.sh certificate index (same URL shape as query_crtsh) via the
+    bounded _get helper, regex-extracts any ``...@{domain}`` substrings from the
+    raw response text, validates each with _valid_email_for_domain, lowercases /
+    dedupes, and caps the set at MAX_BREACH_EMAILS. On ANY failure it logs at
+    DEBUG (job_id/domain only, never addresses) and returns what it gathered.
+    """
+    out: set[str] = set()
+    domain = (domain or "").strip().lower().rstrip(".")
+    if not domain:
+        return out
+    try:
+        resp = await _get(client, f"https://crt.sh/?q=%25.{domain}&output=json")
+        text = resp.text or ""
+        pattern = re.compile(
+            r"[a-z0-9][a-z0-9._%+-]{0,63}@" + re.escape(domain),
+            re.IGNORECASE,
+        )
+        for match in pattern.findall(text):
+            if len(out) >= MAX_BREACH_EMAILS:
+                break
+            email = match.strip().lower()
+            if _valid_email_for_domain(email, domain):
+                out.add(email)
+    except Exception as exc:  # noqa: BLE001 — never raise.
+        logger.debug("email discovery failed for %s: %s", domain, exc)
+    return out
+
+
 async def analyze_candidate(
     probe_client: httpx.AsyncClient,
     verified_client: httpx.AsyncClient,
@@ -1313,6 +1637,30 @@ class LookalikeJobState:
 
 
 LOOKALIKE_JOBS: dict[str, LookalikeJobState] = {}
+
+
+@dataclass
+class BreachJobState:
+    """In-memory state for a keyless breach-exposure job (FEAT-001).
+
+    SEPARATE from JobState/LookalikeJobState and their stores so the subdomain
+    (16-col) and lookalike (14-col) paths are never touched. ``results`` holds
+    the per-email exposure dicts produced by run_breach.
+    """
+    job_id: str
+    domain: str
+    status: str = "pending"  # pending | running | done | error
+    progress: int = 0  # 0-100
+    emails_discovered: int = 0
+    emails_checked: int = 0
+    exposed_count: int = 0
+    checked_clean: int = 0
+    results: list = field(default_factory=list)
+    error: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
+
+
+BREACH_JOBS: dict[str, BreachJobState] = {}
 
 
 class EnumerateRequest(BaseModel):
@@ -3138,12 +3486,29 @@ def cleanup_old_lookalike_jobs() -> None:
         LOOKALIKE_JOBS.pop(jid, None)
 
 
+def cleanup_old_breach_jobs() -> None:
+    """Prune finished breach jobs older than JOB_TTL_SECONDS.
+
+    Mirrors cleanup_old_lookalike_jobs() for the SEPARATE BREACH_JOBS store;
+    running jobs are never pruned.
+    """
+    now = time.time()
+    stale = [
+        jid
+        for jid, job in BREACH_JOBS.items()
+        if now - job.created_at > JOB_TTL_SECONDS and job.status != "running"
+    ]
+    for jid in stale:
+        BREACH_JOBS.pop(jid, None)
+
+
 async def _periodic_cleanup() -> None:
     while True:
         try:
             await asyncio.sleep(300)
             cleanup_old_jobs()
             cleanup_old_lookalike_jobs()
+            cleanup_old_breach_jobs()
         except asyncio.CancelledError:
             break
         except Exception as exc:  # noqa: BLE001
@@ -3230,6 +3595,119 @@ async def run_lookalike(job_id: str, domain: str, check_whois: bool) -> None:
         job.status = "error"
         job.error = str(exc)
         logger.debug("lookalike job %s failed: %s", job_id, exc)
+
+
+async def run_breach(
+    job_id: str, domain: str, emails: Optional[str], names: Optional[str]
+) -> None:
+    """Run a keyless breach-exposure job: discover/collect candidate addresses,
+    check each against XposedOrNot, and surface the exposed/supplied hits.
+
+    Candidate set = supplied emails | crt.sh-discovered emails | name-pattern
+    emails, capped at MAX_BREACH_EMAILS. All breach calls go through the
+    VERIFIED client (app.state.client) to the FIXED host api.xposedornot.com
+    under a bounded Semaphore(BREACH_CONCURRENCY) with a polite inter-call
+    sleep. A supplied address is kept regardless of outcome; a discovered /
+    pattern address is DROPPED when the check returns None ('Not found') so only
+    addresses the breach DB knows OR the user supplied are surfaced. The whole
+    body is wrapped in try/except so a failure marks the job 'error'. A09:
+    logs job_id + domain + counts ONLY — never emails, breach names, or data.
+    """
+    job = BREACH_JOBS.get(job_id)
+    if job is None:
+        return
+    verified_client: httpx.AsyncClient = app.state.client
+    cleanup_old_breach_jobs()
+
+    logger.info("breach job %s started: domain=%s", job_id, domain)
+
+    job.status = "running"
+    job.progress = 0
+    try:
+        supplied = set(parse_email_lines(emails, domain))
+        discovered = await discover_emails(verified_client, domain)
+        pattern = generate_email_patterns(parse_name_lines(names), domain)
+
+        # Source label per address; 'supplied' wins over 'discovered' over
+        # 'pattern' when an address appears in more than one set.
+        source_of: dict[str, str] = {}
+        for addr in pattern:
+            source_of[addr] = "pattern"
+        for addr in discovered:
+            source_of[addr] = "discovered"
+        for addr in supplied:
+            source_of[addr] = "supplied"
+
+        candidates = list(source_of.keys())[:MAX_BREACH_EMAILS]
+        # source_of may contain more than the cap; trim to the kept candidates.
+        candidates_set = set(candidates)
+        job.emails_discovered = len(candidates)
+
+        total = len(candidates) or 1
+        sem = asyncio.Semaphore(BREACH_CONCURRENCY)
+        results: dict[str, dict] = {}
+        counters = {"checked": 0, "clean": 0}
+
+        async def _check(addr: str) -> None:
+            async with sem:
+                res = await check_email_exposed(verified_client, addr)
+                # Polite pause so the keyless API is not hammered.
+                await asyncio.sleep(BREACH_CALL_DELAY)
+            counters["checked"] += 1
+            job.emails_checked = counters["checked"]
+            job.progress = min(100, int(counters["checked"] * 100 / total))
+
+            source = source_of.get(addr, "discovered")
+            is_supplied = source == "supplied"
+
+            if res is None:
+                # 'Not found': keep only if the user supplied it; otherwise drop.
+                if is_supplied:
+                    counters["clean"] += 1
+                return
+            if res == BREACH_UNKNOWN:
+                # Indeterminate: keep supplied addresses (so the user sees the
+                # coverage gap); drop speculative discovered/pattern ones.
+                if is_supplied:
+                    counters["clean"] += 1
+                return
+
+            # res is a (possibly empty) list of breach names -> exposed. Enrich
+            # with detailed analytics (never raises).
+            analytics = await breach_analytics(verified_client, addr)
+            await asyncio.sleep(BREACH_CALL_DELAY)
+            breach_names = sorted(set(res) | set(analytics.get("breaches", [])))
+            results[addr] = {
+                "email": addr,
+                "breaches": breach_names,
+                "exposed_data": analytics.get("exposed_data", []),
+                "risk_label": analytics.get("risk_label", ""),
+                "risk_score": analytics.get("risk_score", ""),
+                "source": source,
+            }
+
+        await asyncio.gather(
+            *(_check(addr) for addr in candidates),
+            return_exceptions=True,
+        )
+
+        job.results = [results[a] for a in candidates if a in results]
+        job.exposed_count = len(job.results)
+        job.checked_clean = counters["clean"]
+        job.progress = 100
+        job.status = "done"
+        logger.info(
+            "breach job %s done: domain=%s candidates=%d checked=%d exposed=%d",
+            job_id,
+            domain,
+            len(candidates_set),
+            job.emails_checked,
+            job.exposed_count,
+        )
+    except Exception as exc:  # noqa: BLE001
+        job.status = "error"
+        job.error = str(exc)
+        logger.debug("breach job %s failed: %s", job_id, exc)
 
 
 async def run_enumeration(
@@ -3835,11 +4313,14 @@ async def lookalike_start(req: LookalikeRequest, request: Request):
         raise HTTPException(status_code=400, detail="Invalid domain format")
 
     cleanup_old_lookalike_jobs()
-    # DoS cap over the COMBINED in-flight jobs of BOTH stores.
+    cleanup_old_breach_jobs()
+    # DoS cap over the COMBINED in-flight jobs of ALL THREE stores.
     active = sum(
         1 for j in JOBS.values() if j.status in ("pending", "running")
     ) + sum(
         1 for j in LOOKALIKE_JOBS.values() if j.status in ("pending", "running")
+    ) + sum(
+        1 for j in BREACH_JOBS.values() if j.status in ("pending", "running")
     )
     if active >= MAX_ACTIVE_JOBS:
         raise HTTPException(status_code=429, detail="Too many active jobs, retry later")
@@ -3892,6 +4373,167 @@ async def lookalike_download(job_id: str):
     content = _build_lookalike_csv(job.results)
     safe_domain = re.sub(r"[^a-z0-9.-]", "_", job.domain.lower()) or "domain"
     filename = f"lookalike_{safe_domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    return StreamingResponse(
+        iter([content]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Breach-exposure API (FEAT-001) — SEPARATE from the subdomain + lookalike
+# routes, with its own 6-column CSV contract.
+# ---------------------------------------------------------------------------
+BREACH_CSV_COLUMNS = [
+    "email",
+    "breaches",
+    "exposed_data",
+    "risk_label",
+    "risk_score",
+    "source",
+]
+
+# Honest coverage disclaimer surfaced in the results payload. The keyless
+# engine only checks addresses it discovered or the user supplied, so this is
+# explicitly NOT an exhaustive domain report.
+BREACH_COVERAGE_NOTE = (
+    "Coverage is limited to discovered or supplied addresses; this is not an "
+    "exhaustive domain report. Source: XposedOrNot keyless API."
+)
+
+
+def _build_breach_csv(results: list) -> str:
+    """Serialize breach results into CSV using BREACH_CSV_COLUMNS order.
+
+    breaches/exposed_data lists are joined with ';'. EVERY text column is passed
+    through _csv_safe (email/breach names are attacker-influenced third-party
+    data). risk_score passes through numeric (blank when '').
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(BREACH_CSV_COLUMNS)
+    for r in results:
+        score = r.get("risk_score", "")
+        writer.writerow([
+            _csv_safe(r.get("email", "")),
+            _csv_safe(";".join(r.get("breaches") or [])),
+            _csv_safe(";".join(r.get("exposed_data") or [])),
+            _csv_safe(r.get("risk_label", "")),
+            score if isinstance(score, int) else "",
+            _csv_safe(r.get("source", "")),
+        ])
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _summarize_breach(results: list, emails_checked: int, checked_clean: int) -> dict:
+    """Summary counts for the breach results payload.
+
+    ``breaches_count`` is the total breach mentions across all exposed emails;
+    ``distinct_breaches`` is the count of unique breach names; ``by_risk`` tiers
+    the exposed emails by their risk_label (high/medium/low, case-insensitive).
+    """
+    exposed_count = len(results)
+    breaches_count = 0
+    distinct: set[str] = set()
+    by_risk = {"high": 0, "medium": 0, "low": 0}
+    for r in results:
+        names = r.get("breaches") or []
+        breaches_count += len(names)
+        distinct.update(names)
+        label = str(r.get("risk_label", "") or "").strip().lower()
+        if label in by_risk:
+            by_risk[label] += 1
+    return {
+        "emails_checked": emails_checked,
+        "exposed_count": exposed_count,
+        "breaches_count": breaches_count,
+        "distinct_breaches": len(distinct),
+        "by_risk": by_risk,
+        "checked_clean": checked_clean,
+    }
+
+
+class BreachRequest(BaseModel):
+    domain: str
+    # A04/API4: cap the raw supplied-email / name blobs so an enormous payload
+    # cannot be buffered/parsed into memory (mirrors EnumerateRequest.wordlist).
+    emails: Optional[str] = Field(default=None, max_length=MAX_WORDLIST_BYTES)
+    names: Optional[str] = Field(default=None, max_length=MAX_WORDLIST_BYTES)
+
+
+@app.post("/api/breach")
+async def breach_start(req: BreachRequest, request: Request):
+    # Per-client rate limit (A04/API4), shared limiter with the other routes.
+    client_ip = request.client.host if request.client else None
+    if not _rate_limit_ok(client_ip):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded, retry later")
+
+    domain = req.domain.strip().lower().rstrip(".")
+    if not is_valid_hostname(domain):
+        raise HTTPException(status_code=400, detail="Invalid domain format")
+
+    cleanup_old_jobs()
+    cleanup_old_lookalike_jobs()
+    cleanup_old_breach_jobs()
+    # DoS cap over the COMBINED in-flight jobs of ALL THREE stores.
+    active = sum(
+        1 for j in JOBS.values() if j.status in ("pending", "running")
+    ) + sum(
+        1 for j in LOOKALIKE_JOBS.values() if j.status in ("pending", "running")
+    ) + sum(
+        1 for j in BREACH_JOBS.values() if j.status in ("pending", "running")
+    )
+    if active >= MAX_ACTIVE_JOBS:
+        raise HTTPException(status_code=429, detail="Too many active jobs, retry later")
+
+    job_id = uuid.uuid4().hex
+    BREACH_JOBS[job_id] = BreachJobState(job_id=job_id, domain=domain)
+    asyncio.create_task(run_breach(job_id, domain, req.emails, req.names))
+    return {"job_id": job_id}
+
+
+@app.get("/api/breach/status/{job_id}")
+async def breach_status(job_id: str):
+    job = BREACH_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "status": job.status,
+        "progress": job.progress,
+        "emails_discovered": job.emails_discovered,
+        "emails_checked": job.emails_checked,
+        "exposed_count": job.exposed_count,
+        "error": job.error,
+    }
+
+
+@app.get("/api/breach/results/{job_id}")
+async def breach_results(job_id: str):
+    job = BREACH_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "done":
+        raise HTTPException(status_code=409, detail=f"Job not ready (status={job.status})")
+    return {
+        "job_id": job.job_id,
+        "domain": job.domain,
+        "exposed": job.results,
+        "summary": _summarize_breach(job.results, job.emails_checked, job.checked_clean),
+        "coverage_note": BREACH_COVERAGE_NOTE,
+    }
+
+
+@app.get("/api/breach/download/{job_id}")
+async def breach_download(job_id: str):
+    job = BREACH_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "done":
+        raise HTTPException(status_code=409, detail=f"Job not ready (status={job.status})")
+    content = _build_breach_csv(job.results)
+    safe_domain = re.sub(r"[^a-z0-9.-]", "_", job.domain.lower()) or "domain"
+    filename = f"breach_{safe_domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     return StreamingResponse(
         iter([content]),
         media_type="text/csv",
