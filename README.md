@@ -393,6 +393,101 @@ These endpoints are keyless, reuse the per-client rate limit and the combined
 active-job cap, and keep their jobs in a store separate from the subdomain jobs
 (also expiring one hour after creation).
 
+## Breach Exposure mode
+
+A third mode checks whether email addresses tied to a domain appear in known
+data breaches, using the **keyless** [XposedOrNot](https://xposedornot.com)
+per-email API. You give it one domain at a time (optionally with known emails
+and employee names); it assembles a candidate set, checks each address against
+the breach database, and reports the ones that are exposed along with the
+breaches and the kinds of data leaked. For example, `careers@example.com` is a
+known-exposed address — but the engine is **general** and works for any domain
+you are authorized to assess.
+
+Switch to it with the **Breach Exposure** tab at the top of the dashboard (the
+UI defaults to the Subdomains mode, so existing workflows are unchanged).
+
+> ⚠️ **For authorized use only — results are sensitive PII.** Only assess
+> domains you own or are explicitly authorized to assess. Breach findings
+> contain sensitive personal data; handle, store, and share them accordingly.
+
+### Honest coverage limitation
+
+This is **not** an exhaustive domain report. The check is **keyless** and uses
+XposedOrNot's *per-email* endpoints only. There is **no keyless complete
+domain-wide email list**: XposedOrNot's domain-level endpoint now requires an
+API key, which this tool deliberately does not use. Coverage is therefore
+**limited to addresses that are discovered from public sources or supplied by
+you**, then verified against the breach API. An address you did not supply is
+surfaced only when the breach database already knows it; unknown addresses are
+not reported. Treat the output as a floor, not a ceiling.
+
+### Discovery approach
+
+The candidate set is the union of three keyless sources, all verified against
+the breach API before anything is surfaced:
+
+- **Public-source harvest** — email addresses ending in `@{domain}` are
+  extracted from the keyless [crt.sh](https://crt.sh) certificate-transparency
+  response (no ToS-gray search engines are queried).
+- **User-supplied emails** — addresses you paste in (one per line), validated to
+  the target domain.
+- **Pattern generation from supplied names** — for each employee name you
+  provide, common address shapes are generated and then verified against the
+  breach API: `{first}.{last}`, `{first}`, `{f}{last}`, `{first}{last}`,
+  `{last}.{first}`, `{flast}`, and `{first}_{last}` (all `@{domain}`). A
+  single-token name yields only `{first}@{domain}`.
+
+A **discovered** or **pattern-generated** candidate is dropped unless the breach
+database actually knows it; a **supplied** address is always kept (and counted
+as checked-clean when the database has nothing on it). The whole candidate set
+is capped at `MAX_BREACH_EMAILS = 2000`, and the per-email API calls run under a
+deliberately low bounded `asyncio.Semaphore(BREACH_CONCURRENCY = 3)` with a
+polite inter-call delay, because the XposedOrNot API is rate-limited. All calls
+go through the **verified** TLS client to the fixed host `api.xposedornot.com`
+(plus crt.sh for discovery); no user-controlled host is ever fetched.
+
+### Breach API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | `/api/breach` | Start a breach-exposure job. Body: `{domain, emails?, names?}` where `emails`/`names` are newline-separated strings. Returns `{job_id}`. |
+| GET | `/api/breach/status/{job_id}` | Poll `status`, `progress`, `emails_discovered`, `emails_checked`, and `exposed_count`. |
+| GET | `/api/breach/results/{job_id}` | Once `done`, returns `{domain, exposed: [...], summary: {...}, coverage_note}`. Each exposed entry carries `email`, `breaches`, `exposed_data`, `risk_label`, `risk_score`, and `source` (`supplied` / `discovered` / `pattern`). |
+| GET | `/api/breach/download/{job_id}` | Download the breach CSV report. |
+
+These endpoints are keyless, reuse the per-client rate limit and the combined
+active-job cap (shared with the subdomain and lookalike jobs), and keep their
+jobs in a store **separate** from both the subdomain and lookalike stores (also
+expiring one hour after creation).
+
+### Breach CSV report
+
+This mode exports its **own** report, separate from both the 16-column
+subdomain CSV and the 14-column lookalike CSV. The breach CSV has these 6
+columns, in order:
+
+```
+email, breaches, exposed_data, risk_label, risk_score, source
+```
+
+`breaches` and `exposed_data` are each joined with `;`, and every text cell
+(including attacker-influenced values returned by the breach API) passes
+through the same spreadsheet-formula-injection neutralizer used by the other
+two exports.
+
+### PII, authorization & ethics
+
+- **Authorized use only.** Assess only domains you own or are explicitly
+  authorized to assess. Checking third parties' addresses without authorization
+  may be unlawful.
+- **Results are sensitive PII.** Exposed-address, breach-name, and
+  exposed-data-category values are personal data — handle them as such.
+- **No persistence.** Results live only in the in-memory job store and expire
+  one hour after the job is created (the job TTL); nothing is written to disk.
+- **Never logged.** The engine logs only the `job_id`, the domain, and counts —
+  it **never** logs email addresses, breach names, or any exposed-data value.
+
 ## DNS reporting
 
 ### `dns_status`
