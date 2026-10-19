@@ -88,6 +88,74 @@ def test_takeover_subdomain_name_endswith_key():
     assert service == "Heroku"
 
 
+# ---------------------------------------------------------------------------
+# Dot-boundary host matching: attacker-controlled LOOKALIKE hosts that merely
+# CONTAIN a provider domain as a substring must NOT be classified as that
+# provider. This proves the fix for the "incomplete URL substring
+# sanitization" alerts and keeps the match strictly on a DNS-label boundary.
+# ---------------------------------------------------------------------------
+def test_takeover_lookalike_cname_not_matched():
+    # "s3.amazonaws.com.evil.com" ends with ".evil.com", not a real S3 host.
+    risk, service, detail = main.check_takeover(
+        subdomain="foo.example.com",
+        cname="bucket.s3.amazonaws.com.evil.com",
+        a_records=[],
+        http_body="NoSuchBucket",
+        ptr_hosts=[],
+    )
+    assert risk == "NONE"
+    assert service is None
+    assert detail is None
+
+
+def test_takeover_lookalike_name_prefix_not_matched():
+    # "evil-s3.amazonaws.com" is a different registrable domain (evil-s3…),
+    # and "notcloudfront.net" is not cloudfront.net — neither may match.
+    risk, service, _ = main.check_takeover(
+        subdomain="victim.notcloudfront.net",
+        cname="edge.notcloudfront.net",
+        a_records=[],
+        http_body="Bad request",
+        ptr_hosts=[],
+    )
+    assert risk == "NONE"
+    assert service is None
+
+
+def test_match_cloud_resource_rejects_lookalikes():
+    # Legitimate targets still match.
+    assert main._match_cloud_resource("bucket.s3.amazonaws.com") == "AWS S3"
+    assert main._match_cloud_resource("d123.cloudfront.net") == "AWS CloudFront"
+    assert (
+        main._match_cloud_resource("lb.us-east-1.elb.amazonaws.com") == "AWS ELB"
+    )
+    # Lookalikes must NOT match.
+    assert main._match_cloud_resource("d123.cloudfront.net.evil.com") is None
+    assert main._match_cloud_resource("notcloudfront.net") is None
+    assert main._match_cloud_resource("bucket.s3.amazonaws.com.attacker.net") is None
+    assert main._match_cloud_resource("evilcloudfront.net") is None
+
+
+def test_host_matches_fingerprint_dot_boundary():
+    # Exact host and true subdomains match.
+    assert main._host_matches_fingerprint("cloudfront.net", "cloudfront.net")
+    assert main._host_matches_fingerprint("d1.cloudfront.net", "cloudfront.net")
+    # Trailing dot (dig output) is tolerated.
+    assert main._host_matches_fingerprint("d1.cloudfront.net.", "cloudfront.net")
+    # Lookalikes do NOT match.
+    assert not main._host_matches_fingerprint("notcloudfront.net", "cloudfront.net")
+    assert not main._host_matches_fingerprint(
+        "cloudfront.net.evil.com", "cloudfront.net"
+    )
+    # Dotless AWS label token matches only on a label boundary.
+    assert main._host_matches_fingerprint(
+        "bucket.s3-website-us-east-1.amazonaws.com", "s3-website"
+    )
+    assert not main._host_matches_fingerprint(
+        "bucket.evils3-website.amazonaws.com", "s3-website"
+    )
+
+
 def test_normalize_host_filters_and_strips():
     assert main._normalize_host("*.example.com", "example.com") == "example.com"
     assert main._normalize_host("A.Example.COM.", "example.com") == "a.example.com"

@@ -1211,6 +1211,39 @@ def _match_cloud_resource(target: Optional[str]) -> Optional[str]:
     return None
 
 
+def _host_matches_fingerprint(host: Optional[str], key: str) -> bool:
+    """Return True only if ``host`` IS, or is a true subdomain of, ``key``.
+
+    Dot-boundary-safe matching for TAKEOVER_FINGERPRINTS keys. A loose
+    substring/``endswith`` check (e.g. ``key in host`` or ``host.endswith(key)``)
+    also matches attacker-controlled lookalikes such as
+    ``s3.amazonaws.com.evil.com`` or ``evil-s3.amazonaws.com``; this requires a
+    DNS-label boundary so only the real host or a genuine subdomain matches.
+
+    Two key shapes are handled:
+
+    * Dotted domain suffix (e.g. ``s3.amazonaws.com``): matches when
+      ``host == key`` or ``host`` ends with ``"." + key`` (a true subdomain).
+    * Label token without a dot (e.g. ``s3-website``, ``s3-accelerate``): these
+      are AWS endpoint label *prefixes*; match only when the token is a whole
+      DNS label or the start of one on a label boundary (``s3-website-…`` /
+      ``s3-website.…``), never merely contained inside another label.
+
+    ``host`` is lowercased and its trailing dot stripped before matching.
+    """
+    if not host:
+        return False
+    host = host.strip().rstrip(".").lower()
+    if not host:
+        return False
+    if "." in key:
+        return host == key or host.endswith("." + key)
+    # Dotless label token: require it to begin a DNS label on a label boundary.
+    return bool(
+        re.search(r"(?:^|\.)" + re.escape(key) + r"(?:[.-]|$)", host)
+    )
+
+
 def _recommended_action(risk: str, verdict: str, service: Optional[str]) -> str:
     """Return a short, concrete next step for a flagged subdomain.
 
@@ -2341,9 +2374,14 @@ def check_takeover(
     # dangling-cloud-resource signal holds (precedence HIGH > VERIFY > LOW).
     held_low: Optional[tuple[str, Optional[str], Optional[str]]] = None
     for key, meta in TAKEOVER_FINGERPRINTS.items():
-        via_cname = key in cname_lower
-        via_name = sub_lower.endswith(key)
-        matched_ptr = next((p for p in ptr_hosts if key in p), None)
+        # Dot-boundary-safe matching (see _host_matches_fingerprint): a loose
+        # substring/endswith check would also match attacker lookalikes such as
+        # "s3.amazonaws.com.evil.com" or "evil-s3.amazonaws.com".
+        via_cname = _host_matches_fingerprint(cname_lower, key)
+        via_name = _host_matches_fingerprint(sub_lower, key)
+        matched_ptr = next(
+            (p for p in ptr_hosts if _host_matches_fingerprint(p, key)), None
+        )
         matched = via_cname or via_name or matched_ptr is not None
         if not matched:
             continue

@@ -226,7 +226,7 @@ async def test_analyze_subdomain_cloudfront_promoted_to_high(monkeypatch):
     async def fake_check_http(client, host, pinned_ip=None):
         # Subdomain probe: 503 no body -> VERIFY tier. CloudFront target probe:
         # no-distribution signature -> VULNERABLE in the verify pass.
-        if host.endswith("cloudfront.net"):
+        if host == "cloudfront.net" or host.endswith(".cloudfront.net"):
             return 403, None, "ERROR: The request could not be satisfied."
         return 503, None, ""
 
@@ -263,7 +263,7 @@ async def test_recommended_action_populated_per_verdict_class(monkeypatch):
 
     async def fake_check_http(client, host, pinned_ip=None):
         # CloudFront bare 403 (no signature) -> INCONCLUSIVE; subdomain 503 -> VERIFY.
-        if host.endswith("cloudfront.net"):
+        if host == "cloudfront.net" or host.endswith(".cloudfront.net"):
             return 403, None, "Forbidden"
         return 503, None, ""
 
@@ -488,7 +488,7 @@ async def test_analyze_subdomain_flagged_gets_verdict(monkeypatch):
     async def fake_resolve_dns_detailed(host):
         # The subdomain itself has no A record (CNAME-only); the S3 target
         # resolves to a public IP so the verification probe runs.
-        if host.endswith("s3.amazonaws.com"):
+        if host == "s3.amazonaws.com" or host.endswith(".s3.amazonaws.com"):
             return ["52.216.1.1"], "RESOLVED"
         return [], "NO_ANSWER"
 
@@ -546,7 +546,7 @@ async def test_analyze_subdomain_verify_promoted_to_high(monkeypatch):
     async def fake_check_http(client, host, pinned_ip=None):
         # Subdomain probe: 503 with no body -> no fingerprint -> VERIFY tier.
         # Target (S3) probe: NoSuchBucket -> VULNERABLE in the verify pass.
-        if host.endswith("s3.amazonaws.com"):
+        if host == "s3.amazonaws.com" or host.endswith(".s3.amazonaws.com"):
             return None, 404, "<Error><Code>NoSuchBucket</Code></Error>"
         return 503, None, ""
 
@@ -681,7 +681,7 @@ async def test_elb_resolution_error_specific_message(monkeypatch):
 async def test_dangling_cname_without_a_record_cloudfront_vulnerable(monkeypatch):
     async def fake_resolve_dns_detailed(host):
         # The CloudFront TARGET resolves; the SUBDOMAIN has NO A record.
-        if host.endswith("cloudfront.net"):
+        if host == "cloudfront.net" or host.endswith(".cloudfront.net"):
             return ["13.33.1.2"], "RESOLVED"
         return [], "NXDOMAIN"
 
@@ -697,7 +697,7 @@ async def test_dangling_cname_without_a_record_cloudfront_vulnerable(monkeypatch
 
     async def fake_check_http(client, host, pinned_ip=None):
         # CloudFront no-distribution signature on the target probe.
-        if host.endswith("cloudfront.net"):
+        if host == "cloudfront.net" or host.endswith(".cloudfront.net"):
             return 403, None, "ERROR: The request could not be satisfied."
         return None, None, ""
 
@@ -726,7 +726,7 @@ async def test_dangling_cname_without_a_record_cloudfront_vulnerable(monkeypatch
 # verdicted (not CloudFront-only). A resolving ELB target -> NOT_VULNERABLE.
 async def test_dangling_cname_without_a_record_elb_kept_and_verdicted(monkeypatch):
     async def fake_resolve_dns_detailed(host):
-        if host.endswith("elb.amazonaws.com"):
+        if host == "elb.amazonaws.com" or host.endswith(".elb.amazonaws.com"):
             return ["52.1.2.3"], "RESOLVED"
         return [], "NO_ANSWER"
 
@@ -743,7 +743,7 @@ async def test_dangling_cname_without_a_record_elb_kept_and_verdicted(monkeypatc
         # The ELB target refuses the bare probe (empty-message timeout) and must
         # NOT swallow the verdict. The subdomain's own probe (no A record) just
         # returns no status.
-        if host.endswith("elb.amazonaws.com"):
+        if host == "elb.amazonaws.com" or host.endswith(".elb.amazonaws.com"):
             raise asyncio.TimeoutError()
         return None, None, ""
 
