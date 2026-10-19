@@ -6,9 +6,10 @@
     let activeFilter = 'all';
     let activeRequested = false;
     let permRequested = false;
+    let lastSourceStatuses = {};
 
     const DOMAIN_RE = /^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
-    const SOURCES = ['crt.sh','HackerTarget','AlienVault','RapidDNS','URLScan','ThreatCrowd','Wayback','Anubis','BufferOver','CertSpotter','ThreatMiner','SubdomainCenter','SecurityTrails','Shodan','c99'];
+    const SOURCES = ['crt.sh','HackerTarget','AlienVault','RapidDNS','URLScan','ThreatCrowd','Wayback','Anubis','BufferOver','CertSpotter','ThreatMiner','SubdomainCenter','AlienVaultURLs','CommonCrawl','SecurityTrails','Shodan','c99'];
 
     function toggleAdvanced() {
       const p = document.getElementById('advancedPanel');
@@ -74,6 +75,8 @@
       if (hero) hero.classList.add('hidden');
       document.getElementById('resultsPanel').classList.add('hidden');
       document.getElementById('progressPanel').classList.remove('hidden');
+      lastSourceStatuses = {};
+      renderSourceFailureNote({});
       renderSourceTable({});
       updateProgress(0, 0);
 
@@ -119,6 +122,32 @@
       }).join('');
     }
 
+    // Labels for the active phases so the coverage note names them cleanly
+    // (not shown as "errors" — only real passive-source failures are listed).
+    const SOURCE_LABELS = { bruteforce: 'Brute-force (active)', permutation: 'Permutation (active)' };
+
+    // Renders a subtle coverage note near the results summary when one or more
+    // passive sources ended in 'error' this run, so a low count is never read
+    // as "only N subdomains exist". All source names are escapeHtml-ed before
+    // reaching innerHTML (XSS-safe), and the active phases are excluded.
+    function renderSourceFailureNote(statuses) {
+      const box = document.getElementById('sourceFailNote');
+      if (!box) return;
+      statuses = statuses || {};
+      const passiveNames = SOURCES; // active phases are not "sources" here
+      const total = passiveNames.length;
+      const errored = passiveNames.filter(s => statuses[s] === 'error');
+      if (!errored.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+      const names = errored.map(s => escapeHtml(SOURCE_LABELS[s] || s)).join(', ');
+      box.innerHTML =
+        `<span class="font-semibold">${errored.length} of ${total} sources were ` +
+        `unavailable this run</span> (${names}) — results may be incomplete. ` +
+        `Passive sources are third-party and occasionally rate-limit or error ` +
+        `(crt.sh is the richest and 502s under load). Try again shortly, or ` +
+        `enable Active DNS discovery in Advanced options for fuller coverage.`;
+      box.classList.remove('hidden');
+    }
+
     function renderNotes(notes) {
       const box = document.getElementById('scanNotes');
       if (!box) return;
@@ -140,7 +169,8 @@
         if (!resp.ok) return;
         const data = await resp.json();
         updateProgress(data.progress, data.subdomains_found);
-        renderSourceTable(data.source_statuses || {});
+        lastSourceStatuses = data.source_statuses || {};
+        renderSourceTable(lastSourceStatuses);
         renderNotes(data.notes);
 
         if (data.status === 'done') {
@@ -177,6 +207,7 @@
       document.getElementById('resultsPanel').classList.remove('hidden');
       document.getElementById('startBtn').disabled = false;
       document.getElementById('resultDomain').textContent = data.domain;
+      renderSourceFailureNote(lastSourceStatuses);
 
       document.getElementById('cardTotal').textContent = data.total;
       document.getElementById('cardAlive').textContent = data.alive;

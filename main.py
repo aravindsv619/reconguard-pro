@@ -9,6 +9,7 @@ import asyncio
 import csv
 import io
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -35,6 +36,28 @@ logger = logging.getLogger("reconguard")
 USER_AGENT = "Mozilla/5.0 (compatible; ReconGuard/1.0)"
 SOURCE_TIMEOUT = 15.0
 HTTP_PROBE_TIMEOUT = 5.0
+
+# Transient-failure retry policy for passive-source fetches (_get). Passive
+# sources are third-party and flaky: crt.sh in particular 502s under load and
+# recovers within seconds, and dropping it silently costs the single richest
+# source (hundreds of hostnames). We retry a BOUNDED number of times with a
+# short exponential backoff on TRANSIENT signals only (502/503/504, 429, and
+# connect/read timeouts); definitive non-transient statuses (e.g. 403/404/530)
+# are never retried — they mean the source has no data for us, so we fail fast
+# and mark the source errored. Backoff is capped so a slow/flaky source can add
+# at most ~a few seconds of latency and never stalls the whole bounded job.
+SOURCE_RETRY_ATTEMPTS = 3  # total attempts (1 initial + up to 2 retries)
+SOURCE_RETRY_BASE_DELAY = 1.0  # seconds; delays are 1s, 2s (exponential)
+SOURCE_RETRY_MAX_DELAY = 4.0  # cap per-sleep so added latency stays bounded
+# CertSpotter pagination (bounded): follow at most this many ?after= pages so a
+# large cert history is not truncated to page 1, while total work stays bounded.
+CERTSPOTTER_MAX_PAGES = 5
+CERTSPOTTER_PAGE_HINT = 100  # a full page is ~100 entries; a shorter page = last
+# CommonCrawl CDX fetch cap: a best-effort, bounded keyless hostname source.
+COMMONCRAWL_LIMIT = 10000
+# HTTP statuses worth retrying (gateway/overload/rate-limit). A 429 honors a
+# numeric Retry-After header when present (clamped to SOURCE_RETRY_MAX_DELAY).
+TRANSIENT_STATUS = frozenset({429, 502, 503, 504})
 ANALYSIS_CONCURRENCY = 50
 JOB_TTL_SECONDS = 3600
 
@@ -1426,15 +1449,59 @@ async def _read_capped_body(resp: httpx.Response) -> Optional[bytes]:
         return None
 
 
-async def _get(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
+class SourceUnavailable(BaseException):
+    """A passive source could not be fetched (transient retries exhausted, a
+    definitive non-transient HTTP status, or a connection/read error).
+
+    Deliberately subclasses ``BaseException`` (NOT ``Exception``): the per-source
+    fetchers wrap their parsing in ``except Exception`` to degrade a malformed
+    *response* to an empty result set, but a genuine *fetch failure* must NOT be
+    swallowed there — it has to propagate up to ``run_source`` so the source is
+    marked ``error`` in ``source_statuses`` and the user can see WHY a run is
+    sparse. ``run_source`` catches this type explicitly.
+    """
+
+
+def _retry_after_seconds(resp: httpx.Response) -> Optional[float]:
+    """Parse a numeric ``Retry-After`` header (seconds), clamped to the backoff
+    cap. HTTP-date form is ignored (best-effort); returns None when absent."""
+    value = resp.headers.get("retry-after")
+    if not value:
+        return None
+    try:
+        secs = float(value.strip())
+    except (TypeError, ValueError):
+        return None
+    if secs < 0:
+        return None
+    return min(secs, SOURCE_RETRY_MAX_DELAY)
+
+
+async def _get(
+    client: httpx.AsyncClient, url: str, *, retry: bool = True, **kwargs
+) -> httpx.Response:
     """Fetch a URL on the verified source client, bounded by SOURCE_TIMEOUT and
-    MAX_RESPONSE_BYTES.
+    MAX_RESPONSE_BYTES, with bounded retry on TRANSIENT failures.
 
     The body is streamed and capped so a hostile source cannot return a
     multi-hundred-MB body and exhaust memory. On an oversize body the response
     content is replaced with an empty payload (``_content = b""``) so the
     caller's ``.json()``/``.text`` parsing yields empty/None and the source
     degrades to an empty result set instead of crashing.
+
+    Retry semantics (``retry=True``, the default for source fetches):
+    * TRANSIENT_STATUS (429/502/503/504) and connect/read timeouts are retried
+      up to ``SOURCE_RETRY_ATTEMPTS`` times with exponential backoff (honoring a
+      numeric ``Retry-After`` on 429); after exhaustion a ``SourceUnavailable``
+      is raised.
+    * Any other non-2xx status is definitive (e.g. 403/404/530) — NOT retried,
+      raised as ``SourceUnavailable`` immediately.
+    * A 2xx response is returned to the caller for parsing.
+
+    Security/limits are unchanged: TLS verification, disabled redirects, the
+    per-attempt ``SOURCE_TIMEOUT``, and ``MAX_RESPONSE_BYTES`` cap all still
+    apply to every attempt, and total added latency is bounded by the capped
+    backoff so a flaky source cannot stall the overall bounded job.
     """
     async def _send() -> httpx.Response:
         req = client.build_request("GET", url, **kwargs)
@@ -1447,26 +1514,65 @@ async def _get(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
         resp._content = body if body is not None else b""
         return resp
 
-    return await asyncio.wait_for(_send(), timeout=SOURCE_TIMEOUT)
+    last_exc: Optional[BaseException] = None
+    for attempt in range(SOURCE_RETRY_ATTEMPTS if retry else 1):
+        try:
+            resp = await asyncio.wait_for(_send(), timeout=SOURCE_TIMEOUT)
+        except (asyncio.TimeoutError, httpx.TimeoutException, httpx.TransportError) as exc:
+            # Connect/read/timeout errors are transient — retry if attempts remain.
+            last_exc = exc
+            if not retry or attempt == SOURCE_RETRY_ATTEMPTS - 1:
+                raise SourceUnavailable(f"{url}: {type(exc).__name__}") from exc
+            await asyncio.sleep(
+                min(SOURCE_RETRY_BASE_DELAY * (2 ** attempt), SOURCE_RETRY_MAX_DELAY)
+            )
+            continue
+
+        if resp.status_code < 400:
+            return resp
+
+        if retry and resp.status_code in TRANSIENT_STATUS and attempt < SOURCE_RETRY_ATTEMPTS - 1:
+            delay = _retry_after_seconds(resp) if resp.status_code == 429 else None
+            if delay is None:
+                delay = min(SOURCE_RETRY_BASE_DELAY * (2 ** attempt), SOURCE_RETRY_MAX_DELAY)
+            await asyncio.sleep(delay)
+            continue
+
+        # Definitive non-transient status, or transient status with no attempts
+        # left: the source has no usable data for us — fail fast, mark errored.
+        raise SourceUnavailable(f"{url}: HTTP {resp.status_code}")
+
+    # Only reachable if the transient loop exhausted without returning/raising.
+    raise SourceUnavailable(f"{url}: exhausted retries") from last_exc
 
 
 async def query_crtsh(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
     out: set[str] = set()
+    # crt.sh is the single richest passive source but it is also the flakiest:
+    # under load it 502/503s (handled by _get's transient retry, which raises
+    # SourceUnavailable after exhaustion) OR returns HTTP 200 with an HTML error
+    # page instead of JSON. Retry the empty/non-JSON case here with short
+    # backoff; if every attempt is unusable, raise SourceUnavailable so the
+    # source is marked errored (never silently "done" with 0 results). Parse
+    # BOTH name_value (newline-delimited SAN list) AND common_name from EVERY
+    # entry so the discovery is exhaustive when crt.sh does respond.
+    data = None
+    for attempt in range(SOURCE_RETRY_ATTEMPTS):
+        resp = await _get(client, f"https://crt.sh/?q=%25.{domain}&output=json")
+        try:
+            parsed = resp.json()
+        except Exception:  # noqa: BLE001 — empty body / HTML error page
+            parsed = None
+        if parsed:
+            data = parsed
+            break
+        if attempt < SOURCE_RETRY_ATTEMPTS - 1:
+            await asyncio.sleep(
+                min(SOURCE_RETRY_BASE_DELAY * (2 ** attempt), SOURCE_RETRY_MAX_DELAY)
+            )
+    if data is None:
+        raise SourceUnavailable("crt.sh: empty/non-JSON body after retries")
     try:
-        # crt.sh occasionally returns an empty body or an HTML error page
-        # instead of JSON under load; retry ONCE on empty/non-JSON before
-        # giving up. Parse BOTH name_value (newline-delimited SAN list) AND
-        # common_name from EVERY entry so the discovery is exhaustive.
-        data = None
-        for attempt in range(2):
-            resp = await _get(client, f"https://crt.sh/?q=%25.{domain}&output=json")
-            try:
-                parsed = resp.json()
-            except Exception:  # noqa: BLE001 — empty body / HTML error page
-                parsed = None
-            if parsed:
-                data = parsed
-                break
         for entry in data or []:
             if not isinstance(entry, dict):
                 continue
@@ -1491,23 +1597,38 @@ async def query_certspotter(client: httpx.AsyncClient, domain: str, keys: dict) 
     compliance with licensing restrictions.
     """
     out: set[str] = set()
-    try:
-        resp = await _get(
-            client,
+    # CertSpotter paginates the issuance list; each page returns up to ~100
+    # entries and the next page is fetched with ?after=<last entry id>. Follow
+    # pagination for a BOUNDED number of pages so a large cert history is not
+    # truncated to the first page, while keeping total work/latency bounded.
+    after: Optional[str] = None
+    for _page in range(CERTSPOTTER_MAX_PAGES):
+        url = (
             "https://api.certspotter.com/v1/issuances"
-            f"?domain={domain}&include_subdomains=true&expand=dns_names",
+            f"?domain={domain}&include_subdomains=true&expand=dns_names"
         )
-        data = resp.json()
-        if isinstance(data, list):
-            for entry in data:
-                if not isinstance(entry, dict):
-                    continue
-                for name in entry.get("dns_names", []) or []:
-                    norm = _normalize_host(name, domain)
-                    if norm:
-                        out.add(norm)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("certspotter failed: %s", exc)
+        if after:
+            url += f"&after={after}"
+        resp = await _get(client, url)
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001 — malformed page degrades to what we have
+            break
+        if not isinstance(data, list) or not data:
+            break
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            for name in entry.get("dns_names", []) or []:
+                norm = _normalize_host(name, domain)
+                if norm:
+                    out.add(norm)
+        # Advance to the next page using the last entry's id; stop when the
+        # page is short (no more pages) or the id is missing.
+        last_id = data[-1].get("id") if isinstance(data[-1], dict) else None
+        if not last_id or len(data) < CERTSPOTTER_PAGE_HINT:
+            break
+        after = str(last_id)
     return out
 
 
@@ -1753,6 +1874,89 @@ async def query_c99(client: httpx.AsyncClient, domain: str, keys: dict) -> set[s
     return out
 
 
+async def query_alienvault_urllist(
+    client: httpx.AsyncClient, domain: str, keys: dict
+) -> set[str]:
+    """AlienVault OTX URL list (KEYLESS) — a SECOND, independent OTX dataset.
+
+    The passive_dns endpoint (query_alienvault) and this url_list endpoint are
+    rate-limited independently, so when one 429s the other often still responds;
+    together they add redundancy. Each url_list entry carries a ``hostname``
+    under the queried domain. Bounded to a few pages so the fetch stays cheap.
+    """
+    out: set[str] = set()
+    for page in range(1, 4):  # up to 3 pages (<=150 urls); bounded + best-effort
+        resp = await _get(
+            client,
+            f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}"
+            f"/url_list?limit=50&page={page}",
+        )
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001 — malformed page degrades to what we have
+            break
+        rows = data.get("url_list", []) if isinstance(data, dict) else []
+        if not rows:
+            break
+        for entry in rows:
+            if not isinstance(entry, dict):
+                continue
+            norm = _normalize_host(entry.get("hostname", "") or "", domain)
+            if norm:
+                out.add(norm)
+        if not (isinstance(data, dict) and data.get("has_next")):
+            break
+    return out
+
+
+async def query_commoncrawl(
+    client: httpx.AsyncClient, domain: str, keys: dict
+) -> set[str]:
+    """CommonCrawl URL index (KEYLESS, best-effort) — hostnames seen crawling
+    the public web under the domain.
+
+    Resolves the newest monthly index from collinfo.json, then queries its CDX
+    API for ``*.{domain}`` and extracts the host from each record's ``url``.
+    Bounded by COMMONCRAWL_LIMIT; a dead/slow index degrades (SourceUnavailable
+    from _get -> source marked errored). The CDX stream is newline-delimited
+    JSON objects (NOT a single JSON array), parsed line by line.
+    """
+    out: set[str] = set()
+    # Discover the latest index id (e.g. "CC-MAIN-2026-39").
+    resp = await _get(client, "https://index.commoncrawl.org/collinfo.json")
+    try:
+        collections = resp.json()
+    except Exception:  # noqa: BLE001 — unusable index listing
+        return out
+    if not isinstance(collections, list) or not collections:
+        return out
+    index_id = collections[0].get("id") if isinstance(collections[0], dict) else None
+    if not index_id or not re.fullmatch(r"CC-MAIN-[0-9]{4}-[0-9]{2}", str(index_id)):
+        # Only accept the expected index id shape (defensive; avoids using an
+        # attacker-controlled value to build the next URL path).
+        return out
+    resp = await _get(
+        client,
+        f"https://index.commoncrawl.org/{index_id}-index"
+        f"?url=*.{domain}&output=json&fl=url&limit={COMMONCRAWL_LIMIT}",
+    )
+    for line in (resp.text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:  # noqa: BLE001 — skip a malformed CDX line
+            continue
+        url = record.get("url", "") if isinstance(record, dict) else ""
+        match = re.search(r"https?://([^/:]+)", str(url))
+        host = match.group(1) if match else str(url)
+        norm = _normalize_host(host, domain)
+        if norm:
+            out.add(norm)
+    return out
+
+
 SOURCES = {
     "crt.sh": query_crtsh,
     "HackerTarget": query_hackertarget,
@@ -1767,6 +1971,11 @@ SOURCES = {
     "CertSpotter": query_certspotter,
     "ThreatMiner": query_threatminer,
     "SubdomainCenter": query_subdomaincenter,
+    # Added keyless sources for redundancy (verified live). AlienVault URL List
+    # is an independently rate-limited OTX dataset; CommonCrawl surfaces hosts
+    # seen crawling the public web.
+    "AlienVaultURLs": query_alienvault_urllist,
+    "CommonCrawl": query_commoncrawl,
     "SecurityTrails": query_securitytrails,
     "Shodan": query_shodan,
     "c99": query_c99,
@@ -3396,6 +3605,13 @@ async def run_enumeration(
                 subdomain_sources.setdefault(sub, set()).add(name)
             job.subdomains_found = len(collected)
             job.source_statuses[name] = "done"
+        except SourceUnavailable as exc:
+            # The source could not be fetched (transient retries exhausted or a
+            # definitive non-transient status). Mark it errored so the UI can
+            # tell the user coverage was degraded; the job continues with the
+            # other sources and NEVER crashes on a single dead source.
+            logger.info("source %s unavailable: %s", name, exc)
+            job.source_statuses[name] = "error"
         except Exception as exc:  # noqa: BLE001
             logger.debug("source %s failed: %s", name, exc)
             job.source_statuses[name] = "error"

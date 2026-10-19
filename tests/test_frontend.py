@@ -155,6 +155,44 @@ def test_csp_unchanged_still_script_src_self_no_unsafe_inline():
     assert "cdn.tailwindcss.com" not in csp
 
 
+def test_index_bumps_app_js_cache_buster_to_v8():
+    """app.js changed (source-failure note) → the ?v= cache-buster must bump so
+    browsers re-fetch it instead of serving a stale cached script."""
+    html = INDEX.read_text()
+    assert re.search(r'<script src="/app\.js\?v=8"></script>', html)
+
+
+def test_index_has_source_fail_note_element():
+    """The coverage-note container must exist for renderSourceFailureNote()."""
+    html = INDEX.read_text()
+    assert 'id="sourceFailNote"' in html
+
+
+def test_app_js_source_failure_note_is_escapehtml_safe():
+    """The source-failure note names errored sources via escapeHtml (no raw
+    server data in innerHTML) and lists the count out of the total."""
+    js = JS.read_text()
+    assert "function renderSourceFailureNote" in js
+    # The note body escapes every source name before it reaches innerHTML.
+    assert "escapeHtml(SOURCE_LABELS[s] || s)" in js
+    # It is wired to render on completion using the last polled statuses.
+    assert "renderSourceFailureNote(lastSourceStatuses)" in js
+    # New keyless sources are present in the client-side source list.
+    for name in ("AlienVaultURLs", "CommonCrawl", "CertSpotter"):
+        assert name in js, f"missing source {name!r} in app.js SOURCES list"
+
+
+def test_app_js_source_fail_note_has_no_inline_handlers():
+    """The note's rendered markup must not introduce inline on* handlers
+    (CSP-blocked). Scope the check to the renderSourceFailureNote body."""
+    js = JS.read_text()
+    start = js.index("function renderSourceFailureNote")
+    body = js[start:start + 1200]
+    assert "onclick=" not in body
+    assert "onerror=" not in body
+    assert "onload=" not in body
+
+
 def test_tailwind_css_covers_brand_and_fadein():
     css = CSS.read_text()
     # Custom theme carried over from the former inline tailwind.config.

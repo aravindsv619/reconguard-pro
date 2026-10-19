@@ -88,8 +88,9 @@ async def test_one_failing_source_does_not_abort(no_network_analysis):
         await client.aclose()
 
     job = main.JOBS["j2"]
-    # Each fetcher swallows its own exceptions and returns an empty set, so a
-    # down source does not abort the job; the healthy source's hosts survive.
+    # A down source (crt.sh connect error, retries exhausted -> SourceUnavailable)
+    # is isolated per-source and does NOT abort the job; the healthy source's
+    # hosts survive and the job still completes.
     assert job.status == "done"
     assert job.progress == 100
     assert job.source_statuses["HackerTarget"] == "done"

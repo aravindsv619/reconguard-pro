@@ -1,21 +1,61 @@
 # ReconGuard Pro
 
 Subdomain Enumeration, Takeover Risk & Lookalike Domain Recon in a single
-self-contained web tool. ReconGuard Pro aggregates subdomains from 12 keyless
+self-contained web tool. ReconGuard Pro aggregates subdomains from 14 keyless
 public passive-DNS sources (no API key needed for any of them), resolves and
 HTTP-probes each one, scores takeover risk against a library of service
 fingerprints, and lets you export everything to CSV — all from a dark-themed
 browser dashboard.
 
+Passive sources are third-party and vary in availability from run to run, so
+ReconGuard Pro retries transient source failures and tells you which sources
+failed on a given run. See [Coverage & result variance](#coverage--result-variance).
+
 > ⚠️ **For authorized security testing only. Unauthorized use is illegal.**
 > Only scan domains you own or have explicit permission to test.
 
+## Run with Docker (quickest)
+
+A prebuilt image is published to the GitHub Container Registry (GHCR) on every
+push by CI — no clone or build required.
+
+```bash
+docker run --rm -p 8080:8080 -e SUBRECON_HOST=0.0.0.0 \
+  ghcr.io/aravindsv619/reconguard-pro:latest
+```
+
+Then open <http://localhost:8080>.
+
+- `SUBRECON_HOST=0.0.0.0` is required **inside the container** so the mapped
+  port is reachable from the host. The app has no authentication, so keep the
+  host-side port on loopback or behind an authenticating reverse proxy — do not
+  expose it to the public internet.
+- Pin a specific build with an immutable tag instead of `latest`, e.g.
+  `ghcr.io/aravindsv619/reconguard-pro:v1.0.0` (release tags) or
+  `...:sha-<short-sha>` (per-commit).
+
+### docker compose
+
+A `docker-compose.yml` is included (binds to `127.0.0.1:8080` by default):
+
+```bash
+docker compose up -d      # → http://localhost:8080
+docker compose down
+```
+
 ## Features
 
-- Passive subdomain discovery from 12 independent **keyless** public sources
+- Passive subdomain discovery from 14 independent **keyless** public sources
   (no API key required for any of them), including the exhaustive crt.sh parser
-  plus CertSpotter, ThreatMiner, and SubdomainCenter (no scanning of the target
+  plus CertSpotter (with bounded pagination), ThreatMiner, SubdomainCenter, the
+  AlienVault OTX URL list, and the CommonCrawl index (no scanning of the target
   is required for discovery).
+- **Resilient fetching:** transient source failures (crt.sh 502/503, gateway
+  504, 429 rate-limits, connect/read timeouts) are retried with bounded
+  exponential backoff, so one flaky-but-recovering source — crt.sh is the
+  richest and 502s intermittently — is not silently dropped. Definitive
+  failures (403/404/530) are not retried; the source is marked **error** and
+  the run proceeds with the others.
 - **Active DNS discovery (optional, OFF by default):** wordlist brute-forcing
   against a bundled 2,400+ label list plus altdns-style permutation generation.
   See [Active DNS discovery](#active-dns-discovery) below.
@@ -38,7 +78,9 @@ browser dashboard.
   types (A/AAAA/CNAME/MX/NS/TXT/SOA) and surfaced as a per-subdomain Records
   panel and a trailing `dns_records` CSV column. See
   [`dns_records`](#dns_records).
-- Live progress tracking with per-source status.
+- Live progress tracking with per-source status, plus a results-summary note
+  that lists any sources that were unavailable this run so a low count is never
+  mistaken for "only N subdomains exist".
 - Filterable, sortable results table and a risk-breakdown chart.
 - One-click CSV report download.
 - Optional SecurityTrails, Shodan, and c99.nl API keys for additional coverage.
@@ -59,9 +101,45 @@ browser dashboard.
 | CertSpotter (SSLMate) | no |
 | ThreatMiner | no |
 | SubdomainCenter | no |
+| AlienVault OTX URL list | no |
+| CommonCrawl (URL index) | no |
 | SecurityTrails | optional |
 | Shodan | optional |
 | c99.nl | optional (paid) |
+
+## Coverage & result variance
+
+Passive discovery reads from independent **third-party** services, and their
+availability changes minute to minute. Any of them can rate-limit (HTTP 429),
+return a gateway error (502/503/504), or be temporarily down, and crt.sh — the
+single richest source, usually the bulk of a large result set — 502s under load
+and typically recovers within seconds. Because of this, **two runs of the same
+domain can legitimately return very different counts** (for example ~90 vs.
+350+) depending purely on which sources answered.
+
+ReconGuard Pro mitigates this in three ways:
+
+- **Retries.** Transient failures (502/503/504, 429 honoring `Retry-After`, and
+  connect/read timeouts) are retried with short bounded exponential backoff so a
+  source that is merely flaky — crt.sh especially — is recovered instead of
+  dropped. Definitive non-transient failures (403/404/530) are not retried.
+- **Redundancy.** Fourteen keyless sources run in parallel, so one or two dead
+  sources no longer gut the run — the results are the union of whatever
+  responded.
+- **Visibility.** A source that still fails after retries is marked **error** in
+  the per-source status table, and the results summary shows a note listing the
+  sources that were unavailable this run. A sparse result is therefore always
+  explained, never silently presented as "all that exists".
+
+**To improve coverage on a sparse run:** re-run shortly (flaky sources usually
+recover), and/or enable **Active DNS discovery** under Advanced Options to add
+brute-force and permutation hosts beyond the passive sources.
+
+> **No tool finds "all" subdomains.** Passive discovery can only surface hosts
+> that are exposed in public datasets (certificate logs, passive DNS, web
+> crawls, etc.). Subdomains that never appear in any public source are not
+> discoverable passively by any tool. This design **maximizes and stabilizes**
+> coverage — it does not guarantee completeness.
 
 ## Requirements
 
@@ -71,10 +149,11 @@ browser dashboard.
   the Python standard-library resolver (`socket.gethostbyname_ex`), so no
   external binary is required — `dig` only speeds things up.
 
-## Installation
+## Installation (from source)
 
 ```bash
-cd /home/aravind/New-SEC
+git clone https://github.com/aravindsv619/reconguard-pro.git
+cd reconguard-pro
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```

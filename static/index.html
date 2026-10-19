@@ -573,6 +573,13 @@
         </button>
       </div>
 
+      <!-- Coverage note: shown when one or more passive sources were
+           unavailable this run (e.g. crt.sh 502). Populated by app.js via
+           renderSourceFailureNote() using escapeHtml — never raw innerHTML of
+           server data. Hidden when every source succeeded. -->
+      <div id="sourceFailNote"
+        class="hidden mb-6 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-300"></div>
+
       <!-- Summary cards -->
       <div class="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
         <div class="bg-gray-900 border border-blue-500/30 rounded-xl p-4">
@@ -814,6 +821,6 @@
        back into this file. -->
   <!-- ?v= is a cache-buster: bump it whenever app.js changes so browsers
        re-fetch instead of running a stale cached copy. -->
-  <script src="/app.js?v=7"></script>
+  <script src="/app.js?v=8"></script>
 </body>
 </html>

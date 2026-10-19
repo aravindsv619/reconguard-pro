@@ -217,10 +217,14 @@ async def test_c99_handles_html_error_body(client):
 
 
 @respx.mock
-async def test_source_failure_returns_empty_not_raises(client):
+async def test_source_connect_error_raises_source_unavailable(client):
+    # New contract: a genuine fetch failure (connection error, exhausted after
+    # retries) propagates as SourceUnavailable so run_source marks the source
+    # 'error' and the UI can report degraded coverage — it is NOT swallowed to
+    # a silent empty "done".
     respx.get("https://crt.sh/").mock(side_effect=httpx.ConnectError("boom"))
-    out = await main.query_crtsh(client, DOMAIN, {})
-    assert out == set()
+    with pytest.raises(main.SourceUnavailable):
+        await main.query_crtsh(client, DOMAIN, {})
 
 
 # ---------------------------------------------------------------------------
@@ -286,24 +290,293 @@ async def test_subdomaincenter_parses_json_array(client):
 
 
 @respx.mock
-async def test_certspotter_connect_error_returns_empty(client):
+async def test_certspotter_connect_error_raises_source_unavailable(client):
     respx.get("https://api.certspotter.com/v1/issuances").mock(
         side_effect=httpx.ConnectError("boom")
     )
-    out = await main.query_certspotter(client, DOMAIN, {})
-    assert out == set()
+    with pytest.raises(main.SourceUnavailable):
+        await main.query_certspotter(client, DOMAIN, {})
 
 
 def test_sources_registry_contains_new_keyless_sources():
-    for name in ("CertSpotter", "ThreatMiner", "SubdomainCenter"):
+    for name in ("CertSpotter", "ThreatMiner", "SubdomainCenter",
+                 "AlienVaultURLs", "CommonCrawl"):
         assert name in main.SOURCES
         assert callable(main.SOURCES[name])
-    # the three new sources are KEYLESS: they must still return data without
-    # any keys (not gated behind a key early-return like the keyed sources).
-    # All 12 original sources remain registered.
+    # the keyless sources must still return data without any keys (not gated
+    # behind a key early-return like the keyed sources).
+    # All original sources remain registered.
     for name in (
         "crt.sh", "HackerTarget", "AlienVault", "RapidDNS", "URLScan",
         "ThreatCrowd", "Wayback", "Anubis", "BufferOver",
         "SecurityTrails", "Shodan", "c99",
     ):
         assert name in main.SOURCES
+
+
+# ---------------------------------------------------------------------------
+# _get retry-on-transient-failure (FIX 1) — all HTTP mocked + sleep patched
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """Make retry backoff instantaneous and deterministic for the whole module."""
+    async def _instant(_delay):
+        return None
+    monkeypatch.setattr(main.asyncio, "sleep", _instant)
+
+
+@respx.mock
+async def test_get_retries_502_then_succeeds(client):
+    route = respx.get("https://crt.sh/retry502").mock(
+        side_effect=[
+            httpx.Response(502, text="bad gateway"),
+            httpx.Response(200, json={"ok": True}),
+        ]
+    )
+    resp = await main._get(client, "https://crt.sh/retry502")
+    assert resp.status_code == 200
+    assert route.call_count == 2  # one retry after the 502
+
+
+@respx.mock
+async def test_get_does_not_retry_403(client):
+    route = respx.get("https://crt.sh/forbidden").mock(
+        return_value=httpx.Response(403, text="nope")
+    )
+    with pytest.raises(main.SourceUnavailable):
+        await main._get(client, "https://crt.sh/forbidden")
+    assert route.call_count == 1  # 403 is definitive — NOT retried
+
+
+@respx.mock
+async def test_get_does_not_retry_530(client):
+    route = respx.get("https://crt.sh/down").mock(
+        return_value=httpx.Response(530, text="origin down")
+    )
+    with pytest.raises(main.SourceUnavailable):
+        await main._get(client, "https://crt.sh/down")
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_get_429_honors_retry_after_then_succeeds(client, monkeypatch):
+    seen = []
+
+    async def _record(delay):
+        seen.append(delay)
+
+    monkeypatch.setattr(main.asyncio, "sleep", _record)
+    route = respx.get("https://crt.sh/ratelimited").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "2"}),
+            httpx.Response(200, json=[]),
+        ]
+    )
+    resp = await main._get(client, "https://crt.sh/ratelimited")
+    assert resp.status_code == 200
+    assert route.call_count == 2
+    # The numeric Retry-After (2s) was honored (clamped to the backoff cap).
+    assert seen and seen[0] == 2.0
+
+
+@respx.mock
+async def test_get_timeout_then_succeeds(client):
+    route = respx.get("https://crt.sh/timeout").mock(
+        side_effect=[
+            httpx.ConnectTimeout("slow"),
+            httpx.Response(200, json=[]),
+        ]
+    )
+    resp = await main._get(client, "https://crt.sh/timeout")
+    assert resp.status_code == 200
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_get_persistent_502_exhausts_and_raises(client):
+    route = respx.get("https://crt.sh/always502").mock(
+        return_value=httpx.Response(502, text="bad gateway")
+    )
+    with pytest.raises(main.SourceUnavailable):
+        await main._get(client, "https://crt.sh/always502")
+    assert route.call_count == main.SOURCE_RETRY_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# query_crtsh resilience (FIX 1)
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_crtsh_502_then_200_recovers_and_parses(client):
+    respx.get("https://crt.sh/").mock(
+        side_effect=[
+            httpx.Response(502, text="<html>502</html>"),
+            httpx.Response(
+                200,
+                json=[
+                    {"name_value": "a.example.com\n*.example.com",
+                     "common_name": "cn.example.com"},
+                ],
+            ),
+        ]
+    )
+    out = await main.query_crtsh(client, DOMAIN, {})
+    assert out == {"a.example.com", "example.com", "cn.example.com"}
+
+
+@respx.mock
+async def test_crtsh_persistent_502_raises_source_unavailable(client):
+    respx.get("https://crt.sh/").mock(return_value=httpx.Response(502, text="x"))
+    with pytest.raises(main.SourceUnavailable):
+        await main.query_crtsh(client, DOMAIN, {})
+
+
+@respx.mock
+async def test_crtsh_persistent_html_body_raises_source_unavailable(client):
+    # 200 OK but HTML error page every time -> unusable -> marked error.
+    respx.get("https://crt.sh/").mock(
+        return_value=httpx.Response(200, text="<html>error</html>")
+    )
+    with pytest.raises(main.SourceUnavailable):
+        await main.query_crtsh(client, DOMAIN, {})
+
+
+# ---------------------------------------------------------------------------
+# New source parsers (FIX 2)
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_certspotter_follows_pagination(client):
+    # First page full (len==PAGE_HINT) -> follow ?after=<last id>; second page
+    # short -> stop. Build a full first page of distinct in-scope hosts.
+    first = [
+        {"id": str(i), "dns_names": [f"h{i}.example.com"]}
+        for i in range(main.CERTSPOTTER_PAGE_HINT)
+    ]
+    respx.get(
+        "https://api.certspotter.com/v1/issuances",
+        params={"after": str(main.CERTSPOTTER_PAGE_HINT - 1)},
+    ).mock(
+        return_value=httpx.Response(200, json=[{"id": "x", "dns_names": ["last.example.com"]}])
+    )
+    # The initial page (no ?after=) must be matched by a broader route; respx
+    # matches the most specific route first, so register the catch-all last.
+    respx.get("https://api.certspotter.com/v1/issuances").mock(
+        return_value=httpx.Response(200, json=first)
+    )
+    out = await main.query_certspotter(client, DOMAIN, {})
+    assert "last.example.com" in out
+    assert "h0.example.com" in out
+    assert len(out) == main.CERTSPOTTER_PAGE_HINT + 1
+
+
+@respx.mock
+async def test_alienvault_urllist_parses_hostnames(client):
+    respx.get(
+        f"https://otx.alienvault.com/api/v1/indicators/domain/{DOMAIN}/url_list"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "has_next": False,
+                "url_list": [
+                    {"hostname": "a.example.com"},
+                    {"hostname": "b.example.com"},
+                    {"hostname": "out.org"},
+                ],
+            },
+        )
+    )
+    out = await main.query_alienvault_urllist(client, DOMAIN, {})
+    assert out == {"a.example.com", "b.example.com"}
+
+
+@respx.mock
+async def test_commoncrawl_extracts_hosts_from_cdx(client):
+    respx.get("https://index.commoncrawl.org/collinfo.json").mock(
+        return_value=httpx.Response(200, json=[{"id": "CC-MAIN-2026-39"}])
+    )
+    body = (
+        '{"url": "https://a.example.com/x"}\n'
+        '{"url": "http://b.example.com/"}\n'
+        '{"url": "https://out.org/"}\n'
+        'not-json-line\n'
+    )
+    respx.get("https://index.commoncrawl.org/CC-MAIN-2026-39-index").mock(
+        return_value=httpx.Response(200, text=body)
+    )
+    out = await main.query_commoncrawl(client, DOMAIN, {})
+    assert out == {"a.example.com", "b.example.com"}
+
+
+@respx.mock
+async def test_commoncrawl_rejects_bad_index_id(client):
+    # A malformed index id must not be used to build the next URL path.
+    respx.get("https://index.commoncrawl.org/collinfo.json").mock(
+        return_value=httpx.Response(200, json=[{"id": "../evil"}])
+    )
+    out = await main.query_commoncrawl(client, DOMAIN, {})
+    assert out == set()
+
+
+# ---------------------------------------------------------------------------
+# run_enumeration resilience (FIX 1/2): several dead sources don't zero the run
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_run_enumeration_union_survives_several_dead_sources(monkeypatch):
+    """When MULTIPLE passive sources error (transient 502, non-transient 403,
+    and a connect error), the job still COMPLETES and the results are the UNION
+    of the working sources — one dead source never zeroes the run. The erroring
+    sources are reflected in source_statuses."""
+    # Stub DNS/HTTP so the per-subdomain analysis does no real I/O (offline).
+    async def fake_resolve_dns(host):
+        return ["1.2.3.4"]
+
+    async def fake_resolve_cname(host):
+        return None
+
+    async def fake_check_http(client, host, pinned_ip=None):
+        return 200, None, ""
+
+    async def fake_resolve_ptrs(ips):
+        return []
+
+    monkeypatch.setattr(main, "resolve_dns", fake_resolve_dns)
+    monkeypatch.setattr(main, "resolve_cname", fake_resolve_cname)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+    monkeypatch.setattr(main, "_resolve_ptrs", fake_resolve_ptrs)
+    main.JOBS.clear()
+
+    # Two healthy sources with an overlapping host (prove dedup/union).
+    respx.get("https://crt.sh/").mock(
+        return_value=httpx.Response(
+            200, json=[{"name_value": "a.example.com\nshared.example.com"}]
+        )
+    )
+    respx.get("https://api.hackertarget.com/hostsearch/").mock(
+        return_value=httpx.Response(
+            200, text="b.example.com,1.1.1.1\nshared.example.com,2.2.2.2"
+        )
+    )
+    # Dead sources: a non-transient 403 and a persistent 502 (retries exhaust).
+    respx.route(host="urlscan.io").mock(return_value=httpx.Response(403))
+    respx.route(host="jldc.me").mock(return_value=httpx.Response(502))
+    # Everything else responds benignly-empty so it is 'done' with 0 hosts.
+    respx.route().mock(return_value=httpx.Response(200, json={}))
+
+    client = httpx.AsyncClient()
+    main.app.state.client = client
+    main.app.state.probe_client = client
+    main.JOBS["ju"] = main.JobState(job_id="ju", domain="example.com")
+    try:
+        await main.run_enumeration("ju", "example.com", {})
+    finally:
+        await client.aclose()
+
+    job = main.JOBS["ju"]
+    assert job.status == "done"
+    assert job.progress == 100
+    subs = {r["subdomain"] for r in job.results}
+    assert subs == {"a.example.com", "b.example.com", "shared.example.com"}
+    assert job.source_statuses["crt.sh"] == "done"
+    assert job.source_statuses["HackerTarget"] == "done"
+    assert job.source_statuses["URLScan"] == "error"  # 403 non-transient
+    assert job.source_statuses["Anubis"] == "error"   # persistent 502
