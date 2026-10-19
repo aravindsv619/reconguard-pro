@@ -18,15 +18,24 @@
        third-party origins; no CDN. Dark theme kept, made to feel current.
        --------------------------------------------------------------------- */
 
-    /* Design tokens. --accent drives the brand highlight across the UI. */
+    /* Design tokens. --accent drives the brand highlight across the UI.
+       The surface/elevation/border tokens give every card and the data grid a
+       single, cohesive palette so the dark theme reads as a polished product
+       rather than a set of mismatched panels. */
     :root {
       --accent: #6366f1;
       --accent-strong: #4f46e5;
       --accent-soft: rgba(99, 102, 241, 0.16);
       --surface: #0f1523;
       --surface-2: #131a2b;
+      --surface-3: #0b1120;       /* deepest surface: inputs, sticky col body */
+      --header-bg: #141b2d;        /* opaque sticky table-header fill */
+      --header-col-bg: #18203250;  /* unused direct; kept for reference */
+      --row-hover: #1b2432;        /* opaque row hover fill */
       --border-soft: rgba(148, 163, 184, 0.12);
+      --border-strong: rgba(148, 163, 184, 0.22);
       --ring: rgba(99, 102, 241, 0.55);
+      --text-muted: #94a3b8;
     }
 
     /* Subtle page backdrop: a soft radial glow behind the dark base so the
@@ -177,32 +186,147 @@
       }
     }
 
-    /* Sticky first (Subdomain) column: stays visible while the table scrolls
-       horizontally. Uses an opaque background so scrolled cells never bleed
-       through, and a higher z-index than ordinary scrolling cells. */
+    /* ----------------------------------------------------------------------
+       HEADER / BRAND — a professional security-tool identity.
+       --------------------------------------------------------------------- */
+    .app-header { display: flex; justify-content: center; }
+    .brand { display: flex; align-items: center; gap: 0.9rem; }
+    .brand-mark {
+      width: 3rem; height: 3rem;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.6rem; line-height: 1;
+      border-radius: 0.85rem;
+      background: linear-gradient(145deg, var(--accent) 0%, var(--accent-strong) 100%);
+      box-shadow: 0 10px 24px -10px rgba(79, 70, 229, 0.8),
+                  0 1px 0 rgba(255, 255, 255, 0.18) inset;
+    }
+    .brand-text { text-align: left; }
+    .brand-wordmark {
+      font-size: 1.9rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      line-height: 1.1;
+      color: #f8fafc;
+    }
+    .brand-tagline {
+      margin-top: 0.15rem;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      letter-spacing: 0.01em;
+    }
+    @media (max-width: 480px) {
+      .brand-wordmark { font-size: 1.5rem; }
+      .brand-tagline { font-size: 0.78rem; }
+      .brand-mark { width: 2.5rem; height: 2.5rem; font-size: 1.35rem; }
+    }
+
+    /* Segmented mode switch: the JS still swaps bg-brand-600/bg-transparent on
+       #modeSubdomains / #modeLookalike, so we only refine the shell + states.
+       The active tab reads as a raised brand pill inside a recessed track. */
+    [role="tablist"][aria-label="Recon mode"] {
+      background: var(--surface);
+      border-color: var(--border-soft);
+      box-shadow: 0 1px 0 rgba(255,255,255,0.03) inset,
+                  0 12px 30px -20px rgba(0,0,0,0.9);
+    }
+
+    /* ----------------------------------------------------------------------
+       DATA GRID — contained scroll region.
+       The table is wide (min-width 1024px) and result lists can run to
+       hundreds of rows. We put the table inside a single `.table-scroll`
+       element that scrolls on BOTH axes and is height-capped, so:
+         • horizontal overflow stays INSIDE the card and never pushes the page
+           sideways;
+         • the header and first column stick against THIS container (its own
+           scroll context), not the page, so they stay put reliably;
+         • long lists scroll vertically within the card instead of growing the
+           page without bound.
+       --------------------------------------------------------------------- */
+    .table-scroll {
+      overflow: auto;                 /* both axes, contained */
+      max-height: min(70vh, 640px);   /* vertical scroll for long lists */
+      overscroll-behavior: contain;   /* don't chain scroll to the page */
+      -webkit-overflow-scrolling: touch;
+      border-radius: 0.75rem;         /* match the card's rounded-xl */
+    }
+    /* Thin, themed scrollbars so the scroll region looks intentional. */
+    .table-scroll { scrollbar-width: thin; scrollbar-color: #334155 transparent; }
+    .table-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+    .table-scroll::-webkit-scrollbar-track { background: transparent; }
+    .table-scroll::-webkit-scrollbar-thumb {
+      background-color: #334155; border-radius: 9999px;
+      border: 2px solid var(--surface);
+    }
+    .table-scroll::-webkit-scrollbar-thumb:hover { background-color: #475569; }
+
+    /* The table fills the scroll container; cell padding/typography are refined
+       for a readable modern grid. */
+    .table-scroll table { width: 100%; }
+    .table-scroll thead th {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    /* Sticky header row: every <th> sticks to the TOP of the scroll container.
+       Opaque fill (no semi-transparent gray) so scrolled body rows never bleed
+       through. A hairline bottom border keeps it visually separated. */
+    .table-scroll thead th {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background-color: var(--header-bg);
+      box-shadow: inset 0 -1px 0 var(--border-strong);
+    }
+
+    /* Sticky first column: stays visible during horizontal scroll. Opaque fill
+       for header AND body variants so columns never bleed through. */
     .sticky-col {
       position: sticky;
       left: 0;
-      background-color: #0f1523; /* matches --surface table/header */
-      z-index: 20;
+      z-index: 10;                 /* above normal body cells */
+      background-color: var(--surface-3);
     }
-    /* Body-cell variant: solid even over the semi-transparent row hover tint. */
-    td.sticky-col { background-color: #0b1120; } /* opaque row bg */
-    tr:hover > td.sticky-col { background-color: #1b2432; } /* opaque hover match */
-    /* Top-left corner (sticky header AND sticky column) must sit above both. */
-    th.sticky-col { z-index: 30; }
+    td.sticky-col { background-color: var(--surface-3); }  /* opaque row bg */
+    /* Row hover must repaint the sticky cell too, else it shows the old fill. */
+    tr:hover > td.sticky-col { background-color: var(--row-hover); }
+    /* Zebra rows: keep the sticky cell opaque over the faint zebra tint. */
+    #lookalikeResultsTable tr:nth-child(odd) > td.sticky-col { background-color: #0d1424; }
+    /* Top-left corner is BOTH a sticky header and a sticky column → highest. */
+    th.sticky-col { z-index: 30; background-color: var(--header-bg); }
+    /* A subtle right edge on the sticky column signals it's pinned. */
+    .sticky-col::after {
+      content: "";
+      position: absolute;
+      top: 0; right: 0; bottom: 0;
+      width: 1px;
+      background: var(--border-soft);
+      pointer-events: none;
+    }
+
+    /* Narrow viewports: the scroll region keeps the layout from breaking —
+       the card never exceeds the viewport width; users swipe within it. */
+    @media (max-width: 640px) {
+      .table-scroll { max-height: min(64vh, 520px); }
+    }
   </style>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
   <div class="max-w-6xl mx-auto px-4 py-8">
 
-    <!-- Header -->
-    <header class="text-center mb-8">
-      <div class="text-5xl mb-3" aria-hidden="true">🛡️🔍</div>
-      <h1 class="text-4xl font-extrabold bg-gradient-to-r from-indigo-400 via-sky-400 to-emerald-400 bg-clip-text text-transparent">
-        ReconGuard Pro
-      </h1>
-      <p class="text-gray-400 mt-3">Subdomain Enumeration, Takeover Risk &amp; Lookalike Domain Recon</p>
+    <!-- Header: crisp wordmark + tagline. The shield glyph sits in a rounded
+         accent tile (brand mark) next to the ReconGuard Pro wordmark for a
+         professional security-tool identity. -->
+    <header class="app-header mb-8">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">🛡</div>
+        <div class="brand-text">
+          <h1 class="brand-wordmark">ReconGuard&nbsp;Pro</h1>
+          <p class="brand-tagline">Subdomain enumeration, takeover risk &amp; lookalike domain recon</p>
+        </div>
+      </div>
     </header>
 
     <!-- Mode switch: Subdomains (default) | Lookalike Domains. Toggling these
@@ -395,20 +519,24 @@
         <span><span class="bg-violet-500 text-white font-semibold px-1.5 py-0.5 rounded">PERM</span> permutation hit (active)</span>
       </div>
 
-      <!-- Results table -->
-      <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto">
+      <!-- Results table. The card is the scroll context (.table-scroll): it
+           scrolls on both axes and is height-capped, so the header and the
+           Subdomain column stick against it (see <style>). The per-<th> sticky
+           utility classes were removed — stickiness is handled centrally in CSS
+           with opaque fills so nothing bleeds through during scroll. -->
+      <div class="bg-gray-900 border border-gray-800 rounded-xl table-scroll">
         <table class="w-full min-w-[1024px] text-sm">
           <thead>
-            <tr class="text-gray-400 text-left border-b border-gray-800">
-              <th class="sortable sticky-col py-3 px-3 whitespace-nowrap sticky top-0 z-10" data-sort="subdomain">Subdomain</th>
-              <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">IP Addresses</th>
-              <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">CNAME</th>
-              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="dns_status">DNS</th>
-              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="http_status">HTTP</th>
-              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="https_status">HTTPS</th>
-              <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Sources</th>
-              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="takeover_risk">Risk / Verdict</th>
-              <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="alive">Live</th>
+            <tr class="text-left">
+              <th class="sortable sticky-col py-3 px-3 whitespace-nowrap" data-sort="subdomain">Subdomain</th>
+              <th class="py-3 px-3 whitespace-nowrap">IP Addresses</th>
+              <th class="py-3 px-3 whitespace-nowrap">CNAME</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap" data-sort="dns_status">DNS</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap" data-sort="http_status">HTTP</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap" data-sort="https_status">HTTPS</th>
+              <th class="py-3 px-3 whitespace-nowrap">Sources</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap" data-sort="takeover_risk">Risk / Verdict</th>
+              <th class="sortable py-3 px-3 whitespace-nowrap" data-sort="alive">Live</th>
             </tr>
           </thead>
           <tbody id="resultsTable"></tbody>
@@ -501,20 +629,20 @@
             class="ml-auto bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
         </div>
 
-        <!-- Results table -->
-        <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto">
+        <!-- Results table — same contained scroll region as the subdomain grid. -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl table-scroll">
           <table class="w-full min-w-[1024px] text-sm">
             <thead>
-              <tr class="text-gray-400 text-left border-b border-gray-800">
-                <th class="sortable sticky-col py-3 px-3 whitespace-nowrap sticky top-0 z-10" data-sort="candidate">Candidate</th>
-                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Technique</th>
-                <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="dns_status">DNS</th>
-                <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="http_status">HTTP</th>
-                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Title</th>
-                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">MX</th>
-                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Registered</th>
-                <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="risk">Risk</th>
-                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10">Action</th>
+              <tr class="text-left">
+                <th class="sortable sticky-col py-3 px-3 whitespace-nowrap" data-sort="candidate">Candidate</th>
+                <th class="py-3 px-3 whitespace-nowrap">Technique</th>
+                <th class="sortable py-3 px-3 whitespace-nowrap" data-sort="dns_status">DNS</th>
+                <th class="sortable py-3 px-3 whitespace-nowrap" data-sort="http_status">HTTP</th>
+                <th class="py-3 px-3 whitespace-nowrap">Title</th>
+                <th class="py-3 px-3 whitespace-nowrap">MX</th>
+                <th class="py-3 px-3 whitespace-nowrap">Registered</th>
+                <th class="sortable py-3 px-3 whitespace-nowrap" data-sort="risk">Risk</th>
+                <th class="py-3 px-3 whitespace-nowrap">Action</th>
               </tr>
             </thead>
             <tbody id="lookalikeResultsTable"></tbody>
@@ -540,6 +668,6 @@
   <!-- ?v= is a cache-buster: bump it whenever app.js changes so browsers
        re-fetch instead of running a stale cached copy (which previously left
        the mode switch / buttons dead after an update). -->
-  <script src="/app.js?v=5"></script>
+  <script src="/app.js?v=6"></script>
 </body>
 </html>
