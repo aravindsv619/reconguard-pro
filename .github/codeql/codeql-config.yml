@@ -1,18 +1,18 @@
 # CodeQL configuration for ReconGuard Pro.
 #
-# Scope SAST to the APPLICATION code. Test files legitimately use membership
-# checks like `assert "brand-co.com" in generated_set` and
-# `assert "<text>" in evidence_message`, which CodeQL's "incomplete URL
-# substring sanitization" query flags as false positives — they are test
-# assertions on in-memory values, not URL/host sanitization. Scanning the real
-# runtime code (main.py) keeps the alerts meaningful.
+# Scope SAST to the APPLICATION code by EXCLUDING test/support directories.
+# Test files legitimately use membership checks like
+# `assert "brand-co.com" in generated_set` and `assert "<text>" in evidence`,
+# which CodeQL's "incomplete URL substring sanitization" query reports as false
+# positives — they are assertions on in-memory values, not URL/host
+# sanitization. Excluding tests/ keeps the alerts meaningful for the runtime
+# code (main.py).
+#
+# NOTE: CodeQL `paths`/`paths-ignore` entries must be DIRECTORIES (globs), not
+# individual files. We therefore use paths-ignore to drop the test/support
+# dirs rather than naming main.py directly.
 name: "ReconGuard Pro CodeQL config"
-
-paths:
-  - main.py
-  - static
 
 paths-ignore:
   - tests
   - wordlists
-  - .github
