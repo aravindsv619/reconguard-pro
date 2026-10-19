@@ -32,6 +32,9 @@ jobs:
         uses: github/codeql-action/init@v3
         with:
           languages: python
+          # Scope analysis to application code (main.py, static/); exclude
+          # tests/ where membership-check assertions produce false positives.
+          config-file: ./.github/codeql/codeql-config.yml
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v3
