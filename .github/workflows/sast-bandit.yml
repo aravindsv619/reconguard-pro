@@ -1,0 +1,37 @@
+name: SAST (Bandit)
+
+# Static application security testing with Bandit. Scans the application source
+# for medium+ severity issues (-ll). Intentional, reviewed findings are
+# annotated inline with `# nosec <id>` and a justification, so this job catches
+# only NEW unreviewed issues. Runs on push/PR to the default branch and weekly.
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bandit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Bandit
+        run: python -m pip install --upgrade pip bandit==1.9.4
+
+      - name: Run Bandit (medium+ severity)
+        # Scan the application module; tests and the virtualenv are not source.
+        run: bandit -r main.py -ll

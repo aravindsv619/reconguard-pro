@@ -1,0 +1,47 @@
+# Pre-commit hooks for ReconGuard Pro.
+#
+# Install once:  .venv/bin/pip install -r requirements-dev.txt && pre-commit install
+# Run on demand: pre-commit run --all-files
+#
+# The full pytest suite is deliberately NOT a pre-commit hook (too slow for a
+# per-commit gate); CI runs the tests. These hooks keep credentials out of
+# history, enforce basic file hygiene, lint/format Python with ruff, and do a
+# fast syntax (AST) check so a broken file never lands.
+#
+# Pinned rev/versions keep hook behaviour reproducible.
+
+minimum_pre_commit_version: "3.5.0"
+
+repos:
+  # --- Secret scanning: stop credentials from being committed. ---
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        name: detect-secrets (block new credentials)
+        args: ["--baseline", ".secrets.baseline"]
+        # Never scan the virtualenv, VCS internals, caches, or the large
+        # generated wordlist (no secrets, just slows the hook down).
+        exclude: ^(\.venv/|\.git/|.*__pycache__/|\.pytest_cache/|wordlists/default\.txt)
+
+  # --- Basic file hygiene. ---
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+        args: ["--maxkb=2048"]
+      - id: check-yaml
+      - id: check-json
+      - id: check-ast   # fast Python syntax/AST check (not the test suite)
+
+  # --- Python lint (ruff). Rules/config live in ruff.toml; autofix safe
+  # issues. ruff-format is intentionally NOT enabled so the hook does not
+  # reformat the existing hand-authored style on every commit. ---
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.1
+    hooks:
+      - id: ruff
+        name: ruff (lint, autofix)
+        args: ["--fix"]

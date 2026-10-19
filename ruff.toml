@@ -1,0 +1,17 @@
+# Ruff configuration for ReconGuard Pro.
+#
+# Intentionally minimal: it enforces correctness and import hygiene without
+# churning the existing code style. Line length (E501) is left unenforced so
+# the many long explanatory docstrings/comments already in the tree do not
+# turn every commit red; real problems (undefined names, unused imports,
+# unsorted imports, obvious bugs) are still caught.
+target-version = "py311"
+line-length = 100
+
+[lint]
+# E/W  — pycodestyle errors & warnings
+# F    — pyflakes (undefined names, unused imports, etc.)
+# I    — import sorting
+select = ["E", "F", "W", "I"]
+# E501 (line too long) is informational here and would flag existing comments.
+ignore = ["E501"]

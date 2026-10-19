@@ -6,7 +6,6 @@ the CNAME socket fallback.
 """
 
 import httpx
-import pytest
 import respx
 
 import main

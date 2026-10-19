@@ -17,8 +17,6 @@ target no longer leaks into A/MX/NS/TXT/SOA.
 
 import subprocess
 
-import pytest
-
 import main
 
 

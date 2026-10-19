@@ -1,0 +1,40 @@
+name: Dependency audit (pip-audit)
+
+# Scans the pinned runtime and dev dependencies for known vulnerabilities with
+# pip-audit. Fails the build if any advisory is found, so a vulnerable pin can
+# never merge unnoticed. Runs on every push/PR to the default branch plus a
+# weekly schedule to catch advisories published after a dependency was pinned.
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+  schedule:
+    # Weekly, Monday 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pip-audit
+        run: python -m pip install --upgrade pip pip-audit==2.10.1
+
+      - name: Audit runtime dependencies (requirements.txt)
+        run: pip-audit -r requirements.txt
+
+      - name: Audit dev dependencies (requirements-dev.txt)
+        run: pip-audit -r requirements-dev.txt

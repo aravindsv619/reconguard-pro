@@ -7,7 +7,6 @@ derived resolved boolean, and that cname_chain captures a multi-hop chain
 whose first element equals the single-hop cname.
 """
 
-import pytest
 
 import main
 

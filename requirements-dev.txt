@@ -1,5 +1,21 @@
 # Development/test-only dependencies (not required to run the app).
 # Install with: .venv/bin/pip install -r requirements-dev.txt
+#
+# After installing, enable the git hooks once:
+#   pre-commit install
+
+# Test suite
 pytest==9.1.1
 pytest-asyncio==1.4.0
 respx==0.23.1
+
+# Lint / format
+ruff==0.17.1
+
+# Pre-commit framework + secret scanner used by the hooks
+pre-commit==4.7.0
+detect-secrets==1.5.0
+
+# Security scanners (also run in CI)
+bandit==1.9.4
+pip-audit==2.10.1

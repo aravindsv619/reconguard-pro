@@ -20,6 +20,28 @@ c99) only add extra subdomain sources and are never required.
 - **Tests:** 308 automated tests.
 - **Packaging:** multi-stage Docker image (non-root), docker-compose, and a
   GitHub Actions workflow that publishes to GHCR.
+- **Security tooling:** `pre-commit` hooks (detect-secrets, ruff, file hygiene,
+  AST check) locally, plus a CI security pipeline (see below).
+
+## Security CI/CD pipeline
+
+Beyond the tests, GitHub Actions enforces three automated security gates. All
+new workflows pin action versions, use least-privilege `permissions`, and run
+on push/PR to the default branch (dependency/SAST also run on a weekly cron):
+
+- **Dependency check** — `pip-audit` scans the pinned runtime and dev
+  requirements and fails on any known advisory (`dependency-audit.yml`).
+- **SAST** — `bandit` (`sast-bandit.yml`) for pattern-based issues plus GitHub
+  **CodeQL** (`codeql.yml`) for semantic/dataflow analysis of the Python
+  source. The single intentional `verify=False` on the probe-only HTTP client
+  (needed to probe targets that serve expired/self-signed certs; no credentials
+  are ever sent on it) is annotated `# nosec B501` with a justification, so the
+  job catches only new, unreviewed findings.
+- **DAST** — OWASP ZAP baseline (`dast-zap.yml`) runs against an **ephemeral**
+  instance that the workflow builds and starts inside the CI runner
+  (`SUBRECON_HOST=0.0.0.0`, `http://localhost:8080`). It is **non-blocking** and
+  never targets a deployed/production instance; rule tuning lives in
+  `.zap/rules.tsv`.
 
 ## Security posture
 

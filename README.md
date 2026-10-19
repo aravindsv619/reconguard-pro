@@ -175,6 +175,51 @@ parsing, and the key-optional SecurityTrails/Shodan skip), the three
 `check_takeover` branches plus A-record PTR matching and the socket CNAME
 fallback, the job state machine and cleanup, and the API/CSV contract.
 
+### Pre-commit hooks
+
+A [`pre-commit`](https://pre-commit.com/) config (`.pre-commit-config.yaml`)
+runs fast local checks before every commit. Enable it once after installing the
+dev dependencies:
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/pre-commit install
+```
+
+The hooks are:
+
+- **detect-secrets** — blocks new credentials from being committed (a
+  `.secrets.baseline` acknowledges the existing documentation placeholders and
+  test fixtures, which are not real secrets).
+- **Basic hygiene** — trailing-whitespace, end-of-file-fixer,
+  check-added-large-files, check-yaml, check-json.
+- **check-ast** — a fast Python syntax check (the full pytest suite is
+  intentionally NOT a pre-commit hook; CI runs the tests).
+- **ruff** — Python lint with autofix (rules in `ruff.toml`; line length is not
+  enforced so existing long comments do not block commits).
+
+Run everything on demand with `.venv/bin/pre-commit run --all-files`.
+
+### Security CI (dependency / SAST / DAST)
+
+GitHub Actions runs the security pipeline in addition to the GHCR image build:
+
+- **Dependency audit** (`dependency-audit.yml`) — `pip-audit` against
+  `requirements.txt` and `requirements-dev.txt` on push/PR and a weekly
+  schedule; fails on any known vulnerability.
+- **SAST** — `bandit` (`sast-bandit.yml`, medium+ severity) and GitHub
+  **CodeQL** (`codeql.yml`, Python) on push/PR and weekly. Intentional,
+  reviewed Bandit findings are annotated inline with `# nosec` + a
+  justification so only new unreviewed issues fail the job.
+- **DAST** (`dast-zap.yml`) — builds the Docker image, starts an **ephemeral**
+  instance on `localhost:8080` in the runner (`SUBRECON_HOST=0.0.0.0`), and runs
+  the OWASP ZAP baseline scan against it. The scan is **non-blocking** (reports
+  findings without hard-failing) and runs only against the throwaway CI
+  instance — never against a deployed/production target. Rule tuning lives in
+  `.zap/rules.tsv`.
+
+See [SECURITY.md](SECURITY.md) for the full posture.
+
 ## Takeover risk tiers
 
 Each subdomain is scored into one of five tiers. Ordered most to least severe:

@@ -1,0 +1,39 @@
+name: SAST (CodeQL)
+
+# GitHub CodeQL semantic analysis for Python. Complements Bandit with deeper
+# dataflow/taint analysis. Results surface in the repository's Security ->
+# Code scanning alerts tab. Runs on push/PR to the default branch and weekly.
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: CodeQL analyze (python)
+    runs-on: ubuntu-latest
+    permissions:
+      # Least privilege: only what CodeQL needs to read code and upload alerts.
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"

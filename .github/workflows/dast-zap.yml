@@ -1,0 +1,72 @@
+name: DAST (OWASP ZAP baseline)
+
+# Dynamic application security testing. Builds the ReconGuard Pro Docker image,
+# starts an EPHEMERAL instance on localhost in the runner (SUBRECON_HOST set so
+# the container is reachable on the mapped port), then runs the OWASP ZAP
+# baseline scan against it.
+#
+# IMPORTANT: this scans a throwaway instance spun up inside the CI runner only.
+# It NEVER touches a production or deployed instance. The baseline scan is
+# passive (spider + passive rules, no active attacks) and is configured
+# NON-BLOCKING (fail_action: false) so informational alerts report findings
+# without hard-failing the pipeline; a tuned rules file (.zap/rules.tsv) can
+# downgrade specific noisy rules.
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zap-baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t reconguard-pro:ci .
+
+      - name: Start ephemeral app on localhost:8080
+        run: |
+          docker run -d --name reconguard-ci \
+            -e SUBRECON_HOST=0.0.0.0 \
+            -p 8080:8080 \
+            reconguard-pro:ci
+
+      - name: Wait for /health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health >/dev/null 2>&1; then
+              echo "App is up."
+              exit 0
+            fi
+            echo "Waiting for app... ($i)"
+            sleep 2
+          done
+          echo "App did not become healthy in time; dumping logs." >&2
+          docker logs reconguard-ci || true
+          exit 1
+
+      - name: OWASP ZAP baseline scan (non-blocking)
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: "http://localhost:8080"
+          # Tuned rule thresholds (ignore/warn) live here; the file is created
+          # with no overrides so the scan reports every alert as a warning.
+          rules_file_name: ".zap/rules.tsv"
+          # Non-blocking: report findings, do not hard-fail on informational
+          # alerts (this is a passive baseline, not a gating control).
+          fail_action: false
+          # Do not open/update GitHub issues (keeps least-privilege perms;
+          # the HTML/MD reports are uploaded as a build artifact instead).
+          allow_issue_writing: false
+
+      - name: Stop ephemeral app
+        if: always()
+        run: docker rm -f reconguard-ci || true

@@ -7,10 +7,8 @@ exposes an in-memory job API plus a single-file dark-themed frontend.
 
 import asyncio
 import csv
-import html
 import io
 import ipaddress
-import json
 import logging
 import os
 import re
@@ -3551,7 +3549,13 @@ async def lifespan(app: FastAPI):
         headers={"User-Agent": USER_AGENT},
         follow_redirects=False,
         timeout=HTTP_PROBE_TIMEOUT,
-        verify=False,
+        # nosec B501 — INTENTIONAL: this probe-only client disables TLS
+        # verification because target subdomains routinely serve expired or
+        # self-signed certs that must still be probed for liveness/takeover
+        # fingerprints. No credentials are ever sent on this client (keys go
+        # only through app.state.client with verify=True), and probes connect
+        # to a pre-validated pinned public IP behind the SSRF guard.
+        verify=False,  # nosec B501
     )
     cleanup_task = asyncio.create_task(_periodic_cleanup())
     try:

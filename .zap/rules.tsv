@@ -1,0 +1,11 @@
+# OWASP ZAP baseline rule tuning for ReconGuard Pro (DAST).
+#
+# Tab-separated: <ruleId> <TAB> <threshold> <TAB> <optional comment>
+# threshold is one of: IGNORE | WARN | FAIL
+#
+# With no overrides below, every triggered rule is reported as a WARNing and
+# the job stays non-blocking (see fail_action: false in dast-zap.yml). Add a
+# line here to downgrade a known-false-positive rule to IGNORE, or to promote a
+# rule you want to gate on to FAIL. Example (commented out):
+#
+# 10096	IGNORE	Timestamp disclosure — not sensitive for this local tool
