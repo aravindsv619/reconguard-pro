@@ -726,7 +726,7 @@ async def test_dangling_cname_without_a_record_cloudfront_vulnerable(monkeypatch
 # verdicted (not CloudFront-only). A resolving ELB target -> NOT_VULNERABLE.
 async def test_dangling_cname_without_a_record_elb_kept_and_verdicted(monkeypatch):
     async def fake_resolve_dns_detailed(host):
-        if host.endswith("elb.amazonaws.com"):
+        if host == "internal-lb.us-east-1.elb.amazonaws.com":
             return ["52.1.2.3"], "RESOLVED"
         return [], "NO_ANSWER"
 
@@ -743,7 +743,7 @@ async def test_dangling_cname_without_a_record_elb_kept_and_verdicted(monkeypatc
         # The ELB target refuses the bare probe (empty-message timeout) and must
         # NOT swallow the verdict. The subdomain's own probe (no A record) just
         # returns no status.
-        if host.endswith("elb.amazonaws.com"):
+        if host == "internal-lb.us-east-1.elb.amazonaws.com":
             raise asyncio.TimeoutError()
         return None, None, ""
 
