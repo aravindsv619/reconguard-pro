@@ -10,14 +10,172 @@
        (default-src 'self'; script-src 'self') with no third-party origins. -->
   <link rel="stylesheet" href="/tailwind.css">
   <style>
+    /* ----------------------------------------------------------------------
+       Modern theme layer (CSP-safe: style-src allows 'unsafe-inline').
+       This refines the look of the vendored utility classes WITHOUT renaming
+       any class the JS depends on — it layers a cohesive accent, elevation,
+       focus rings, zebra rows, and badge polish on top of them. No new
+       third-party origins; no CDN. Dark theme kept, made to feel current.
+       --------------------------------------------------------------------- */
+
+    /* Design tokens. --accent drives the brand highlight across the UI. */
+    :root {
+      --accent: #6366f1;
+      --accent-strong: #4f46e5;
+      --accent-soft: rgba(99, 102, 241, 0.16);
+      --surface: #0f1523;
+      --surface-2: #131a2b;
+      --border-soft: rgba(148, 163, 184, 0.12);
+      --ring: rgba(99, 102, 241, 0.55);
+    }
+
+    /* Subtle page backdrop: a soft radial glow behind the dark base so the
+       flat #030712 body reads as depth rather than a void. */
+    body {
+      background-color: #070b14;
+      background-image:
+        radial-gradient(900px 500px at 50% -10%, rgba(99, 102, 241, 0.10), transparent 60%),
+        radial-gradient(700px 400px at 100% 0%, rgba(56, 189, 248, 0.06), transparent 55%);
+      background-attachment: fixed;
+      -webkit-font-smoothing: antialiased;
+      letter-spacing: 0.01em;
+    }
+
+    /* Card surfaces: refine the vendored bg-gray-900 panels with a cohesive
+       surface color, softer borders and layered elevation. Applies to the
+       scan/progress/results section cards and summary cards. */
+    section.bg-gray-900,
+    .bg-gray-900.rounded-xl {
+      background-color: var(--surface);
+      border-color: var(--border-soft);
+      box-shadow: 0 1px 0 rgba(255, 255, 255, 0.02) inset,
+                  0 10px 30px -18px rgba(0, 0, 0, 0.9);
+    }
+
+    /* Summary cards lift slightly on hover for a tactile, current feel. */
+    .grid .bg-gray-900.rounded-xl {
+      transition: transform 150ms ease, box-shadow 150ms ease, border-color 150ms ease;
+    }
+    .grid .bg-gray-900.rounded-xl:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 14px 34px -18px rgba(0, 0, 0, 0.95);
+    }
+
+    /* Header title: a touch more presence and smoother gradient weight. */
+    h1.bg-gradient-to-r { letter-spacing: -0.02em; }
+
+    /* Mode switch (segmented control). The JS swaps the exact utility strings
+       bg-brand-600/bg-transparent on these buttons; we only polish them. */
+    #modeSubdomains, #modeLookalike {
+      transition: background-color 150ms ease, color 150ms ease, box-shadow 150ms ease;
+    }
+    #modeSubdomains.bg-brand-600, #modeLookalike.bg-brand-600 {
+      box-shadow: 0 6px 16px -8px var(--accent-strong);
+    }
+    #modeSubdomains.bg-transparent:hover, #modeLookalike.bg-transparent:hover {
+      color: #e5e7eb;
+      background-color: rgba(148, 163, 184, 0.08);
+    }
+
+    /* Primary / secondary buttons: smooth transitions + clear press feedback.
+       Covers Start Scan, Find Lookalikes, Download CSV, Cancel, filters. */
+    button { transition: background-color 150ms ease, color 150ms ease,
+             box-shadow 150ms ease, transform 100ms ease; }
+    button:not(:disabled):active { transform: translateY(1px); }
+    button.bg-brand-600:not(:disabled):hover { box-shadow: 0 8px 20px -10px var(--accent-strong); }
+    button:disabled { opacity: 0.55; }
+
+    /* Filter chips (filter-btn / lookalike-filter-btn): subtle hover for the
+       inactive state so the active brand chip stands out. */
+    .filter-btn.bg-gray-800:hover,
+    .lookalike-filter-btn.bg-gray-800:hover {
+      background-color: #273145;
+      color: #e5e7eb;
+    }
+
+    /* Form controls: inputs/selects/textarea get a cohesive surface, soft
+       border and a visible accent focus ring (also improves accessibility). */
+    input[type="text"], input[type="password"], textarea, select {
+      background-color: var(--surface-2);
+      border-color: rgba(148, 163, 184, 0.16);
+      transition: border-color 150ms ease, box-shadow 150ms ease;
+    }
+    input[type="text"]:hover, input[type="password"]:hover,
+    textarea:hover, select:hover {
+      border-color: rgba(148, 163, 184, 0.28);
+    }
+    input:focus, textarea:focus, select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+      outline: none;
+    }
+
+    /* Accessibility: a visible keyboard focus outline on every interactive
+       element (buttons, checkboxes, sortable headers, toggles). Mouse users
+       don't see it thanks to :focus-visible. */
+    a:focus-visible, button:focus-visible, input:focus-visible,
+    select:focus-visible, textarea:focus-visible,
+    th.sortable:focus-visible, [tabindex]:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+      border-radius: 6px;
+    }
+
     .progress-stripes {
       background-image: linear-gradient(45deg, rgba(255,255,255,0.15) 25%, transparent 25%, transparent 50%, rgba(255,255,255,0.15) 50%, rgba(255,255,255,0.15) 75%, transparent 75%, transparent);
       background-size: 1rem 1rem;
       animation: stripe 1s linear infinite;
     }
     @keyframes stripe { from { background-position: 1rem 0; } to { background-position: 0 0; } }
-    th.sortable { cursor: pointer; user-select: none; }
+    th.sortable { cursor: pointer; user-select: none; transition: color 120ms ease; }
     th.sortable:hover { color: #a5b4fc; }
+
+    /* Results table polish: rounded container already supplied by the vendored
+       rounded-xl; here we add zebra striping, a smoother row hover, and a
+       refined sticky header so the table reads as a modern data grid. */
+    /* Lookalike table: one row per candidate, so classic odd-row zebra works.
+       Subdomain table interleaves a hidden records row after each data row, so
+       zebra by nth-child would misalign; instead we give the data rows (which
+       carry .animate-fadein) a faint base tint and rely on row hover for
+       separation — still a clean, modern grid without mis-striping. */
+    #lookalikeResultsTable tr:nth-child(odd) {
+      background-color: rgba(148, 163, 184, 0.03);
+    }
+    #resultsTable tr.animate-fadein {
+      background-color: rgba(148, 163, 184, 0.015);
+    }
+    /* Reinforce row hover AFTER the zebra rules (and at >= their specificity)
+       so hovering always wins over the base tint — keeps the interactive feel
+       the vendored .hover:bg-gray-800/40 provides. */
+    #resultsTable tr.animate-fadein:hover,
+    #lookalikeResultsTable tr:hover {
+      background-color: rgba(31, 41, 55, 0.5);
+    }
+    thead th { backdrop-filter: saturate(1.2); }
+    tbody tr { transition: background-color 120ms ease; }
+
+    /* Risk / verdict badges: slightly bolder, rounded, with a soft glow so
+       severity reads at a glance. The JS still emits the whitelisted bg-*
+       classes; this only refines their shape/weight. */
+    td span[class*="bg-red-"], td span[class*="bg-amber-"],
+    td span[class*="bg-orange-"], td span[class*="bg-emerald-"],
+    td span[class*="bg-sky-"], td span[class*="bg-violet-"],
+    td span[class*="bg-gray-5"], td span[class*="bg-gray-6"] {
+      letter-spacing: 0.03em;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+    }
+
+    /* Footer: quieter, with a hairline divider for separation. */
+    footer { border-top: 1px solid var(--border-soft); padding-top: 1.25rem; }
+
+    /* Respect reduced-motion preferences (accessibility). */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+      }
+    }
 
     /* Sticky first (Subdomain) column: stays visible while the table scrolls
        horizontally. Uses an opaque background so scrolled cells never bleed
@@ -25,11 +183,11 @@
     .sticky-col {
       position: sticky;
       left: 0;
-      background-color: #111827; /* bg-gray-900 — matches table/header */
+      background-color: #0f1523; /* matches --surface table/header */
       z-index: 20;
     }
     /* Body-cell variant: solid even over the semi-transparent row hover tint. */
-    td.sticky-col { background-color: #0b1220; } /* ~bg-gray-950, opaque row bg */
+    td.sticky-col { background-color: #0b1120; } /* opaque row bg */
     tr:hover > td.sticky-col { background-color: #1b2432; } /* opaque hover match */
     /* Top-left corner (sticky header AND sticky column) must sit above both. */
     th.sticky-col { z-index: 30; }
@@ -39,12 +197,12 @@
   <div class="max-w-6xl mx-auto px-4 py-8">
 
     <!-- Header -->
-    <header class="text-center mb-10">
-      <div class="text-5xl mb-2">🛡️🔍</div>
+    <header class="text-center mb-8">
+      <div class="text-5xl mb-3" aria-hidden="true">🛡️🔍</div>
       <h1 class="text-4xl font-extrabold bg-gradient-to-r from-indigo-400 via-sky-400 to-emerald-400 bg-clip-text text-transparent">
         ReconGuard Pro
       </h1>
-      <p class="text-gray-400 mt-2">Subdomain Enumeration, Takeover Risk &amp; Lookalike Domain Recon</p>
+      <p class="text-gray-400 mt-3">Subdomain Enumeration, Takeover Risk &amp; Lookalike Domain Recon</p>
     </header>
 
     <!-- Mode switch: Subdomains (default) | Lookalike Domains. Toggling these
@@ -52,18 +210,14 @@
          app.js (wired with addEventListener — no inline handlers). Subdomains is
          active by default so existing behavior is byte-for-byte unchanged. -->
     <div class="flex justify-center mb-8">
-      <div class="inline-flex bg-gray-900 border border-gray-800 rounded-xl p-1">
-        <button id="modeSubdomains"
+      <div class="inline-flex bg-gray-900 border border-gray-800 rounded-xl p-1 gap-1" role="tablist" aria-label="Recon mode">
+        <button id="modeSubdomains" type="button" role="tab" aria-selected="true"
           class="px-5 py-2 rounded-lg text-sm font-semibold bg-brand-600 text-white">
           Subdomains
         </button>
-        <button id="modeLookalike"
+        <button id="modeLookalike" type="button" role="tab" aria-selected="false"
           class="px-5 py-2 rounded-lg text-sm font-semibold bg-transparent text-gray-300">
           Lookalike Domains
-        </button>
-        <button id="modeBreach"
-          class="px-5 py-2 rounded-lg text-sm font-semibold bg-transparent text-gray-300">
-          Breach Exposure
         </button>
       </div>
     </div>
@@ -75,9 +229,9 @@
     <!-- Scan Form -->
     <section class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg">
       <div class="flex flex-col sm:flex-row gap-3">
-        <input id="domainInput" type="text" placeholder="target.com" autocomplete="off"
+        <input id="domainInput" type="text" placeholder="target.com" autocomplete="off" aria-label="Target domain"
           class="flex-1 bg-gray-950 border border-gray-700 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-brand-500" />
-        <button id="startBtn"
+        <button id="startBtn" type="button"
           class="bg-brand-600 hover:bg-brand-700 transition-colors px-6 py-3 rounded-lg font-semibold text-white">
           Start Scan
         </button>
@@ -85,8 +239,9 @@
       <p id="domainError" class="text-red-400 text-sm mt-2 hidden">Please enter a valid domain (e.g. example.com).</p>
 
       <div class="mt-4">
-        <button id="advToggleBtn" class="text-sm text-gray-400 hover:text-gray-200">
-          <span id="advChevron">▸</span> Advanced Options
+        <button id="advToggleBtn" type="button" aria-expanded="false" aria-controls="advancedPanel"
+          class="text-sm text-gray-400 hover:text-gray-200">
+          <span id="advChevron" aria-hidden="true">▸</span> Advanced Options
         </button>
         <div id="advancedPanel" class="hidden mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div>
@@ -145,7 +300,7 @@
     <section id="progressPanel" class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg hidden">
       <div class="flex items-center justify-between mb-3">
         <h2 class="text-lg font-semibold">Scanning…</h2>
-        <button id="cancelBtn" class="text-sm text-red-400 hover:text-red-300 border border-red-500/40 rounded px-3 py-1">Cancel</button>
+        <button id="cancelBtn" type="button" class="text-sm text-red-400 hover:text-red-300 border border-red-500/40 rounded px-3 py-1">Cancel</button>
       </div>
       <div class="w-full bg-gray-800 rounded-full h-4 overflow-hidden mb-2">
         <div id="progressBar" class="progress-stripes bg-brand-600 h-4 rounded-full transition-all duration-500" style="width:0%"></div>
@@ -168,9 +323,9 @@
     <section id="resultsPanel" class="hidden">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-2xl font-bold">Results for <span id="resultDomain" class="text-brand-400"></span></h2>
-        <button id="downloadBtn"
+        <button id="downloadBtn" type="button"
           class="bg-emerald-600 hover:bg-emerald-700 transition-colors px-5 py-2.5 rounded-lg font-semibold text-white flex items-center gap-2">
-          ⬇ Download CSV
+          <span aria-hidden="true">⬇</span> Download CSV
         </button>
       </div>
 
@@ -221,16 +376,16 @@
 
       <!-- Filters -->
       <div class="flex flex-wrap items-center gap-2 mb-4">
-        <div class="flex flex-wrap gap-2" id="filterBtns">
-          <button data-filter="all" class="filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm">All</button>
-          <button data-filter="vulnerable" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Vulnerable</button>
-          <button data-filter="alive" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Alive Only</button>
-          <button data-filter="high" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">HIGH Risk</button>
-          <button data-filter="verify" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Verify</button>
-          <button data-filter="medium" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">MEDIUM Risk</button>
-          <button data-filter="unresolved" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Unresolved</button>
+        <div class="flex flex-wrap gap-2" id="filterBtns" role="group" aria-label="Filter results">
+          <button type="button" data-filter="all" class="filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm">All</button>
+          <button type="button" data-filter="vulnerable" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Vulnerable</button>
+          <button type="button" data-filter="alive" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Alive Only</button>
+          <button type="button" data-filter="high" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">HIGH Risk</button>
+          <button type="button" data-filter="verify" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Verify</button>
+          <button type="button" data-filter="medium" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">MEDIUM Risk</button>
+          <button type="button" data-filter="unresolved" class="filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Unresolved</button>
         </div>
-        <input id="searchInput" type="text" placeholder="Search subdomains…"
+        <input id="searchInput" type="text" placeholder="Search subdomains…" aria-label="Search subdomains"
           class="ml-auto bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
       </div>
 
@@ -273,9 +428,9 @@
       <!-- Lookalike scan form -->
       <section class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg">
         <div class="flex flex-col sm:flex-row gap-3">
-          <input id="lookalikeDomainInput" type="text" placeholder="target.com" autocomplete="off"
+          <input id="lookalikeDomainInput" type="text" placeholder="target.com" autocomplete="off" aria-label="Target domain"
             class="flex-1 bg-gray-950 border border-gray-700 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-brand-500" />
-          <button id="findLookalikesBtn"
+          <button id="findLookalikesBtn" type="button"
             class="bg-brand-600 hover:bg-brand-700 transition-colors px-6 py-3 rounded-lg font-semibold text-white">
             Find Lookalikes
           </button>
@@ -295,7 +450,7 @@
       <section id="lookalikeProgressPanel" class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg hidden">
         <div class="flex items-center justify-between mb-3">
           <h2 class="text-lg font-semibold">Finding lookalikes…</h2>
-          <button id="lookalikeCancelBtn" class="text-sm text-red-400 hover:text-red-300 border border-red-500/40 rounded px-3 py-1">Cancel</button>
+          <button id="lookalikeCancelBtn" type="button" class="text-sm text-red-400 hover:text-red-300 border border-red-500/40 rounded px-3 py-1">Cancel</button>
         </div>
         <div class="w-full bg-gray-800 rounded-full h-4 overflow-hidden mb-2">
           <div id="lookalikeProgressBar" class="progress-stripes bg-brand-600 h-4 rounded-full transition-all duration-500" style="width:0%"></div>
@@ -307,9 +462,9 @@
       <section id="lookalikeResultsPanel" class="hidden">
         <div class="flex items-center justify-between mb-4">
           <h2 class="text-2xl font-bold">Lookalikes for <span id="lookalikeResultDomain" class="text-brand-400"></span></h2>
-          <button id="lookalikeDownloadBtn"
+          <button id="lookalikeDownloadBtn" type="button"
             class="bg-emerald-600 hover:bg-emerald-700 transition-colors px-5 py-2.5 rounded-lg font-semibold text-white flex items-center gap-2">
-            ⬇ Download CSV
+            <span aria-hidden="true">⬇</span> Download CSV
           </button>
         </div>
 
@@ -335,14 +490,14 @@
 
         <!-- Filters -->
         <div class="flex flex-wrap items-center gap-2 mb-4">
-          <div class="flex flex-wrap gap-2" id="lookalikeFilterBtns">
-            <button data-filter="all" class="lookalike-filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm">All</button>
-            <button data-filter="live" class="lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Registered/Live</button>
-            <button data-filter="high" class="lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">HIGH Risk</button>
-            <button data-filter="medium" class="lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">MEDIUM Risk</button>
-            <button data-filter="available" class="lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Available</button>
+          <div class="flex flex-wrap gap-2" id="lookalikeFilterBtns" role="group" aria-label="Filter candidates">
+            <button type="button" data-filter="all" class="lookalike-filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm">All</button>
+            <button type="button" data-filter="live" class="lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Registered/Live</button>
+            <button type="button" data-filter="high" class="lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">HIGH Risk</button>
+            <button type="button" data-filter="medium" class="lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">MEDIUM Risk</button>
+            <button type="button" data-filter="available" class="lookalike-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Available</button>
           </div>
-          <input id="lookalikeSearchInput" type="text" placeholder="Search candidates…"
+          <input id="lookalikeSearchInput" type="text" placeholder="Search candidates…" aria-label="Search candidates"
             class="ml-auto bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
         </div>
 
@@ -370,127 +525,6 @@
 
     </div><!-- /#lookalikeMode -->
 
-    <!-- Breach Exposure mode (hidden by default). Drives the FEAT-001 API:
-         POST /api/breach {domain, emails, names}, GET /api/breach/status|
-         results|download/{id}. Keyless checks via XposedOrNot; coverage is
-         limited to discovered/supplied addresses. All interactivity is wired
-         in app.js via addEventListener — no inline <script>, no inline on*
-         handlers. Breach data is attacker-influenced PII, so app.js renders
-         every dynamic value XSS-safe (escapeHtml/statusCell/textContent). -->
-    <div id="breachMode" class="hidden">
-
-      <!-- Breach check form -->
-      <section class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg">
-        <div class="flex flex-col sm:flex-row gap-3">
-          <input id="breachDomainInput" type="text" placeholder="target.com" autocomplete="off"
-            class="flex-1 bg-gray-950 border border-gray-700 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-brand-500" />
-          <button id="checkBreachBtn"
-            class="bg-brand-600 hover:bg-brand-700 transition-colors px-6 py-3 rounded-lg font-semibold text-white">
-            Check Breach Exposure
-          </button>
-        </div>
-        <p id="breachDomainError" class="text-red-400 text-sm mt-2 hidden">Please enter a valid domain (e.g. example.com).</p>
-
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4">
-          <div>
-            <label class="block text-xs text-gray-500 mb-1">Known emails (optional, one per line)</label>
-            <textarea id="breachEmails" rows="4"
-              placeholder="alice@target.com&#10;bob@target.com"
-              class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-500"></textarea>
-          </div>
-          <div>
-            <label class="block text-xs text-gray-500 mb-1">Employee names (optional, one per line) — used to generate &amp; verify likely addresses</label>
-            <textarea id="breachNames" rows="4"
-              placeholder="Alice Smith&#10;Bob Jones"
-              class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-500"></textarea>
-          </div>
-        </div>
-
-        <p class="text-amber-400 text-xs mt-3">
-          ⚠️ Keyless check via XposedOrNot. Coverage limited to discovered/supplied addresses — not an exhaustive domain report. Handle results as sensitive PII; authorized use only.
-        </p>
-      </section>
-
-      <!-- Breach progress panel -->
-      <section id="breachProgressPanel" class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg hidden">
-        <div class="flex items-center justify-between mb-3">
-          <h2 class="text-lg font-semibold">Checking breach exposure…</h2>
-          <button id="breachCancelBtn" class="text-sm text-red-400 hover:text-red-300 border border-red-500/40 rounded px-3 py-1">Cancel</button>
-        </div>
-        <div class="w-full bg-gray-800 rounded-full h-4 overflow-hidden mb-2">
-          <div id="breachProgressBar" class="progress-stripes bg-brand-600 h-4 rounded-full transition-all duration-500" style="width:0%"></div>
-        </div>
-        <p id="breachProgressText" class="text-sm text-gray-400">0 emails discovered, 0 checked, 0 exposed</p>
-      </section>
-
-      <!-- Breach results dashboard -->
-      <section id="breachResultsPanel" class="hidden">
-        <div class="flex items-center justify-between mb-4">
-          <h2 class="text-2xl font-bold">Breach exposure for <span id="breachResultDomain" class="text-brand-400"></span></h2>
-          <button id="breachDownloadBtn"
-            class="bg-emerald-600 hover:bg-emerald-700 transition-colors px-5 py-2.5 rounded-lg font-semibold text-white flex items-center gap-2">
-            ⬇ Download CSV
-          </button>
-        </div>
-
-        <!-- Coverage-note banner (filled via textContent from the API). -->
-        <div class="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 mb-6">
-          <p id="breachCoverageNote" class="text-amber-300 text-xs"></p>
-        </div>
-
-        <!-- Summary cards -->
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-          <div class="bg-gray-900 border border-blue-500/30 rounded-xl p-4">
-            <div class="text-3xl font-bold text-blue-400" id="breachCardChecked">0</div>
-            <div class="text-xs text-gray-400 mt-1">Emails Checked</div>
-          </div>
-          <div class="bg-gray-900 border border-red-500/30 rounded-xl p-4">
-            <div class="text-3xl font-bold text-red-400" id="breachCardExposed">0</div>
-            <div class="text-xs text-gray-400 mt-1">Exposed</div>
-          </div>
-          <div class="bg-gray-900 border border-orange-500/30 rounded-xl p-4">
-            <div class="text-3xl font-bold text-orange-400" id="breachCardBreaches">0</div>
-            <div class="text-xs text-gray-400 mt-1">Breaches</div>
-          </div>
-          <div class="bg-gray-900 border border-red-600/40 rounded-xl p-4">
-            <div class="text-3xl font-bold text-red-500" id="breachCardHigh">0</div>
-            <div class="text-xs text-gray-400 mt-1">High-Risk</div>
-          </div>
-        </div>
-
-        <!-- Filters -->
-        <div class="flex flex-wrap items-center gap-2 mb-4">
-          <div class="flex flex-wrap gap-2" id="breachFilterBtns">
-            <button data-filter="all" class="breach-filter-btn bg-brand-600 text-white px-3 py-1.5 rounded-lg text-sm">All</button>
-            <button data-filter="high" class="breach-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">High</button>
-            <button data-filter="medium" class="breach-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Medium</button>
-            <button data-filter="low" class="breach-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Low</button>
-            <button data-filter="exposed" class="breach-filter-btn bg-gray-800 text-gray-300 px-3 py-1.5 rounded-lg text-sm">Exposed</button>
-          </div>
-          <input id="breachSearchInput" type="text" placeholder="Search emails…"
-            class="ml-auto bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
-        </div>
-
-        <!-- Results table -->
-        <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-x-auto">
-          <table class="w-full min-w-[1024px] text-sm">
-            <thead>
-              <tr class="text-gray-400 text-left border-b border-gray-800">
-                <th class="sortable sticky-col py-3 px-3 whitespace-nowrap sticky top-0 z-10" data-sort="email">Email</th>
-                <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="breaches">Breaches</th>
-                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="exposed_data">Exposed Data</th>
-                <th class="sortable py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="risk">Risk</th>
-                <th class="py-3 px-3 whitespace-nowrap sticky top-0 bg-gray-900 z-10" data-sort="source">Source</th>
-              </tr>
-            </thead>
-            <tbody id="breachResultsTable"></tbody>
-          </table>
-          <p id="breachEmptyRow" class="text-center text-gray-500 py-6 hidden">No emails match the current filter.</p>
-        </div>
-      </section>
-
-    </div><!-- /#breachMode -->
-
     <!-- Footer -->
     <footer class="text-center text-xs text-gray-600 mt-12">
       ⚠️ For authorized security testing only. Unauthorized use is illegal.
@@ -506,6 +540,6 @@
   <!-- ?v= is a cache-buster: bump it whenever app.js changes so browsers
        re-fetch instead of running a stale cached copy (which previously left
        the mode switch / buttons dead after an update). -->
-  <script src="/app.js?v=4"></script>
+  <script src="/app.js?v=5"></script>
 </body>
 </html>
