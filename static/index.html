@@ -4,6 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ReconGuard Pro</title>
+  <!-- Favicon served from the same origin by the StaticFiles mount (/favicon.svg).
+       Kept as a local asset (not a data: URI) so index.html carries no http(s)
+       origin string; the CSP allows img-src 'self'. This removes the former
+       /favicon.ico 404 seen in the server logs. -->
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <!-- Tailwind utilities are vendored locally (static/tailwind.css) instead of
        the former Tailwind CDN runtime script. This keeps the app fully offline
        and lets the server's Content-Security-Policy stay strict
@@ -11,70 +16,204 @@
   <link rel="stylesheet" href="/tailwind.css">
   <style>
     /* ----------------------------------------------------------------------
-       Modern theme layer (CSP-safe: style-src allows 'unsafe-inline').
-       This refines the look of the vendored utility classes WITHOUT renaming
-       any class the JS depends on — it layers a cohesive accent, elevation,
-       focus rings, zebra rows, and badge polish on top of them. No new
-       third-party origins; no CDN. Dark theme kept, made to feel current.
+       ReconGuard Pro — professional dark theme layer (CSP-safe: style-src
+       allows 'unsafe-inline'). All styling here layers on top of the vendored
+       utility classes WITHOUT renaming any class/ID the JS depends on. No CDN,
+       no third-party origin. A single cohesive design system: layered
+       near-black surfaces, one indigo accent, text contrast tiers, consistent
+       radius/spacing, subtle elevation, and tasteful short transitions.
        --------------------------------------------------------------------- */
 
-    /* Design tokens. --accent drives the brand highlight across the UI.
-       The surface/elevation/border tokens give every card and the data grid a
-       single, cohesive palette so the dark theme reads as a polished product
-       rather than a set of mismatched panels. */
     :root {
+      /* Accent (brand) — one cohesive indigo/violet used for primary actions,
+         active states and focus rings. */
       --accent: #6366f1;
       --accent-strong: #4f46e5;
+      --accent-bright: #818cf8;
       --accent-soft: rgba(99, 102, 241, 0.16);
-      --surface: #0f1523;
-      --surface-2: #131a2b;
-      --surface-3: #0b1120;       /* deepest surface: inputs, sticky col body */
-      --header-bg: #141b2d;        /* opaque sticky table-header fill */
-      --header-col-bg: #18203250;  /* unused direct; kept for reference */
-      --row-hover: #1b2432;        /* opaque row hover fill */
+
+      /* Layered surfaces: base page -> cards -> inputs/sticky body. */
+      --bg-base: #070a12;
+      --surface: #0f1522;        /* card surface */
+      --surface-2: #131a2a;      /* raised controls / segmented track */
+      --surface-3: #0b1120;      /* deepest: inputs, sticky column body */
+      --header-bg: #141b2d;      /* opaque sticky table-header fill */
+      --row-hover: #1b2432;      /* opaque row hover fill */
+
+      /* Borders + hairlines. */
       --border-soft: rgba(148, 163, 184, 0.12);
       --border-strong: rgba(148, 163, 184, 0.22);
+
+      /* Focus ring + text tiers. */
       --ring: rgba(99, 102, 241, 0.55);
+      --text-primary: #f1f5f9;
+      --text-secondary: #cbd5e1;
       --text-muted: #94a3b8;
+
+      --radius: 0.75rem;
     }
 
-    /* Subtle page backdrop: a soft radial glow behind the dark base so the
-       flat #030712 body reads as depth rather than a void. */
+    /* Page backdrop: a soft radial glow over the layered near-black base so the
+       app reads as depth rather than a flat void. */
     body {
-      background-color: #070b14;
+      background-color: var(--bg-base);
       background-image:
-        radial-gradient(900px 500px at 50% -10%, rgba(99, 102, 241, 0.10), transparent 60%),
-        radial-gradient(700px 400px at 100% 0%, rgba(56, 189, 248, 0.06), transparent 55%);
+        radial-gradient(1100px 560px at 50% -12%, rgba(99, 102, 241, 0.14), transparent 62%),
+        radial-gradient(760px 420px at 100% 0%, rgba(56, 189, 248, 0.07), transparent 58%);
       background-attachment: fixed;
       -webkit-font-smoothing: antialiased;
+      color: var(--text-secondary);
       letter-spacing: 0.01em;
     }
 
-    /* Card surfaces: refine the vendored bg-gray-900 panels with a cohesive
-       surface color, softer borders and layered elevation. Applies to the
-       scan/progress/results section cards and summary cards. */
+    /* ----------------------------------------------------------------------
+       APP SHELL — a real sticky top bar spanning the width, reading as product
+       chrome (brand + tagline left, "authorized use only" pill right).
+       --------------------------------------------------------------------- */
+    .app-topbar {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: rgba(10, 14, 22, 0.82);
+      -webkit-backdrop-filter: saturate(1.4) blur(10px);
+      backdrop-filter: saturate(1.4) blur(10px);
+      border-bottom: 1px solid var(--border-soft);
+      box-shadow: 0 8px 26px -22px rgba(0, 0, 0, 0.95);
+    }
+    .app-topbar-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0.85rem 1.25rem;
+    }
+    .brand { display: flex; align-items: center; gap: 0.8rem; min-width: 0; }
+    .brand-mark {
+      width: 2.6rem; height: 2.6rem; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      border-radius: 0.7rem;
+      background: linear-gradient(145deg, var(--accent) 0%, var(--accent-strong) 100%);
+      box-shadow: 0 8px 20px -10px rgba(79, 70, 229, 0.85),
+                  0 1px 0 rgba(255, 255, 255, 0.2) inset;
+    }
+    .brand-mark svg { width: 1.45rem; height: 1.45rem; display: block; }
+    .brand-text { min-width: 0; }
+    .brand-wordmark {
+      font-size: 1.25rem; font-weight: 800; letter-spacing: -0.01em;
+      line-height: 1.1; color: var(--text-primary); white-space: nowrap;
+    }
+    .brand-tagline {
+      margin-top: 0.1rem; font-size: 0.78rem; color: var(--text-muted);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .auth-pill {
+      display: inline-flex; align-items: center; gap: 0.4rem; flex-shrink: 0;
+      font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em;
+      color: #fbbf24;
+      padding: 0.35rem 0.7rem; border-radius: 9999px;
+      background: rgba(245, 158, 11, 0.1);
+      border: 1px solid rgba(245, 158, 11, 0.28);
+    }
+    .auth-pill .dot {
+      width: 0.42rem; height: 0.42rem; border-radius: 9999px;
+      background: #fbbf24; box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.18);
+    }
+    @media (max-width: 560px) {
+      .brand-tagline { display: none; }
+      .auth-pill .label-long { display: none; }
+    }
+
+    /* Centered content column. */
+    .shell { max-width: 1100px; margin: 0 auto; padding: 0 1.25rem; }
+
+    /* ----------------------------------------------------------------------
+       LANDING HERO — fills the former dead void with purposeful content when no
+       scan has run. Hidden by app.js once results render.
+       --------------------------------------------------------------------- */
+    .hero { text-align: center; padding: 2.5rem 0 0.5rem; }
+    .hero-eyebrow {
+      display: inline-block; font-size: 0.72rem; font-weight: 600;
+      letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent-bright);
+      padding: 0.3rem 0.75rem; border-radius: 9999px;
+      background: var(--accent-soft); border: 1px solid rgba(99, 102, 241, 0.28);
+    }
+    .hero-title {
+      margin-top: 1rem; font-size: 2.3rem; line-height: 1.12; font-weight: 800;
+      letter-spacing: -0.02em; color: var(--text-primary);
+    }
+    .hero-title .grad {
+      background: linear-gradient(90deg, var(--accent-bright), #38bdf8);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .hero-sub {
+      margin: 0.9rem auto 0; max-width: 640px; font-size: 1rem;
+      line-height: 1.6; color: var(--text-muted);
+    }
+    .steps {
+      display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1rem; margin: 2rem auto 0; max-width: 920px;
+    }
+    .step {
+      text-align: left; background: var(--surface);
+      border: 1px solid var(--border-soft); border-radius: var(--radius);
+      padding: 1.15rem 1.2rem;
+      box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset,
+                  0 16px 34px -26px rgba(0,0,0,0.9);
+      transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+    }
+    .step:hover {
+      transform: translateY(-3px); border-color: var(--border-strong);
+      box-shadow: 0 20px 40px -24px rgba(0,0,0,0.95);
+    }
+    .step-num {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 1.9rem; height: 1.9rem; border-radius: 0.6rem;
+      font-size: 0.85rem; font-weight: 700; color: #fff;
+      background: linear-gradient(145deg, var(--accent), var(--accent-strong));
+      box-shadow: 0 6px 16px -8px var(--accent-strong);
+    }
+    .step-title { margin-top: 0.7rem; font-weight: 700; color: var(--text-primary); font-size: 0.96rem; }
+    .step-desc { margin-top: 0.3rem; font-size: 0.85rem; line-height: 1.5; color: var(--text-muted); }
+    @media (max-width: 720px) {
+      .hero-title { font-size: 1.8rem; }
+      .steps { grid-template-columns: 1fr; }
+    }
+
+    /* ----------------------------------------------------------------------
+       CARDS / SURFACES — cohesive surface color, soft borders, layered depth
+       on the scan/progress/results section cards and summary cards.
+       --------------------------------------------------------------------- */
     section.bg-gray-900,
     .bg-gray-900.rounded-xl {
       background-color: var(--surface);
       border-color: var(--border-soft);
       box-shadow: 0 1px 0 rgba(255, 255, 255, 0.02) inset,
-                  0 10px 30px -18px rgba(0, 0, 0, 0.9);
+                  0 16px 36px -26px rgba(0, 0, 0, 0.92);
     }
-
-    /* Summary cards lift slightly on hover for a tactile, current feel. */
     .grid .bg-gray-900.rounded-xl {
       transition: transform 150ms ease, box-shadow 150ms ease, border-color 150ms ease;
     }
     .grid .bg-gray-900.rounded-xl:hover {
       transform: translateY(-2px);
-      box-shadow: 0 14px 34px -18px rgba(0, 0, 0, 0.95);
+      box-shadow: 0 20px 40px -24px rgba(0, 0, 0, 0.95);
     }
 
-    /* Header title: a touch more presence and smoother gradient weight. */
-    h1.bg-gradient-to-r { letter-spacing: -0.02em; }
+    /* Section titles. */
+    h2.text-2xl, h2.text-lg { color: var(--text-primary); }
 
-    /* Mode switch (segmented control). The JS swaps the exact utility strings
-       bg-brand-600/bg-transparent on these buttons; we only polish them. */
+    /* ----------------------------------------------------------------------
+       MODE SWITCH — refined segmented control sitting in a recessed track. The
+       JS swaps the exact utility strings bg-brand-600/bg-transparent on
+       #modeSubdomains / #modeLookalike, so only the shell + states are styled.
+       --------------------------------------------------------------------- */
+    [role="tablist"][aria-label="Recon mode"] {
+      background: var(--surface-2);
+      border-color: var(--border-soft);
+      box-shadow: 0 1px 0 rgba(255,255,255,0.03) inset,
+                  0 14px 30px -24px rgba(0,0,0,0.9);
+    }
     #modeSubdomains, #modeLookalike {
       transition: background-color 150ms ease, color 150ms ease, box-shadow 150ms ease;
     }
@@ -82,46 +221,48 @@
       box-shadow: 0 6px 16px -8px var(--accent-strong);
     }
     #modeSubdomains.bg-transparent:hover, #modeLookalike.bg-transparent:hover {
-      color: #e5e7eb;
+      color: var(--text-primary);
       background-color: rgba(148, 163, 184, 0.08);
     }
 
-    /* Primary / secondary buttons: smooth transitions + clear press feedback.
-       Covers Start Scan, Find Lookalikes, Download CSV, Cancel, filters. */
+    /* ----------------------------------------------------------------------
+       BUTTONS — smooth transitions + clear press feedback.
+       --------------------------------------------------------------------- */
     button { transition: background-color 150ms ease, color 150ms ease,
              box-shadow 150ms ease, transform 100ms ease; }
     button:not(:disabled):active { transform: translateY(1px); }
-    button.bg-brand-600:not(:disabled):hover { box-shadow: 0 8px 20px -10px var(--accent-strong); }
+    button.bg-brand-600:not(:disabled):hover { box-shadow: 0 10px 22px -10px var(--accent-strong); }
     button:disabled { opacity: 0.55; }
 
-    /* Filter chips (filter-btn / lookalike-filter-btn): subtle hover for the
-       inactive state so the active brand chip stands out. */
+    /* Filter chips: subtle hover for the inactive state so the active chip
+       (bg-brand-600 via JS) clearly stands out. */
     .filter-btn.bg-gray-800:hover,
     .lookalike-filter-btn.bg-gray-800:hover {
-      background-color: #273145;
-      color: #e5e7eb;
+      background-color: #273145; color: var(--text-primary);
     }
 
-    /* Form controls: inputs/selects/textarea get a cohesive surface, soft
-       border and a visible accent focus ring (also improves accessibility). */
+    /* ----------------------------------------------------------------------
+       FORM CONTROLS — cohesive surface, soft border, visible accent focus ring.
+       --------------------------------------------------------------------- */
     input[type="text"], input[type="password"], textarea, select {
-      background-color: var(--surface-2);
+      background-color: var(--surface-3);
       border-color: rgba(148, 163, 184, 0.16);
+      color: var(--text-primary);
       transition: border-color 150ms ease, box-shadow 150ms ease;
     }
     input[type="text"]:hover, input[type="password"]:hover,
-    textarea:hover, select:hover {
-      border-color: rgba(148, 163, 184, 0.28);
-    }
+    textarea:hover, select:hover { border-color: rgba(148, 163, 184, 0.3); }
     input:focus, textarea:focus, select:focus {
       border-color: var(--accent);
       box-shadow: 0 0 0 3px var(--accent-soft);
       outline: none;
     }
 
+    /* Advanced Options disclosure: a proper chevron that rotates when open. */
+    #advChevron { display: inline-block; transition: transform 160ms ease; }
+
     /* Accessibility: a visible keyboard focus outline on every interactive
-       element (buttons, checkboxes, sortable headers, toggles). Mouse users
-       don't see it thanks to :focus-visible. */
+       element. Mouse users don't see it thanks to :focus-visible. */
     a:focus-visible, button:focus-visible, input:focus-visible,
     select:focus-visible, textarea:focus-visible,
     th.sortable:focus-visible, [tabindex]:focus-visible {
@@ -137,35 +278,30 @@
     }
     @keyframes stripe { from { background-position: 1rem 0; } to { background-position: 0 0; } }
     th.sortable { cursor: pointer; user-select: none; transition: color 120ms ease; }
-    th.sortable:hover { color: #a5b4fc; }
+    th.sortable:hover { color: var(--accent-bright); }
 
-    /* Results table polish: rounded container already supplied by the vendored
-       rounded-xl; here we add zebra striping, a smoother row hover, and a
-       refined sticky header so the table reads as a modern data grid. */
+    /* ----------------------------------------------------------------------
+       RESULTS TABLE — modern data grid: zebra/row separators, row hover,
+       refined sticky header.
+       --------------------------------------------------------------------- */
     /* Lookalike table: one row per candidate, so classic odd-row zebra works.
        Subdomain table interleaves a hidden records row after each data row, so
        zebra by nth-child would misalign; instead we give the data rows (which
-       carry .animate-fadein) a faint base tint and rely on row hover for
-       separation — still a clean, modern grid without mis-striping. */
+       carry .animate-fadein) a faint base tint and rely on row hover. */
     #lookalikeResultsTable tr:nth-child(odd) {
       background-color: rgba(148, 163, 184, 0.03);
     }
     #resultsTable tr.animate-fadein {
       background-color: rgba(148, 163, 184, 0.015);
     }
-    /* Reinforce row hover AFTER the zebra rules (and at >= their specificity)
-       so hovering always wins over the base tint — keeps the interactive feel
-       the vendored .hover:bg-gray-800/40 provides. */
     #resultsTable tr.animate-fadein:hover,
     #lookalikeResultsTable tr:hover {
       background-color: rgba(31, 41, 55, 0.5);
     }
-    thead th { backdrop-filter: saturate(1.2); }
     tbody tr { transition: background-color 120ms ease; }
 
-    /* Risk / verdict badges: slightly bolder, rounded, with a soft glow so
-       severity reads at a glance. The JS still emits the whitelisted bg-*
-       classes; this only refines their shape/weight. */
+    /* Risk / verdict badges: slightly bolder, with a soft shadow so severity
+       reads at a glance. The JS emits the whitelisted bg-* classes. */
     td span[class*="bg-red-"], td span[class*="bg-amber-"],
     td span[class*="bg-orange-"], td span[class*="bg-emerald-"],
     td span[class*="bg-sky-"], td span[class*="bg-violet-"],
@@ -174,8 +310,8 @@
       box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
     }
 
-    /* Footer: quieter, with a hairline divider for separation. */
-    footer { border-top: 1px solid var(--border-soft); padding-top: 1.25rem; }
+    /* Footer within the shell. */
+    footer { border-top: 1px solid var(--border-soft); padding-top: 1.25rem; color: var(--text-muted); }
 
     /* Respect reduced-motion preferences (accessibility). */
     @media (prefers-reduced-motion: reduce) {
@@ -187,69 +323,20 @@
     }
 
     /* ----------------------------------------------------------------------
-       HEADER / BRAND — a professional security-tool identity.
-       --------------------------------------------------------------------- */
-    .app-header { display: flex; justify-content: center; }
-    .brand { display: flex; align-items: center; gap: 0.9rem; }
-    .brand-mark {
-      width: 3rem; height: 3rem;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 1.6rem; line-height: 1;
-      border-radius: 0.85rem;
-      background: linear-gradient(145deg, var(--accent) 0%, var(--accent-strong) 100%);
-      box-shadow: 0 10px 24px -10px rgba(79, 70, 229, 0.8),
-                  0 1px 0 rgba(255, 255, 255, 0.18) inset;
-    }
-    .brand-text { text-align: left; }
-    .brand-wordmark {
-      font-size: 1.9rem;
-      font-weight: 800;
-      letter-spacing: -0.02em;
-      line-height: 1.1;
-      color: #f8fafc;
-    }
-    .brand-tagline {
-      margin-top: 0.15rem;
-      font-size: 0.85rem;
-      color: var(--text-muted);
-      letter-spacing: 0.01em;
-    }
-    @media (max-width: 480px) {
-      .brand-wordmark { font-size: 1.5rem; }
-      .brand-tagline { font-size: 0.78rem; }
-      .brand-mark { width: 2.5rem; height: 2.5rem; font-size: 1.35rem; }
-    }
-
-    /* Segmented mode switch: the JS still swaps bg-brand-600/bg-transparent on
-       #modeSubdomains / #modeLookalike, so we only refine the shell + states.
-       The active tab reads as a raised brand pill inside a recessed track. */
-    [role="tablist"][aria-label="Recon mode"] {
-      background: var(--surface);
-      border-color: var(--border-soft);
-      box-shadow: 0 1px 0 rgba(255,255,255,0.03) inset,
-                  0 12px 30px -20px rgba(0,0,0,0.9);
-    }
-
-    /* ----------------------------------------------------------------------
-       DATA GRID — contained scroll region.
-       The table is wide (min-width 1024px) and result lists can run to
-       hundreds of rows. We put the table inside a single `.table-scroll`
-       element that scrolls on BOTH axes and is height-capped, so:
-         • horizontal overflow stays INSIDE the card and never pushes the page
-           sideways;
-         • the header and first column stick against THIS container (its own
-           scroll context), not the page, so they stay put reliably;
-         • long lists scroll vertically within the card instead of growing the
-           page without bound.
+       DATA GRID — contained scroll region (unchanged behavior from the fix the
+       user just approved). The table is wide (min-width 1024px) and lists can
+       run to hundreds of rows; a single `.table-scroll` element scrolls on both
+       axes and is height-capped, so horizontal overflow stays INSIDE the card,
+       the header + first column stick against THIS container, and long lists
+       scroll vertically within the card.
        --------------------------------------------------------------------- */
     .table-scroll {
-      overflow: auto;                 /* both axes, contained */
-      max-height: min(70vh, 640px);   /* vertical scroll for long lists */
-      overscroll-behavior: contain;   /* don't chain scroll to the page */
+      overflow: auto;
+      max-height: min(70vh, 640px);
+      overscroll-behavior: contain;
       -webkit-overflow-scrolling: touch;
-      border-radius: 0.75rem;         /* match the card's rounded-xl */
+      border-radius: var(--radius);
     }
-    /* Thin, themed scrollbars so the scroll region looks intentional. */
     .table-scroll { scrollbar-width: thin; scrollbar-color: #334155 transparent; }
     .table-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
     .table-scroll::-webkit-scrollbar-track { background: transparent; }
@@ -259,8 +346,6 @@
     }
     .table-scroll::-webkit-scrollbar-thumb:hover { background-color: #475569; }
 
-    /* The table fills the scroll container; cell padding/typography are refined
-       for a readable modern grid. */
     .table-scroll table { width: 100%; }
     .table-scroll thead th {
       font-size: 0.72rem;
@@ -270,9 +355,7 @@
       font-weight: 600;
     }
 
-    /* Sticky header row: every <th> sticks to the TOP of the scroll container.
-       Opaque fill (no semi-transparent gray) so scrolled body rows never bleed
-       through. A hairline bottom border keeps it visually separated. */
+    /* Sticky header row. Opaque fill so scrolled body rows never bleed through. */
     .table-scroll thead th {
       position: sticky;
       top: 0;
@@ -286,17 +369,13 @@
     .sticky-col {
       position: sticky;
       left: 0;
-      z-index: 10;                 /* above normal body cells */
+      z-index: 10;
       background-color: var(--surface-3);
     }
-    td.sticky-col { background-color: var(--surface-3); }  /* opaque row bg */
-    /* Row hover must repaint the sticky cell too, else it shows the old fill. */
+    td.sticky-col { background-color: var(--surface-3); }
     tr:hover > td.sticky-col { background-color: var(--row-hover); }
-    /* Zebra rows: keep the sticky cell opaque over the faint zebra tint. */
     #lookalikeResultsTable tr:nth-child(odd) > td.sticky-col { background-color: #0d1424; }
-    /* Top-left corner is BOTH a sticky header and a sticky column → highest. */
     th.sticky-col { z-index: 30; background-color: var(--header-bg); }
-    /* A subtle right edge on the sticky column signals it's pinned. */
     .sticky-col::after {
       content: "";
       position: absolute;
@@ -306,34 +385,45 @@
       pointer-events: none;
     }
 
-    /* Narrow viewports: the scroll region keeps the layout from breaking —
-       the card never exceeds the viewport width; users swipe within it. */
     @media (max-width: 640px) {
       .table-scroll { max-height: min(64vh, 520px); }
     }
   </style>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
-  <div class="max-w-6xl mx-auto px-4 py-8">
 
-    <!-- Header: crisp wordmark + tagline. The shield glyph sits in a rounded
-         accent tile (brand mark) next to the ReconGuard Pro wordmark for a
-         professional security-tool identity. -->
-    <header class="app-header mb-8">
+  <!-- ====================================================================
+       APP TOP BAR — product chrome spanning the full width.
+       ==================================================================== -->
+  <header class="app-topbar">
+    <div class="app-topbar-inner">
       <div class="brand">
-        <div class="brand-mark" aria-hidden="true">🛡</div>
+        <div class="brand-mark" aria-hidden="true">
+          <!-- Inline shield glyph (same-origin markup, no external asset). -->
+          <svg viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 2l7 3v6c0 4.5-3 8-7 11-4-3-7-6.5-7-11V5l7-3z"></path>
+            <path d="M9 12l2 2 4-4"></path>
+          </svg>
+        </div>
         <div class="brand-text">
-          <h1 class="brand-wordmark">ReconGuard&nbsp;Pro</h1>
-          <p class="brand-tagline">Subdomain enumeration, takeover risk &amp; lookalike domain recon</p>
+          <div class="brand-wordmark">ReconGuard&nbsp;Pro</div>
+          <div class="brand-tagline">External attack-surface recon — subdomains, takeover risk &amp; lookalike domains</div>
         </div>
       </div>
-    </header>
+      <span class="auth-pill" title="For authorized security testing only">
+        <span class="dot" aria-hidden="true"></span>
+        <span><span class="label-long">Authorized use </span>only</span>
+      </span>
+    </div>
+  </header>
+
+  <main class="shell py-8">
 
     <!-- Mode switch: Subdomains (default) | Lookalike Domains. Toggling these
          buttons shows/hides #subdomainMode / #lookalikeMode via switchMode() in
-         app.js (wired with addEventListener — no inline handlers). Subdomains is
-         active by default so existing behavior is byte-for-byte unchanged. -->
-    <div class="flex justify-center mb-8">
+         app.js (wired with addEventListener — no inline handlers). -->
+    <div class="flex justify-center mb-7">
       <div class="inline-flex bg-gray-900 border border-gray-800 rounded-xl p-1 gap-1" role="tablist" aria-label="Recon mode">
         <button id="modeSubdomains" type="button" role="tab" aria-selected="true"
           class="px-5 py-2 rounded-lg text-sm font-semibold bg-brand-600 text-white">
@@ -346,14 +436,44 @@
       </div>
     </div>
 
-    <!-- Subdomains mode (default-visible): the original scan form, progress
-         panel, and results dashboard are wrapped here untouched. -->
+    <!-- Subdomains mode (default-visible). -->
     <div id="subdomainMode">
 
+    <!-- Landing hero: shown until the first scan renders results. app.js hides
+         #landingHero once a scan starts/completes, so the page never looks
+         empty or unfinished. -->
+    <div id="landingHero" class="hero">
+      <span class="hero-eyebrow">Keyless OSINT recon</span>
+      <h1 class="hero-title">Map your <span class="grad">external attack surface</span></h1>
+      <p class="hero-sub">
+        Enumerate subdomains and flag subdomain-takeover risk, or hunt
+        lookalike domains built for phishing and impersonation. Everything runs
+        against public, keyless intelligence sources — no API keys required.
+      </p>
+      <div class="steps">
+        <div class="step">
+          <span class="step-num">1</span>
+          <div class="step-title">Enter a domain</div>
+          <div class="step-desc">Point ReconGuard at a domain you are authorized to assess, then pick a mode.</div>
+        </div>
+        <div class="step">
+          <span class="step-num">2</span>
+          <div class="step-title">Query 12+ sources</div>
+          <div class="step-desc">We fan out across certificate logs, passive DNS and OSINT APIs in parallel.</div>
+        </div>
+        <div class="step">
+          <span class="step-num">3</span>
+          <div class="step-title">Review the findings</div>
+          <div class="step-desc">Inspect resolved hosts, takeover verdicts and lookalike risk, then export CSV.</div>
+        </div>
+      </div>
+    </div>
+
     <!-- Scan Form -->
-    <section class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg">
+    <section class="bg-gray-900 border border-gray-800 rounded-xl p-6 mt-8 mb-8 shadow-lg">
+      <label for="domainInput" class="block text-sm font-semibold text-gray-200 mb-2">Target domain</label>
       <div class="flex flex-col sm:flex-row gap-3">
-        <input id="domainInput" type="text" placeholder="target.com" autocomplete="off" aria-label="Target domain"
+        <input id="domainInput" type="text" placeholder="example.com" autocomplete="off" aria-label="Target domain"
           class="flex-1 bg-gray-950 border border-gray-700 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-brand-500" />
         <button id="startBtn" type="button"
           class="bg-brand-600 hover:bg-brand-700 transition-colors px-6 py-3 rounded-lg font-semibold text-white">
@@ -364,8 +484,8 @@
 
       <div class="mt-4">
         <button id="advToggleBtn" type="button" aria-expanded="false" aria-controls="advancedPanel"
-          class="text-sm text-gray-400 hover:text-gray-200">
-          <span id="advChevron" aria-hidden="true">▸</span> Advanced Options
+          class="inline-flex items-center gap-1.5 text-sm text-gray-400 hover:text-gray-200">
+          <span id="advChevron" aria-hidden="true">▸</span> Advanced options
         </button>
         <div id="advancedPanel" class="hidden mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div>
@@ -521,9 +641,7 @@
 
       <!-- Results table. The card is the scroll context (.table-scroll): it
            scrolls on both axes and is height-capped, so the header and the
-           Subdomain column stick against it (see <style>). The per-<th> sticky
-           utility classes were removed — stickiness is handled centrally in CSS
-           with opaque fills so nothing bleeds through during scroll. -->
+           Subdomain column stick against it (see <style>). -->
       <div class="bg-gray-900 border border-gray-800 rounded-xl table-scroll">
         <table class="w-full min-w-[1024px] text-sm">
           <thead>
@@ -553,10 +671,40 @@
          addEventListener — no inline <script>, no inline on* handlers. -->
     <div id="lookalikeMode" class="hidden">
 
+      <!-- Lookalike landing hero (mirrors the subdomain hero for a consistent,
+           non-empty landing). Hidden by app.js once lookalike results render. -->
+      <div id="lookalikeHero" class="hero">
+        <span class="hero-eyebrow">Phishing &amp; impersonation recon</span>
+        <h1 class="hero-title">Find <span class="grad">lookalike domains</span> before attackers do</h1>
+        <p class="hero-sub">
+          Generate typosquat, homoglyph and combosquat variants of your domain,
+          then check which are registered, resolve, or serve a live site — so
+          you can spot impersonation and defensive-registration gaps.
+        </p>
+        <div class="steps">
+          <div class="step">
+            <span class="step-num">1</span>
+            <div class="step-title">Enter your domain</div>
+            <div class="step-desc">Provide the brand domain you want to protect from lookalike abuse.</div>
+          </div>
+          <div class="step">
+            <span class="step-num">2</span>
+            <div class="step-title">Generate variants</div>
+            <div class="step-desc">Keyless permutations across typo, homoglyph and combosquat techniques.</div>
+          </div>
+          <div class="step">
+            <span class="step-num">3</span>
+            <div class="step-title">Assess the risk</div>
+            <div class="step-desc">See DNS/HTTP, MX, registration and a risk verdict, then export CSV.</div>
+          </div>
+        </div>
+      </div>
+
       <!-- Lookalike scan form -->
-      <section class="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-8 shadow-lg">
+      <section class="bg-gray-900 border border-gray-800 rounded-xl p-6 mt-8 mb-8 shadow-lg">
+        <label for="lookalikeDomainInput" class="block text-sm font-semibold text-gray-200 mb-2">Your domain</label>
         <div class="flex flex-col sm:flex-row gap-3">
-          <input id="lookalikeDomainInput" type="text" placeholder="target.com" autocomplete="off" aria-label="Target domain"
+          <input id="lookalikeDomainInput" type="text" placeholder="example.com" autocomplete="off" aria-label="Target domain"
             class="flex-1 bg-gray-950 border border-gray-700 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-brand-500" />
           <button id="findLookalikesBtn" type="button"
             class="bg-brand-600 hover:bg-brand-700 transition-colors px-6 py-3 rounded-lg font-semibold text-white">
@@ -654,20 +802,18 @@
     </div><!-- /#lookalikeMode -->
 
     <!-- Footer -->
-    <footer class="text-center text-xs text-gray-600 mt-12">
+    <footer class="text-center text-xs text-gray-600 mt-12 pb-10">
       ⚠️ For authorized security testing only. Unauthorized use is illegal.
     </footer>
-  </div>
+  </main>
 
   <!-- The application JavaScript lives in an EXTERNAL file served from the
        same origin (/app.js via the StaticFiles mount). This satisfies the
        strict Content-Security-Policy (script-src 'self', no 'unsafe-inline'),
-       which blocks any inline script element entirely. Keeping the JS inline
-       here would be silently refused by the browser, leaving every button
-       dead. Do not inline the JS back into this file. -->
+       which blocks any inline script element entirely. Do not inline the JS
+       back into this file. -->
   <!-- ?v= is a cache-buster: bump it whenever app.js changes so browsers
-       re-fetch instead of running a stale cached copy (which previously left
-       the mode switch / buttons dead after an update). -->
-  <script src="/app.js?v=6"></script>
+       re-fetch instead of running a stale cached copy. -->
+  <script src="/app.js?v=7"></script>
 </body>
 </html>

@@ -68,6 +68,10 @@
       }
 
       document.getElementById('startBtn').disabled = true;
+      // Landing hero has served its purpose once a scan starts; hide it so the
+      // progress/results fill the space instead.
+      const hero = document.getElementById('landingHero');
+      if (hero) hero.classList.add('hidden');
       document.getElementById('resultsPanel').classList.add('hidden');
       document.getElementById('progressPanel').classList.remove('hidden');
       renderSourceTable({});
@@ -167,6 +171,8 @@
 
     function displayResults(data) {
       allResults = data.subdomains || [];
+      const hero = document.getElementById('landingHero');
+      if (hero) hero.classList.add('hidden');
       document.getElementById('progressPanel').classList.add('hidden');
       document.getElementById('resultsPanel').classList.remove('hidden');
       document.getElementById('startBtn').disabled = false;
@@ -480,6 +486,8 @@
       const body = { domain, check_whois };
 
       document.getElementById('findLookalikesBtn').disabled = true;
+      const lookHero = document.getElementById('lookalikeHero');
+      if (lookHero) lookHero.classList.add('hidden');
       document.getElementById('lookalikeResultsPanel').classList.add('hidden');
       document.getElementById('lookalikeProgressPanel').classList.remove('hidden');
       updateLookalikeProgress(0, 0, 0, 0);
@@ -552,6 +560,8 @@
 
     function displayLookalikeResults(data) {
       lookalikeResults = data.candidates || [];
+      const lookHero = document.getElementById('lookalikeHero');
+      if (lookHero) lookHero.classList.add('hidden');
       document.getElementById('lookalikeProgressPanel').classList.add('hidden');
       document.getElementById('lookalikeResultsPanel').classList.remove('hidden');
       document.getElementById('findLookalikesBtn').disabled = false;

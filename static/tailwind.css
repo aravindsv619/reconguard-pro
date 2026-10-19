@@ -107,6 +107,7 @@ textarea::placeholder {
 .block { display: block; }
 .inline-block { display: inline-block; }
 .flex { display: flex; }
+.inline-flex { display: inline-flex; }
 .grid { display: grid; }
 .hidden { display: none; }
 
@@ -124,6 +125,7 @@ textarea::placeholder {
 .grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
 .gap-1 { gap: 0.25rem; }
+.gap-1\.5 { gap: 0.375rem; }
 .gap-2 { gap: 0.5rem; }
 .gap-3 { gap: 0.75rem; }
 .gap-4 { gap: 1rem; }
@@ -162,6 +164,7 @@ textarea::placeholder {
 .mt-2 { margin-top: 0.5rem; }
 .mt-3 { margin-top: 0.75rem; }
 .mt-4 { margin-top: 1rem; }
+.mt-8 { margin-top: 2rem; }
 .mt-12 { margin-top: 3rem; }
 
 /* ------------------------------------------------------------------ */
@@ -184,6 +187,7 @@ textarea::placeholder {
 .py-6 { padding-top: 1.5rem; padding-bottom: 1.5rem; }
 .py-8 { padding-top: 2rem; padding-bottom: 2rem; }
 .pt-3 { padding-top: 0.75rem; }
+.pb-10 { padding-bottom: 2.5rem; }
 
 /* space-y-1 — vertical rhythm between stacked children */
 .space-y-1 > :not([hidden]) ~ :not([hidden]) {
