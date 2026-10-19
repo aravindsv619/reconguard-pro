@@ -237,6 +237,65 @@ def test_is_parked_signatures_and_empty_title():
     assert main._is_parked(None) is False        # no probe -> not parked
 
 
+def test_is_parked_marketplace_signatures():
+    # Expanded marketplace/for-sale markers.
+    assert main._is_parked("acmebrand.com - HugeDomains") is True
+    assert main._is_parked("Inquire about this domain") is True
+    assert main._is_parked("Make an Offer") is True
+    assert main._is_parked("The owner of this domain is in the Dan.com") is True
+    # Over-generic tokens must NOT false-positive on real sites.
+    assert main._is_parked("Summer Sale - 50% off shoes") is False
+    assert main._is_parked("We offer great service") is False
+
+
+def test_is_parked_by_body_slice():
+    # Title is just the domain name (not a signature) but the body carries the
+    # for-sale marker -> parked.
+    assert main._is_parked(
+        "acmebrand.com",
+        body="<html><body>This domain is for sale. Buy this domain.</body></html>",
+    ) is True
+    # A real brand-ish title with real body is NOT parked.
+    assert main._is_parked(
+        "Brand Co", body="<html><body>Welcome to our store</body></html>"
+    ) is False
+
+
+def test_is_parked_by_redirect_host():
+    # The STRONGEST signal: a 3xx Location host that is a known parking provider.
+    # Title is just the domain name and matches no signature on its own.
+    assert main._is_parked(
+        "acmebrand.com", redirect_hosts=["www.hugedomains.com"]
+    ) is True
+    assert main._is_parked("acmebrand.com", redirect_hosts=["sedo.com"]) is True
+    assert main._is_parked("foo.com", redirect_hosts=["dan.com"]) is True
+    assert main._is_parked("foo.com", redirect_hosts=["afternic.com"]) is True
+    # A non-parking redirect host is NOT a park signal.
+    assert main._is_parked("Brand Co", redirect_hosts=["www.example.com"]) is False
+
+
+def test_is_parking_host_dot_boundary_safe():
+    assert main._is_parking_host("hugedomains.com") is True
+    assert main._is_parking_host("www.hugedomains.com") is True
+    assert main._is_parking_host("sedoparking.com") is True
+    # Attacker lookalike must NOT match (dot-boundary-safe).
+    assert main._is_parking_host("hugedomains.com.evil.com") is False
+    assert main._is_parking_host("notsedo.com") is False
+    assert main._is_parking_host(None) is False
+    assert main._is_parking_host("") is False
+
+
+def test_host_from_url_parses_location():
+    assert main._host_from_url("https://www.hugedomains.com/buy/acmebrand.com") \
+        == "www.hugedomains.com"
+    assert main._host_from_url("//sedo.com/park") == "sedo.com"
+    assert main._host_from_url("dan.com/foo") == "dan.com"
+    # A relative Location has no host.
+    assert main._host_from_url("/relative/path") is None
+    assert main._host_from_url(None) is None
+    assert main._host_from_url("") is None
+
+
 def test_resembles_brand_label_containment():
     tokens = main._brand_tokens("brandco", "Brand Co")
     # Hyphen/dot variants normalize to contain the brand label.
@@ -272,11 +331,15 @@ def test_resembles_brand_by_content_token():
 async def _run_analyze(monkeypatch, *, ips, dns_status, http, https, body, mx,
                        check_whois=False, original_title=None,
                        candidate="brand-co.com", brand_label="brandco",
-                       brand_tokens=None):
+                       brand_tokens=None, redirect_host=None):
     async def fake_resolve(host):
         return ips, dns_status
 
-    async def fake_check_http(client, host, pinned_ip=None):
+    async def fake_check_http(client, host, pinned_ip=None, redirect_hosts=None):
+        # Populate the caller's redirect_hosts from a 3xx-shaped mock so the
+        # parked-via-redirect path can be exercised offline.
+        if redirect_hosts is not None and redirect_host is not None:
+            redirect_hosts.append(redirect_host)
         return http, https, body
 
     def fake_dig(host):
@@ -335,6 +398,82 @@ async def test_analyze_parked_not_high(monkeypatch):
     )
     assert res["resembles_original"] is False
     assert res["risk"] == "LOW"
+
+
+async def test_analyze_hugedomains_redirect_resembling_not_high(monkeypatch):
+    # acmebrand.com/acmebrand.net shape: resolves, 302 with Location to
+    # HugeDomains, title is just the domain name. The label resembles the brand
+    # -> must be MEDIUM (parked), NEVER HIGH.
+    res = await _run_analyze(
+        monkeypatch, ips=["93.184.216.34"], dns_status="RESOLVED",
+        http=302, https=None, body="<title>acmebrand.com</title>", mx=False,
+        candidate="innovationinc-acmebrand.com",
+        brand_label="acmebrand",
+        redirect_host="www.hugedomains.com",
+    )
+    assert res["resembles_original"] is True
+    assert res["risk"] == "MEDIUM"
+    assert res["risk"] != "HIGH"
+    assert "parked" in res["recommended_action"].lower() or \
+        "for-sale" in res["recommended_action"].lower()
+
+
+async def test_analyze_sedo_redirect_not_resembling_low(monkeypatch):
+    # A redirect to sedo.com on a non-resembling label -> parked -> LOW.
+    res = await _run_analyze(
+        monkeypatch, ips=["93.184.216.34"], dns_status="RESOLVED",
+        http=303, https=None, body="<title>acmebrand.com</title>", mx=False,
+        candidate="unrelated-xyz.com", brand_label="acmebrand",
+        redirect_host="sedo.com",
+    )
+    assert res["resembles_original"] is False
+    assert res["risk"] == "LOW"
+
+
+async def test_analyze_live_impersonation_still_high(monkeypatch):
+    # REGRESSION / don't over-suppress: a genuinely live brand-resembling site
+    # (200, real brand-like title, NO parking redirect, NOT a park signature)
+    # must still score HIGH.
+    res = await _run_analyze(
+        monkeypatch, ips=["93.184.216.34"], dns_status="RESOLVED",
+        http=200, https=None,
+        body="<title>Acme Brand - Login to your account</title>",
+        mx=False, candidate="innovation-incacmebrand.com",
+        brand_label="acmebrand",
+    )
+    assert res["resembles_original"] is True
+    assert res["risk"] == "HIGH"
+
+
+async def test_analyze_redirect_detection_is_header_only_no_extra_fetch(monkeypatch):
+    # SSRF regression: parked-via-redirect detection must NOT issue a new/
+    # unpinned request to the parking host. We assert check_http is invoked
+    # exactly ONCE (for the candidate) and never again for the redirect target.
+    calls = []
+
+    async def fake_resolve(host):
+        return ["93.184.216.34"], "RESOLVED"
+
+    async def fake_check_http(client, host, pinned_ip=None, redirect_hosts=None):
+        calls.append(host)
+        if redirect_hosts is not None:
+            redirect_hosts.append("www.hugedomains.com")
+        return 302, None, "<title>acmebrand.com</title>"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve)
+    monkeypatch.setattr(main, "check_http", fake_check_http)
+    monkeypatch.setattr(main, "_dig_records", lambda h: {})
+
+    import asyncio
+    res = await main.analyze_candidate(
+        None, None, "innovationinc-acmebrand.com", "lookalike", None, False,
+        asyncio.Semaphore(5), asyncio.Semaphore(5),
+        brand_label="acmebrand",
+    )
+    # Only the candidate itself was probed; no second fetch to hugedomains.com.
+    assert calls == ["innovationinc-acmebrand.com"]
+    assert "hugedomains.com" not in calls
+    assert res["risk"] != "HIGH"
 
 
 async def test_analyze_brand_tld_variant_high(monkeypatch):
@@ -498,7 +637,7 @@ async def test_job_completes_despite_rdap_error(monkeypatch):
     async def fake_resolve(host):
         return ["93.184.216.34"], "RESOLVED"
 
-    async def fake_check_http(client, host, pinned_ip=None):
+    async def fake_check_http(client, host, pinned_ip=None, redirect_hosts=None):
         return 200, None, "<title>x</title>"
 
     monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve)

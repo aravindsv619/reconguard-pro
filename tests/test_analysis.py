@@ -211,6 +211,43 @@ async def test_check_http_probes_both_schemes():
 
 
 @respx.mock
+async def test_check_http_captures_redirect_location_host_without_following():
+    # Parked-detection hook: a 3xx Location host is recorded into redirect_hosts
+    # by reading the response header ONLY — the redirect is NOT followed (the
+    # client keeps follow_redirects=False), so no request to the parking host is
+    # issued. Mock by the pinned-IP URL (same contract as the other probe tests).
+    pinned_ip = "93.184.216.34"
+    http_route = respx.get(f"http://{pinned_ip}").mock(
+        return_value=httpx.Response(
+            302,
+            text="",
+            headers={"Location": "https://www.hugedomains.com/buy/acmebrand.com"},
+        )
+    )
+    https_route = respx.get(f"https://{pinned_ip}").mock(
+        return_value=httpx.Response(
+            302,
+            text="",
+            headers={"Location": "https://www.hugedomains.com/buy/acmebrand.com"},
+        )
+    )
+    parking_route = respx.get("https://www.hugedomains.com/buy/acmebrand.com").mock(
+        return_value=httpx.Response(200, text="SHOULD NOT BE FETCHED")
+    )
+    redirect_hosts: list[str] = []
+    async with httpx.AsyncClient() as c:  # defaults to follow_redirects=False
+        http_status, https_status, body = await main.check_http(
+            c, "acmebrand.com", pinned_ip=pinned_ip, redirect_hosts=redirect_hosts
+        )
+    assert http_status == 302 and https_status == 302
+    assert http_route.called and https_route.called
+    # The redirect host was captured from the header.
+    assert "www.hugedomains.com" in redirect_hosts
+    # Crucially, the parking host was NEVER fetched (header-only detection).
+    assert not parking_route.called
+
+
+@respx.mock
 async def test_check_http_never_probes_without_pinned_ip():
     # Defense in depth: with no pinned IP, check_http must NOT hand the hostname
     # to httpx for independent resolution — it returns empties and makes no call.

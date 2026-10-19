@@ -484,6 +484,34 @@ Every candidate also carries a `recommended_action` string with a concrete next
 step appropriate to its tier (e.g. HIGH → investigate possible phishing/brand
 abuse and confirm ownership; AVAILABLE → consider defensive registration).
 
+#### Parked / for-sale detection (not HIGH)
+
+Many brand-resembling lookalikes are simply **parked or listed for sale** on a
+domain marketplace (HugeDomains, Sedo, Dan, Afternic, Bodis, etc.), not active
+impersonation. ReconGuard Pro detects these and **downgrades** them: a
+parked candidate that resembles your brand scores **MEDIUM** ("consider
+acquiring it or monitoring for activation"), and a non-resembling parked page
+scores **LOW** — never HIGH. Detection uses three signals, any of which marks a
+candidate parked:
+
+1. **Redirect host (strongest).** The parking marketplaces serve via a 301/302/303
+   redirect to their own domain. The probe reads the `Location` **header** of
+   that response and matches its host against a known parking-provider list.
+   This is header-only: the probe client keeps `follow_redirects=False` (for
+   SSRF/DNS-rebinding safety — every probe connects to a pre-validated pinned
+   IP), so the redirect is **never followed** and **no new request** is made to
+   the parking host.
+2. **Page signatures.** Case-insensitive marketplace/for-sale markers
+   (`hugedomains`, `this domain is for sale`, `make an offer`, `dan.com`, …)
+   matched against the candidate's title and a bounded slice of its body. Overly
+   generic tokens (a bare "sale"/"offer") are intentionally excluded to avoid
+   false positives on real sites.
+3. **Empty/placeholder title** on an otherwise live site.
+
+A genuinely live site serving real brand-like content (not a redirect to a
+marketplace and not a park signature) still scores HIGH, so this does not
+over-suppress real impersonation.
+
 ### Lookalike CSV report
 
 This mode exports its **own** report, separate from the 16-column subdomain CSV.
