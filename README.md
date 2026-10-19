@@ -45,11 +45,11 @@ docker compose down
 
 ## Features
 
-- Passive subdomain discovery from 14 independent **keyless** public sources
+- Passive subdomain discovery from 9 independent **keyless** public sources
   (no API key required for any of them), including the exhaustive crt.sh parser
-  plus CertSpotter (with bounded pagination), ThreatMiner, SubdomainCenter, the
-  AlienVault OTX URL list, and the CommonCrawl index (no scanning of the target
-  is required for discovery).
+  plus CertSpotter (with bounded pagination), SubdomainCenter, and the
+  AlienVault OTX URL list (no scanning of the target is required for
+  discovery).
 - **Resilient fetching:** transient source failures (crt.sh 502/503, gateway
   504, 429 rate-limits, connect/read timeouts) are retried with bounded
   exponential backoff, so one flaky-but-recovering source — crt.sh is the
@@ -94,15 +94,10 @@ docker compose down
 | AlienVault OTX | no |
 | RapidDNS | no |
 | URLScan.io | no |
-| ThreatCrowd | no |
 | Wayback Machine (CDX) | no |
-| Anubis (jldc.me) | no |
-| BufferOver | no |
 | CertSpotter (SSLMate) | no |
-| ThreatMiner | no |
 | SubdomainCenter | no |
 | AlienVault OTX URL list | no |
-| CommonCrawl (URL index) | no |
 | SecurityTrails | optional |
 | Shodan | optional |
 | c99.nl | optional (paid) |
@@ -123,7 +118,7 @@ ReconGuard Pro mitigates this in three ways:
   connect/read timeouts) are retried with short bounded exponential backoff so a
   source that is merely flaky — crt.sh especially — is recovered instead of
   dropped. Definitive non-transient failures (403/404/530) are not retried.
-- **Redundancy.** Fourteen keyless sources run in parallel, so one or two dead
+- **Redundancy.** Nine keyless sources run in parallel, so one or two dead
   sources no longer gut the run — the results are the union of whatever
   responded.
 - **Visibility.** A source that still fails after retries is marked **error** in

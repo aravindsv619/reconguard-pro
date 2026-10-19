@@ -178,7 +178,7 @@ def test_app_js_source_failure_note_is_escapehtml_safe():
     # It is wired to render on completion using the last polled statuses.
     assert "renderSourceFailureNote(lastSourceStatuses)" in js
     # New keyless sources are present in the client-side source list.
-    for name in ("AlienVaultURLs", "CommonCrawl", "CertSpotter"):
+    for name in ("AlienVaultURLs", "SubdomainCenter", "CertSpotter"):
         assert name in js, f"missing source {name!r} in app.js SOURCES list"
 
 

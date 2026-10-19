@@ -1,4 +1,4 @@
-"""Tests for the 11 data-source parsers in main.py.
+"""Tests for the data-source parsers in main.py.
 
 Each endpoint is mocked with respx and the parser's normalized output is
 asserted, including crt.sh wildcard stripping, Wayback URL host extraction,
@@ -101,15 +101,6 @@ async def test_urlscan_results(client):
 
 
 @respx.mock
-async def test_threatcrowd_subdomains(client):
-    respx.get("https://www.threatcrowd.org/searchApi/v2/domain/report/").mock(
-        return_value=httpx.Response(200, json={"subdomains": ["g.example.com", "h.example.com"]})
-    )
-    out = await main.query_threatcrowd(client, DOMAIN, {})
-    assert out == {"g.example.com", "h.example.com"}
-
-
-@respx.mock
 async def test_wayback_extracts_host_from_url(client):
     respx.get("https://web.archive.org/cdx/search/cdx").mock(
         return_value=httpx.Response(
@@ -119,26 +110,6 @@ async def test_wayback_extracts_host_from_url(client):
     )
     out = await main.query_wayback(client, DOMAIN, {})
     assert out == {"i.example.com", "j.example.com"}
-
-
-@respx.mock
-async def test_anubis_list(client):
-    respx.get(f"https://jldc.me/anubis/subdomains/{DOMAIN}").mock(
-        return_value=httpx.Response(200, json=["k.example.com", "l.example.com"])
-    )
-    out = await main.query_anubis(client, DOMAIN, {})
-    assert out == {"k.example.com", "l.example.com"}
-
-
-@respx.mock
-async def test_bufferover_results(client):
-    respx.get("https://tls.bufferover.run/dns").mock(
-        return_value=httpx.Response(
-            200, json={"Results": ["1.2.3.4,m.example.com", "5.6.7.8,n.example.com"]}
-        )
-    )
-    out = await main.query_bufferover(client, DOMAIN, {})
-    assert out == {"m.example.com", "n.example.com"}
 
 
 async def test_securitytrails_skips_without_key(client):
@@ -266,18 +237,6 @@ async def test_certspotter_parses_dns_names(client):
 
 
 @respx.mock
-async def test_threatminer_parses_results(client):
-    respx.get("https://api.threatminer.org/v2/domain.php").mock(
-        return_value=httpx.Response(
-            200,
-            json={"results": ["c.example.com", "d.example.com", "nope.net"]},
-        )
-    )
-    out = await main.query_threatminer(client, DOMAIN, {})
-    assert out == {"c.example.com", "d.example.com"}
-
-
-@respx.mock
 async def test_subdomaincenter_parses_json_array(client):
     respx.get("https://api.subdomain.center/").mock(
         return_value=httpx.Response(
@@ -299,19 +258,28 @@ async def test_certspotter_connect_error_raises_source_unavailable(client):
 
 
 def test_sources_registry_contains_new_keyless_sources():
-    for name in ("CertSpotter", "ThreatMiner", "SubdomainCenter",
-                 "AlienVaultURLs", "CommonCrawl"):
+    for name in ("CertSpotter", "SubdomainCenter", "AlienVaultURLs"):
         assert name in main.SOURCES
         assert callable(main.SOURCES[name])
     # the keyless sources must still return data without any keys (not gated
     # behind a key early-return like the keyed sources).
-    # All original sources remain registered.
+    # The remaining working/valuable sources stay registered.
     for name in (
         "crt.sh", "HackerTarget", "AlienVault", "RapidDNS", "URLScan",
-        "ThreatCrowd", "Wayback", "Anubis", "BufferOver",
-        "SecurityTrails", "Shodan", "c99",
+        "Wayback", "SecurityTrails", "Shodan", "c99",
     ):
         assert name in main.SOURCES
+
+
+def test_sources_registry_excludes_dead_sources():
+    # Chronically-dead sources were removed so the per-source status table
+    # stops showing permanent failures. They must NOT reappear in the registry.
+    for name in ("BufferOver", "ThreatMiner", "CommonCrawl", "ThreatCrowd", "Anubis"):
+        assert name not in main.SOURCES
+    # and their fetchers are gone from the module entirely.
+    for attr in ("query_bufferover", "query_threatminer", "query_commoncrawl",
+                 "query_threatcrowd", "query_anubis"):
+        assert not hasattr(main, attr)
 
 
 # ---------------------------------------------------------------------------
@@ -489,34 +457,6 @@ async def test_alienvault_urllist_parses_hostnames(client):
     assert out == {"a.example.com", "b.example.com"}
 
 
-@respx.mock
-async def test_commoncrawl_extracts_hosts_from_cdx(client):
-    respx.get("https://index.commoncrawl.org/collinfo.json").mock(
-        return_value=httpx.Response(200, json=[{"id": "CC-MAIN-2026-39"}])
-    )
-    body = (
-        '{"url": "https://a.example.com/x"}\n'
-        '{"url": "http://b.example.com/"}\n'
-        '{"url": "https://out.org/"}\n'
-        'not-json-line\n'
-    )
-    respx.get("https://index.commoncrawl.org/CC-MAIN-2026-39-index").mock(
-        return_value=httpx.Response(200, text=body)
-    )
-    out = await main.query_commoncrawl(client, DOMAIN, {})
-    assert out == {"a.example.com", "b.example.com"}
-
-
-@respx.mock
-async def test_commoncrawl_rejects_bad_index_id(client):
-    # A malformed index id must not be used to build the next URL path.
-    respx.get("https://index.commoncrawl.org/collinfo.json").mock(
-        return_value=httpx.Response(200, json=[{"id": "../evil"}])
-    )
-    out = await main.query_commoncrawl(client, DOMAIN, {})
-    assert out == set()
-
-
 # ---------------------------------------------------------------------------
 # run_enumeration resilience (FIX 1/2): several dead sources don't zero the run
 # ---------------------------------------------------------------------------
@@ -558,7 +498,7 @@ async def test_run_enumeration_union_survives_several_dead_sources(monkeypatch):
     )
     # Dead sources: a non-transient 403 and a persistent 502 (retries exhaust).
     respx.route(host="urlscan.io").mock(return_value=httpx.Response(403))
-    respx.route(host="jldc.me").mock(return_value=httpx.Response(502))
+    respx.route(host="rapiddns.io").mock(return_value=httpx.Response(502))
     # Everything else responds benignly-empty so it is 'done' with 0 hosts.
     respx.route().mock(return_value=httpx.Response(200, json={}))
 
@@ -579,4 +519,4 @@ async def test_run_enumeration_union_survives_several_dead_sources(monkeypatch):
     assert job.source_statuses["crt.sh"] == "done"
     assert job.source_statuses["HackerTarget"] == "done"
     assert job.source_statuses["URLScan"] == "error"  # 403 non-transient
-    assert job.source_statuses["Anubis"] == "error"   # persistent 502
+    assert job.source_statuses["RapidDNS"] == "error"  # persistent 502

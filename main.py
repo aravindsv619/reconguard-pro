@@ -1,6 +1,6 @@
 """ReconGuard Pro — subdomain enumeration, takeover-risk, and lookalike-domain backend.
 
-A FastAPI application that aggregates subdomains from 11 public passive-DNS
+A FastAPI application that aggregates subdomains from public passive-DNS
 sources, resolves and probes each one, scores subdomain-takeover risk, and
 exposes an in-memory job API plus a single-file dark-themed frontend.
 """
@@ -9,7 +9,6 @@ import asyncio
 import csv
 import io
 import ipaddress
-import json
 import logging
 import os
 import re
@@ -53,8 +52,6 @@ SOURCE_RETRY_MAX_DELAY = 4.0  # cap per-sleep so added latency stays bounded
 # large cert history is not truncated to page 1, while total work stays bounded.
 CERTSPOTTER_MAX_PAGES = 5
 CERTSPOTTER_PAGE_HINT = 100  # a full page is ~100 entries; a shorter page = last
-# CommonCrawl CDX fetch cap: a best-effort, bounded keyless hostname source.
-COMMONCRAWL_LIMIT = 10000
 # HTTP statuses worth retrying (gateway/overload/rate-limit). A 429 honors a
 # numeric Retry-After header when present (clamped to SOURCE_RETRY_MAX_DELAY).
 TRANSIENT_STATUS = frozenset({429, 502, 503, 504})
@@ -1632,25 +1629,6 @@ async def query_certspotter(client: httpx.AsyncClient, domain: str, keys: dict) 
     return out
 
 
-async def query_threatminer(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
-    """ThreatMiner passive-DNS subdomains (KEYLESS). rt=5 returns subdomains."""
-    out: set[str] = set()
-    try:
-        resp = await _get(
-            client,
-            f"https://api.threatminer.org/v2/domain.php?q={domain}&rt=5",
-        )
-        data = resp.json()
-        if isinstance(data, dict):
-            for host in data.get("results", []) or []:
-                norm = _normalize_host(str(host), domain)
-                if norm:
-                    out.add(norm)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("threatminer failed: %s", exc)
-    return out
-
-
 async def query_subdomaincenter(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
     """subdomain.center passive discovery (KEYLESS). Returns a JSON array."""
     out: set[str] = set()
@@ -1732,23 +1710,6 @@ async def query_urlscan(client: httpx.AsyncClient, domain: str, keys: dict) -> s
     return out
 
 
-async def query_threatcrowd(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
-    out: set[str] = set()
-    try:
-        resp = await _get(
-            client,
-            f"https://www.threatcrowd.org/searchApi/v2/domain/report/?domain={domain}",
-        )
-        data = resp.json()
-        for sub in data.get("subdomains", []):
-            norm = _normalize_host(sub, domain)
-            if norm:
-                out.add(norm)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("threatcrowd failed: %s", exc)
-    return out
-
-
 async def query_wayback(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
     out: set[str] = set()
     try:
@@ -1768,41 +1729,6 @@ async def query_wayback(client: httpx.AsyncClient, domain: str, keys: dict) -> s
                 out.add(norm)
     except Exception as exc:  # noqa: BLE001
         logger.debug("wayback failed: %s", exc)
-    return out
-
-
-async def query_anubis(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
-    out: set[str] = set()
-    try:
-        resp = await _get(client, f"https://jldc.me/anubis/subdomains/{domain}")
-        data = resp.json()
-        if isinstance(data, list):
-            for sub in data:
-                norm = _normalize_host(sub, domain)
-                if norm:
-                    out.add(norm)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("anubis failed: %s", exc)
-    return out
-
-
-async def query_bufferover(client: httpx.AsyncClient, domain: str, keys: dict) -> set[str]:
-    out: set[str] = set()
-    try:
-        resp = await _get(client, f"https://tls.bufferover.run/dns?q=.{domain}")
-        data = resp.json()
-        rows = []
-        if isinstance(data, dict):
-            rows = (data.get("Results") or []) + (data.get("FDNS") or []) + (data.get("RDNS") or [])
-        for row in rows:
-            # format: ip,subdomain  (sometimes ip,other,subdomain)
-            parts = str(row).split(",")
-            host = parts[-1] if parts else ""
-            norm = _normalize_host(host, domain)
-            if norm:
-                out.add(norm)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("bufferover failed: %s", exc)
     return out
 
 
@@ -1909,73 +1835,19 @@ async def query_alienvault_urllist(
     return out
 
 
-async def query_commoncrawl(
-    client: httpx.AsyncClient, domain: str, keys: dict
-) -> set[str]:
-    """CommonCrawl URL index (KEYLESS, best-effort) — hostnames seen crawling
-    the public web under the domain.
-
-    Resolves the newest monthly index from collinfo.json, then queries its CDX
-    API for ``*.{domain}`` and extracts the host from each record's ``url``.
-    Bounded by COMMONCRAWL_LIMIT; a dead/slow index degrades (SourceUnavailable
-    from _get -> source marked errored). The CDX stream is newline-delimited
-    JSON objects (NOT a single JSON array), parsed line by line.
-    """
-    out: set[str] = set()
-    # Discover the latest index id (e.g. "CC-MAIN-2026-39").
-    resp = await _get(client, "https://index.commoncrawl.org/collinfo.json")
-    try:
-        collections = resp.json()
-    except Exception:  # noqa: BLE001 — unusable index listing
-        return out
-    if not isinstance(collections, list) or not collections:
-        return out
-    index_id = collections[0].get("id") if isinstance(collections[0], dict) else None
-    if not index_id or not re.fullmatch(r"CC-MAIN-[0-9]{4}-[0-9]{2}", str(index_id)):
-        # Only accept the expected index id shape (defensive; avoids using an
-        # attacker-controlled value to build the next URL path).
-        return out
-    resp = await _get(
-        client,
-        f"https://index.commoncrawl.org/{index_id}-index"
-        f"?url=*.{domain}&output=json&fl=url&limit={COMMONCRAWL_LIMIT}",
-    )
-    for line in (resp.text or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except Exception:  # noqa: BLE001 — skip a malformed CDX line
-            continue
-        url = record.get("url", "") if isinstance(record, dict) else ""
-        match = re.search(r"https?://([^/:]+)", str(url))
-        host = match.group(1) if match else str(url)
-        norm = _normalize_host(host, domain)
-        if norm:
-            out.add(norm)
-    return out
-
-
 SOURCES = {
     "crt.sh": query_crtsh,
     "HackerTarget": query_hackertarget,
     "AlienVault": query_alienvault,
     "RapidDNS": query_rapiddns,
     "URLScan": query_urlscan,
-    "ThreatCrowd": query_threatcrowd,
     "Wayback": query_wayback,
-    "Anubis": query_anubis,
-    "BufferOver": query_bufferover,
     # New keyless sources (always run, no key/toggle).
     "CertSpotter": query_certspotter,
-    "ThreatMiner": query_threatminer,
     "SubdomainCenter": query_subdomaincenter,
-    # Added keyless sources for redundancy (verified live). AlienVault URL List
-    # is an independently rate-limited OTX dataset; CommonCrawl surfaces hosts
-    # seen crawling the public web.
+    # Added keyless source for redundancy (verified live). AlienVault URL List
+    # is an independently rate-limited OTX dataset.
     "AlienVaultURLs": query_alienvault_urllist,
-    "CommonCrawl": query_commoncrawl,
     "SecurityTrails": query_securitytrails,
     "Shodan": query_shodan,
     "c99": query_c99,

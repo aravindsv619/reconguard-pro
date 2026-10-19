@@ -9,7 +9,7 @@
     let lastSourceStatuses = {};
 
     const DOMAIN_RE = /^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
-    const SOURCES = ['crt.sh','HackerTarget','AlienVault','RapidDNS','URLScan','ThreatCrowd','Wayback','Anubis','BufferOver','CertSpotter','ThreatMiner','SubdomainCenter','AlienVaultURLs','CommonCrawl','SecurityTrails','Shodan','c99'];
+    const SOURCES = ['crt.sh','HackerTarget','AlienVault','RapidDNS','URLScan','Wayback','CertSpotter','SubdomainCenter','AlienVaultURLs','SecurityTrails','Shodan','c99'];
 
     function toggleAdvanced() {
       const p = document.getElementById('advancedPanel');
