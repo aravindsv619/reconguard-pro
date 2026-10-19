@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .agents/
 .pytest_cache/
+pip-audit-report.*
+wordlists/gen_wordlist.py

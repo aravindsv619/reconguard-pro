@@ -1,7 +1,0 @@
-{
-  "task_id": "task-verify-dns",
-  "task_description": "Extend SubRecon Pro (HEAD 1540058) with two features: (1) an ACTIVE subdomain-takeover verification pass that turns the heuristic VERIFY tier into a concrete VULNERABLE/NOT_VULNERABLE/INCONCLUSIVE verdict with evidence (incl. the ELB gitlab/openproject not-claimable case), and (2) full DNS record listing (A/AAAA/CNAME/MX/NS/TXT/SOA) via dig-arg-list + stdlib fallback. New CSV columns appended at positions 13-15 (takeover_verdict, takeover_evidence, dns_records); first 12 columns unchanged. All new network calls reuse probe_client + SSRF guard + Semaphore + dig arg-list + _csv_safe + XSS-safe rendering. Preserve all existing features and 130 passing tests.",
-  "status": "completed",
-  "feature_order": ["FEAT-001", "FEAT-002"],
-  "blocked_reason": null
-}
