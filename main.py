@@ -656,7 +656,7 @@ def generate_lookalikes(domain: str) -> set[str]:
 
 # Generic words that carry no distinctive brand signal. When a brand label or
 # an original page title is reduced to tokens, these are dropped so resemblance
-# keys off the DISTINCTIVE part (e.g. 'nerd' for brandco), not a word any
+# keys off the DISTINCTIVE part (e.g. 'brand' for brandco), not a word any
 # unrelated business might share ('agent', 'solutions', 'services', ...).
 BRAND_STOPWORDS = frozenset(
     {
@@ -705,15 +705,16 @@ def _brand_tokens(brand_label: str, original_title: Optional[str]) -> set[str]:
     Combines the normalized registrable brand label with the significant words
     of the original page title, drops BRAND_STOPWORDS and very short (<3 char)
     tokens, and ALSO adds the leading distinctive fragment of the brand label
-    (e.g. 'nerd' from 'brandco' once the generic suffix 'agent' is removed) so
-    a content match can key off the distinctive part. Best-effort, never raises.
+    (e.g. 'brand' from 'brandservices' once the generic suffix 'services' is
+    removed) so a content match can key off the distinctive part. Best-effort,
+    never raises.
     """
     tokens: set[str] = set()
     norm_label = _normalize_label(brand_label)
     if norm_label:
         tokens.add(norm_label)
         # Peel off a trailing generic stopword to expose the distinctive stem,
-        # e.g. 'brandco' -> 'nerd' (since 'agent' is a stopword). Only strip
+        # e.g. 'brandservices' -> 'brand' ('services' is a stopword). Only strip
         # ONE suffix and only when a meaningful (>=3 char) stem remains.
         for stop in BRAND_STOPWORDS:
             if len(stop) >= 3 and norm_label.endswith(stop) and \

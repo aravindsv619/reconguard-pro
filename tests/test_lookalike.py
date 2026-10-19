@@ -101,12 +101,12 @@ def test_generate_respects_cap(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_technique_omission():
     out = main.generate_lookalikes("brandco.ai")
-    assert "erdagent.ai" in out  # first char removed
+    assert "randco.ai" in out  # first char removed
 
 
 def test_technique_transposition():
     out = main.generate_lookalikes("brandco.ai")
-    assert "enrdagent.ai" in out  # swap first two chars
+    assert "rbandco.ai" in out  # swap first two chars
 
 
 def test_technique_homoglyph():
@@ -157,7 +157,7 @@ def test_score_high_resembles_without_mx():
 
 
 def test_score_medium_live_mx_but_no_resemblance_not_high():
-    # REGRESSION GUARD (nersagent.com): live + MX but does NOT resemble the
+    # REGRESSION GUARD (brsndco.com): live + MX but does NOT resemble the
     # brand -> MEDIUM, never HIGH. Bare MX must not escalate to HIGH anymore.
     risk, action = main.score_lookalike(
         "RESOLVED", 200, None, True, False, "unknown", False
@@ -207,12 +207,12 @@ def test_score_none():
 # 4b. Brand-signal helpers: _brand_tokens / _is_parked / _resembles_brand
 # ---------------------------------------------------------------------------
 def test_brand_tokens_excludes_stopwords_keeps_distinctive():
-    # 'agent' is a generic stopword; the distinctive stem 'nerd' and the full
-    # label 'brandco' must survive, but 'ai'/'for'/'home' (stopwords/short)
+    # 'co' is a generic stopword; the distinctive title token 'brand' and the
+    # full label 'brandco' must survive, but 'ai'/'for'/'home' (stopwords/short)
     # must be dropped.
-    tokens = main._brand_tokens("brandco", "Nerd Agent - AI for Home Assistant")
+    tokens = main._brand_tokens("brandco", "Brand Co - AI for Home Assistant")
     assert "brandco" in tokens
-    assert "nerd" in tokens
+    assert "brand" in tokens
     assert "assistant" in tokens
     assert "agent" not in tokens
     assert "ai" not in tokens
@@ -224,7 +224,6 @@ def test_brand_tokens_label_only_when_no_title():
     # Fetch failure path: tokens derive from the label alone, still distinctive.
     tokens = main._brand_tokens("brandco", None)
     assert "brandco" in tokens
-    assert "nerd" in tokens
 
 
 def test_is_parked_signatures_and_empty_title():
@@ -234,12 +233,12 @@ def test_is_parked_signatures_and_empty_title():
     assert main._is_parked("Coming Soon") is True
     assert main._is_parked("") is True          # empty title
     assert main._is_parked("   ") is True        # whitespace-only
-    assert main._is_parked("Nerd Agent") is False
+    assert main._is_parked("Brand Co") is False
     assert main._is_parked(None) is False        # no probe -> not parked
 
 
 def test_resembles_brand_label_containment():
-    tokens = main._brand_tokens("brandco", "Nerd Agent")
+    tokens = main._brand_tokens("brandco", "Brand Co")
     # Hyphen/dot variants normalize to contain the brand label.
     assert main._resembles_brand("brand-co.com", None, "brandco", tokens) is True
     assert main._resembles_brand("brandco.me", None, "brandco", tokens) is True
@@ -247,23 +246,23 @@ def test_resembles_brand_label_containment():
 
 
 def test_resembles_brand_unrelated_label_and_title():
-    tokens = main._brand_tokens("brandco", "Nerd Agent - AI for Home Assistant")
-    # nersagent/nercagent do NOT contain 'brandco' and their titles share no
+    tokens = main._brand_tokens("brandco", "Brand Co - AI for Home Assistant")
+    # brsndco/brzndco do NOT contain 'brandco' and their titles share no
     # distinctive brand token -> do NOT resemble.
     assert main._resembles_brand(
-        "nersagent.com", "New Era Realty Solutions - real estate in Miami",
+        "brsndco.com", "New Era Realty Solutions - real estate in Miami",
         "brandco", tokens,
     ) is False
     assert main._resembles_brand(
-        "nercagent.com", "NERC Agent", "brandco", tokens,
+        "brzndco.com", "Acme Networks", "brandco", tokens,
     ) is False
 
 
 def test_resembles_brand_by_content_token():
-    tokens = main._brand_tokens("brandco", "Nerd Agent - AI for Home Assistant")
-    # Different label but title echoes the distinctive token 'nerd'.
+    tokens = main._brand_tokens("brandco", "Brand Co - AI for Home Assistant")
+    # Different label but title echoes the distinctive token 'brand'.
     assert main._resembles_brand(
-        "totally-other.com", "Nerd Helper", "brandco", tokens,
+        "totally-other.com", "Brand Helper", "brandco", tokens,
     ) is True
 
 
@@ -301,7 +300,7 @@ async def test_analyze_high_tier_brand_containing_label(monkeypatch):
     # -> live + not parked -> HIGH, even without MX.
     res = await _run_analyze(
         monkeypatch, ips=["93.184.216.34"], dns_status="RESOLVED",
-        http=200, https=200, body="<title>Nerd Agent - AI for Home Assistant</title>",
+        http=200, https=200, body="<title>Brand Co - AI for Home Assistant</title>",
         mx=False,
     )
     assert res["resembles_original"] is True
@@ -311,15 +310,15 @@ async def test_analyze_high_tier_brand_containing_label(monkeypatch):
 
 
 async def test_analyze_medium_unrelated_business_not_high(monkeypatch):
-    # REGRESSION (nersagent.com): live + MX, label does NOT contain 'brandco',
+    # REGRESSION (brsndco.com): live + MX, label does NOT contain 'brandco',
     # title is a clearly different business sharing no distinctive brand token
     # -> resembles False -> MEDIUM, never HIGH.
     res = await _run_analyze(
         monkeypatch, ips=["93.184.216.34"], dns_status="RESOLVED",
         http=200, https=None,
         body="<title>New Era Realty Solutions - real estate in Miami</title>",
-        mx=True, candidate="nersagent.com",
-        original_title="Nerd Agent - AI for Home Assistant",
+        mx=True, candidate="brsndco.com",
+        original_title="Brand Co - AI for Home Assistant",
     )
     assert res["resembles_original"] is False
     assert res["risk"] == "MEDIUM"
@@ -331,8 +330,8 @@ async def test_analyze_parked_not_high(monkeypatch):
     res = await _run_analyze(
         monkeypatch, ips=["93.184.216.34"], dns_status="RESOLVED",
         http=200, https=None, body="<title>Parking Page</title>", mx=True,
-        candidate="berdagent.com",
-        original_title="Nerd Agent - AI for Home Assistant",
+        candidate="xrandco.com",
+        original_title="Brand Co - AI for Home Assistant",
     )
     assert res["resembles_original"] is False
     assert res["risk"] == "LOW"
@@ -342,7 +341,7 @@ async def test_analyze_brand_tld_variant_high(monkeypatch):
     # Brand TLD variant: same brand label, different TLD, live, MX -> HIGH.
     res = await _run_analyze(
         monkeypatch, ips=["93.184.216.34"], dns_status="RESOLVED",
-        http=200, https=200, body="<title>Nerd Agent</title>", mx=True,
+        http=200, https=200, body="<title>Brand Co</title>", mx=True,
         candidate="brandco.me",
     )
     assert res["resembles_original"] is True
@@ -371,12 +370,12 @@ async def test_analyze_available_tier(monkeypatch):
 
 async def test_analyze_resembles_by_content_token(monkeypatch):
     # Label does NOT contain the brand, but the fetched title shares the
-    # distinctive brand token 'nerd' -> resembles by content -> HIGH when live.
+    # distinctive brand token 'brand' -> resembles by content -> HIGH when live.
     res = await _run_analyze(
         monkeypatch, ips=["93.184.216.34"], dns_status="RESOLVED",
-        http=200, https=None, body="<title>Nerd Helper</title>", mx=False,
+        http=200, https=None, body="<title>Brand Helper</title>", mx=False,
         candidate="totally-other.com",
-        original_title="Nerd Agent - AI for Home Assistant",
+        original_title="Brand Co - AI for Home Assistant",
     )
     assert res["resembles_original"] is True
     assert res["risk"] == "HIGH"
@@ -388,7 +387,7 @@ async def test_analyze_fetch_failure_falls_back_to_label(monkeypatch):
     # and NEVER raise. 'brand-co' still contains 'brandco' -> resembles.
     res = await _run_analyze(
         monkeypatch, ips=["93.184.216.34"], dns_status="RESOLVED",
-        http=200, https=None, body="<title>Nerd Agent</title>", mx=False,
+        http=200, https=None, body="<title>Brand Co</title>", mx=False,
         original_title=None, candidate="brand-co.com",
     )
     assert res["resembles_original"] is True
@@ -579,7 +578,7 @@ def client(monkeypatch):
                 "ip_addresses": ["93.184.216.34"],
                 "http_status": 200,
                 "https_status": 200,
-                "page_title": "Nerd Agent",
+                "page_title": "Brand Co",
                 "has_mx": True,
                 "registered": True,
                 "registrar": "Example Registrar",
