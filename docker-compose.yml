@@ -1,0 +1,48 @@
+# ReconGuard Pro — docker compose
+#
+# Two ways to use this:
+#
+# 1) Pull the published image from GHCR (what you share with others):
+#      docker compose up -d
+#    This pulls ghcr.io/aravindsv619/reconguard-pro:latest (published by CI).
+#
+# 2) Build locally from source (for development):
+#      docker compose up --build
+#    (uses the `build:` section — comment out `image:` or it will still tag it).
+#
+# Then open http://localhost:8080
+#
+# NOTE: ReconGuard Pro has NO authentication (single-user tool). This compose
+# binds the published port to 127.0.0.1 ONLY, so it is reachable from your
+# machine but not the network. To expose it to a LAN/host, change the port
+# mapping to "8080:8080" AND put an authenticating reverse proxy in front.
+
+services:
+  reconguard:
+    # Published image (edit <OWNER> to your GitHub owner, lowercase):
+    image: ghcr.io/aravindsv619/reconguard-pro:latest
+    # For a local source build instead of pulling, uncomment:
+    # build: .
+    container_name: reconguard-pro
+    # Bind to loopback only (safe default — no auth on the app).
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Must stay 0.0.0.0 so the container port is reachable from the host.
+      SUBRECON_HOST: "0.0.0.0"
+      # Scope CORS to the host origin you use.
+      SUBRECON_CORS_ORIGINS: "http://localhost:8080,http://127.0.0.1:8080"
+      # Per-client rate limit (requests/min) for scan starts.
+      SUBRECON_RATE_LIMIT: "60"
+      # Optional subdomain-source API keys (all OPTIONAL — the app is fully
+      # keyless without them; leave unset to skip those sources):
+      # SECURITYTRAILS_API_KEY: ""
+      # SHODAN_API_KEY: ""
+      # C99_API_KEY: ""
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
