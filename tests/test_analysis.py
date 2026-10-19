@@ -119,10 +119,121 @@ def test_socket_cname_fallback_same_host_returns_none(monkeypatch):
 
 @respx.mock
 async def test_check_http_probes_both_schemes():
-    respx.get("http://foo.example.com").mock(return_value=httpx.Response(200, text="hi"))
-    respx.get("https://foo.example.com").mock(return_value=httpx.Response(404, text="nope"))
+    # DNS-rebinding fix: check_http now connects to the PINNED IP (the URL
+    # authority is the IP) while the original hostname is kept as the Host
+    # header. Mock by the IP URL and assert the Host header is preserved.
+    pinned_ip = "93.184.216.34"
+    http_route = respx.get(f"http://{pinned_ip}").mock(
+        return_value=httpx.Response(200, text="hi")
+    )
+    https_route = respx.get(f"https://{pinned_ip}").mock(
+        return_value=httpx.Response(404, text="nope")
+    )
     async with httpx.AsyncClient() as c:
-        http_status, https_status, body = await main.check_http(c, "foo.example.com")
+        http_status, https_status, body = await main.check_http(
+            c, "foo.example.com", pinned_ip=pinned_ip
+        )
     assert http_status == 200
     assert https_status == 404
     assert "hi" in body and "nope" in body
+    # The connection address is the validated IP; the Host header is the
+    # original hostname so virtual-hosted sites still resolve correctly.
+    assert http_route.called and https_route.called
+    assert http_route.calls.last.request.headers["Host"] == "foo.example.com"
+    assert http_route.calls.last.request.url.host == pinned_ip
+
+
+@respx.mock
+async def test_check_http_never_probes_without_pinned_ip():
+    # Defense in depth: with no pinned IP, check_http must NOT hand the hostname
+    # to httpx for independent resolution — it returns empties and makes no call.
+    route = respx.route().mock(return_value=httpx.Response(200, text="should-not-happen"))
+    async with httpx.AsyncClient() as c:
+        http_status, https_status, body = await main.check_http(c, "foo.example.com")
+    assert (http_status, https_status, body) == (None, None, "")
+    assert not route.called
+
+
+@respx.mock
+async def test_check_http_skips_private_pinned_ip():
+    # Even if a private IP is somehow passed as pinned, the in-function
+    # _is_safe_public_ip re-check blocks the connection (SSRF regression).
+    route = respx.route().mock(return_value=httpx.Response(200, text="should-not-happen"))
+    async with httpx.AsyncClient() as c:
+        out = await main.check_http(c, "evil.example.com", pinned_ip="169.254.169.254")
+    assert out == (None, None, "")
+    assert not route.called
+
+
+# ---------------------------------------------------------------------------
+# DNS-rebinding TOCTOU: the probe pins the validated public IP and never
+# reaches a private/metadata IP that a second resolution might return.
+# ---------------------------------------------------------------------------
+@respx.mock
+async def test_rebinding_probe_pins_validated_public_ip(monkeypatch):
+    # The GUARD resolution returns a PUBLIC IP. A simulated SECOND resolution
+    # (what httpx would do at connect time) would return a PRIVATE/metadata IP.
+    # With IP-pinning the probe must connect to the PUBLIC IP only; the private
+    # address must never be contacted.
+    public_ip = "93.184.216.34"
+    private_ip = "169.254.169.254"
+
+    async def fake_resolve_dns_detailed(host):
+        # Guard check sees only the safe public IP.
+        return [public_ip], "RESOLVED"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", lambda h: __import_awaitable([]))
+    monkeypatch.setattr(main, "resolve_cname", lambda h: __import_awaitable(None))
+    monkeypatch.setattr(main, "resolve_dns_records", lambda h: __import_awaitable({}))
+    monkeypatch.setattr(main, "_resolve_ptrs", lambda ips: __import_awaitable([]))
+
+    public_route = respx.get(f"http://{public_ip}").mock(
+        return_value=httpx.Response(200, text="live")
+    )
+    respx.get(f"https://{public_ip}").mock(return_value=httpx.Response(200, text="live"))
+    # Any request to the private IP must NEVER happen.
+    private_route = respx.route(host=private_ip).mock(
+        return_value=httpx.Response(200, text="SHOULD-NOT-BE-REACHED")
+    )
+
+    async with httpx.AsyncClient() as c:
+        res = await main.analyze_subdomain(c, "target.example.com", ["src"], main.asyncio.Semaphore(5))
+
+    # Probe connected to the pinned public IP with the hostname preserved.
+    assert public_route.called
+    assert public_route.calls.last.request.headers["Host"] == "target.example.com"
+    # The private/metadata IP was never contacted.
+    assert not private_route.called
+    assert res["http_status"] == 200
+
+
+@respx.mock
+async def test_rebinding_private_only_host_never_probed(monkeypatch):
+    # A host resolving ONLY to a private IP must never be probed (SSRF guard
+    # regression still holds after the pinning refactor).
+    async def fake_resolve_dns_detailed(host):
+        return ["10.0.0.5"], "RESOLVED"
+
+    monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
+    monkeypatch.setattr(main, "resolve_cname_chain", lambda h: __import_awaitable([]))
+    monkeypatch.setattr(main, "resolve_cname", lambda h: __import_awaitable(None))
+    monkeypatch.setattr(main, "resolve_dns_records", lambda h: __import_awaitable({}))
+    monkeypatch.setattr(main, "_resolve_ptrs", lambda ips: __import_awaitable([]))
+
+    route = respx.route().mock(return_value=httpx.Response(200, text="should-not-happen"))
+
+    async with httpx.AsyncClient() as c:
+        res = await main.analyze_subdomain(c, "internal.example.com", ["src"], main.asyncio.Semaphore(5))
+
+    assert not route.called
+    assert res["http_status"] is None and res["https_status"] is None
+
+
+def __import_awaitable(value):
+    """Tiny helper: wrap a plain value in an awaitable for monkeypatched async
+    functions (so lambdas can stand in for `async def`)."""
+    async def _coro():
+        return value
+
+    return _coro()

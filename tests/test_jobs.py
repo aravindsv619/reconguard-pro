@@ -25,7 +25,7 @@ def no_network_analysis(monkeypatch):
     async def fake_resolve_cname(host):
         return None
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return 200, None, ""
 
     async def fake_resolve_ptrs(ips):

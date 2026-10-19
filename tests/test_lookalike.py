@@ -277,7 +277,7 @@ async def _run_analyze(monkeypatch, *, ips, dns_status, http, https, body, mx,
     async def fake_resolve(host):
         return ips, dns_status
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return http, https, body
 
     def fake_dig(host):
@@ -404,7 +404,7 @@ async def test_ssrf_private_ip_not_probed(monkeypatch):
     async def fake_resolve(host):
         return ["127.0.0.1"], "RESOLVED"
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         called["http"] = True
         return 200, 200, "<title>should not happen</title>"
 
@@ -428,7 +428,7 @@ async def test_ssrf_metadata_ip_not_probed(monkeypatch):
     async def fake_resolve(host):
         return ["169.254.169.254"], "RESOLVED"
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         called["http"] = True
         return 200, None, ""
 
@@ -499,7 +499,7 @@ async def test_job_completes_despite_rdap_error(monkeypatch):
     async def fake_resolve(host):
         return ["93.184.216.34"], "RESOLVED"
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return 200, None, "<title>x</title>"
 
     monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve)

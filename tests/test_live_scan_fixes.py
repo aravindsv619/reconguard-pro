@@ -125,7 +125,7 @@ async def test_onboarding_live_lightsail_not_flagged(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return ["ec2-203-0-113-10.ap-south-1.compute.amazonaws.com"]
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return 200, 200, "<html>app</html>"
 
     monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
@@ -169,7 +169,7 @@ async def test_live_elb_cname_not_vulnerable_not_dangling(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return []
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return 200, 200, "<html>welcome</html>"
 
     monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)

@@ -193,7 +193,7 @@ async def test_cloudfront_timeout_inconclusive(monkeypatch):
     async def fake_resolve_dns_detailed(host):
         return ["13.33.1.2"], "RESOLVED"
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         # Simulate a timeout: no status obtained from either scheme.
         return None, None, ""
 
@@ -223,7 +223,7 @@ async def test_analyze_subdomain_cloudfront_promoted_to_high(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return []
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         # Subdomain probe: 503 no body -> VERIFY tier. CloudFront target probe:
         # no-distribution signature -> VULNERABLE in the verify pass.
         if host.endswith("cloudfront.net"):
@@ -261,7 +261,7 @@ async def test_recommended_action_populated_per_verdict_class(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return []
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         # CloudFront bare 403 (no signature) -> INCONCLUSIVE; subdomain 503 -> VERIFY.
         if host.endswith("cloudfront.net"):
             return 403, None, "Forbidden"
@@ -451,7 +451,7 @@ async def test_analyze_subdomain_non_flagged_empty_verdict(monkeypatch):
     async def fake_resolve_cname(host):
         return None
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return 200, 200, "welcome"
 
     async def fake_resolve_ptrs(ips):
@@ -498,7 +498,7 @@ async def test_analyze_subdomain_flagged_gets_verdict(monkeypatch):
     async def fake_resolve_cname(host):
         return "bucket.s3.amazonaws.com"
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return None, 404, "<Error><Code>NoSuchBucket</Code></Error>"
 
     async def fake_resolve_ptrs(ips):
@@ -543,7 +543,7 @@ async def test_analyze_subdomain_verify_promoted_to_high(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return []
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         # Subdomain probe: 503 with no body -> no fingerprint -> VERIFY tier.
         # Target (S3) probe: NoSuchBucket -> VULNERABLE in the verify pass.
         if host.endswith("s3.amazonaws.com"):
@@ -584,7 +584,7 @@ async def test_elb_resolving_target_probe_times_out_not_vulnerable(monkeypatch):
     async def fake_resolve_dns_detailed(host):
         return ["52.1.2.3"], "RESOLVED"
 
-    async def boom_check_http(client, host):
+    async def boom_check_http(client, host, pinned_ip=None):
         # Realistic, EMPTY-message error — the exact class that produced the bug.
         raise asyncio.TimeoutError()
 
@@ -612,7 +612,7 @@ async def test_verify_probe_error_evidence_is_non_empty(monkeypatch):
     async def fake_resolve_dns_detailed(host):
         return ["13.33.1.2"], "RESOLVED"
 
-    async def boom_check_http(client, host):
+    async def boom_check_http(client, host, pinned_ip=None):
         raise socket.gaierror()
 
     monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
@@ -695,7 +695,7 @@ async def test_dangling_cname_without_a_record_cloudfront_vulnerable(monkeypatch
     async def fake_resolve_ptrs(ips):
         return []
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         # CloudFront no-distribution signature on the target probe.
         if host.endswith("cloudfront.net"):
             return 403, None, "ERROR: The request could not be satisfied."
@@ -739,7 +739,7 @@ async def test_dangling_cname_without_a_record_elb_kept_and_verdicted(monkeypatc
     async def fake_resolve_ptrs(ips):
         return []
 
-    async def boom_check_http(client, host):
+    async def boom_check_http(client, host, pinned_ip=None):
         # The ELB target refuses the bare probe (empty-message timeout) and must
         # NOT swallow the verdict. The subdomain's own probe (no A record) just
         # returns no status.
@@ -783,7 +783,7 @@ async def test_normal_a_record_subdomain_unchanged(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return []
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return 200, 200, "welcome"
 
     monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
@@ -830,7 +830,7 @@ async def test_arecord_cloudfront_healthy_not_vulnerable(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return ["server-93-184-216-34.maa51.r.cloudfront.net"]
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return 200, 200, "welcome"
 
     monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
@@ -869,7 +869,7 @@ async def test_arecord_cloudfront_unclaimed_alias_vulnerable(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return ["server-93-184-216-34.maa51.r.cloudfront.net"]
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return 403, None, "ERROR: The request could not be satisfied."
 
     monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
@@ -987,7 +987,7 @@ async def test_arecord_cloudfront_probe_timeout_inconclusive(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return ["server-93-184-216-34.maa51.r.cloudfront.net"]
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         # Simulate a blocked/timed-out probe: no status, no body. The verify
         # pass maps a status-less CloudFront probe to INCONCLUSIVE.
         return None, None, ""
@@ -1029,7 +1029,7 @@ async def test_cloud_low_service_row_gets_nonempty_verdict(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return ["s3-website-us-east-1.amazonaws.com"]
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return 200, 200, ""
 
     monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)
@@ -1067,7 +1067,7 @@ async def test_plain_arecord_noncloud_empty_verdict(monkeypatch):
     async def fake_resolve_ptrs(ips):
         return ["edge.example-cdn.net"]
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return 200, 200, "welcome"
 
     monkeypatch.setattr(main, "resolve_dns_detailed", fake_resolve_dns_detailed)

@@ -154,7 +154,7 @@ async def test_active_hit_tagged_bruteforce_and_permutation(monkeypatch):
     async def fake_resolve_cname(host):
         return None
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return 200, None, ""
 
     async def fake_resolve_ptrs(ips):
@@ -212,7 +212,7 @@ async def test_active_hosts_still_pass_ssrf_guard(monkeypatch):
     async def fake_resolve_cname(host):
         return None
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         probe_called["n"] += 1
         return 200, 200, "should-not-happen"
 
@@ -264,7 +264,7 @@ async def test_resolve_candidates_only_returns_hits(monkeypatch):
     async def fake_resolve_cname(host):
         return None
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return 200, None, ""
 
     async def fake_resolve_ptrs(ips):
@@ -401,7 +401,7 @@ async def test_custom_wordlist_all_invalid_falls_back_to_default(monkeypatch):
     async def fake_resolve_cname(host):
         return None
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return None, None, ""
 
     async def fake_resolve_ptrs(ips):
@@ -444,7 +444,7 @@ async def test_run_enumeration_truncation_note(monkeypatch):
     async def fake_resolve_cname(host):
         return None
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         return None, None, ""
 
     async def fake_resolve_ptrs(ips):

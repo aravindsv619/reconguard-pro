@@ -105,7 +105,7 @@ async def test_analyze_subdomain_skips_probe_for_private_ip(monkeypatch):
     async def fake_resolve_cname(host):
         return None
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         nonlocal probe_called
         probe_called = True
         return 200, 200, "should-not-happen"
@@ -149,7 +149,7 @@ async def test_analyze_subdomain_verify_private_ip_issues_no_probe(monkeypatch):
     async def fake_resolve_cname(host):
         return "app.us-east-1.elb.amazonaws.com"
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         nonlocal probe_called
         probe_called = True
         return 200, 200, "should-not-happen"
@@ -187,7 +187,7 @@ async def test_analyze_subdomain_probes_public_ip(monkeypatch):
     async def fake_resolve_cname(host):
         return None
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         nonlocal probe_called
         probe_called = True
         return 200, None, "ok"
@@ -217,7 +217,7 @@ async def test_analyze_subdomain_skips_invalid_hostname(monkeypatch):
         called["dns"] = True
         return ["93.184.216.34"]
 
-    async def fake_check_http(client, host):
+    async def fake_check_http(client, host, pinned_ip=None):
         called["http"] = True
         return 200, None, ""
 

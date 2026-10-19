@@ -136,6 +136,64 @@ def test_rate_limit_fails_open_on_internal_error(monkeypatch):
     assert main._rate_limit_ok("1.2.3.4") is True
 
 
+def test_proactive_eviction_reclaims_idle_buckets(monkeypatch):
+    # Harden (A04/API4): the periodic sweep must reclaim buckets that have
+    # fully refilled (idle), so a churn of one-off IPs never accumulates.
+    fake_now = {"t": 1000.0}
+    monkeypatch.setattr(main.time, "monotonic", lambda: fake_now["t"])
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 60)
+    monkeypatch.setattr(main, "RATE_LIMIT_BURST", 60)
+    main._RATE_BUCKETS.clear()
+
+    # 500 distinct IPs each spend one token.
+    for i in range(500):
+        assert main._rate_limit_ok(f"10.0.{i // 256}.{i % 256}") is True
+    assert len(main._RATE_BUCKETS) == 500
+
+    # Immediately: buckets are NOT yet fully refilled, so nothing is evicted.
+    assert main._evict_idle_rate_buckets() == 0
+    assert len(main._RATE_BUCKETS) == 500
+
+    # Advance the clock past a full refill window (60 tokens/60s): every bucket
+    # is back to full burst (idle) and must be reclaimed.
+    fake_now["t"] += 120.0
+    evicted = main._evict_idle_rate_buckets()
+    assert evicted == 500
+    assert len(main._RATE_BUCKETS) == 0
+
+
+def test_rate_buckets_bounded_under_ip_flood(monkeypatch):
+    # The hard cap must bound memory even without a proactive sweep: a flood of
+    # distinct IPs can never grow _RATE_BUCKETS unbounded.
+    fake_now = {"t": 5000.0}
+    monkeypatch.setattr(main.time, "monotonic", lambda: fake_now["t"])
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 60)
+    monkeypatch.setattr(main, "RATE_LIMIT_BURST", 60)
+    monkeypatch.setattr(main, "RATE_LIMIT_MAX_BUCKETS", 50)
+    main._RATE_BUCKETS.clear()
+
+    # Each IP makes one request; the clock advances enough between IPs that
+    # prior buckets are idle, so the emergency prune can reclaim them.
+    for i in range(500):
+        fake_now["t"] += 120.0
+        main._rate_limit_ok(f"172.16.{i // 256}.{i % 256}")
+    # Never exceeds the cap by more than the single in-flight add.
+    assert len(main._RATE_BUCKETS) <= main.RATE_LIMIT_MAX_BUCKETS + 1
+
+
+def test_rate_limit_429_behavior_unchanged(client, monkeypatch):
+    # Existing 429-on-exceed behavior must remain intact after hardening.
+    monkeypatch.setattr(main, "RATE_LIMIT_PER_MINUTE", 3)
+    monkeypatch.setattr(main, "RATE_LIMIT_BURST", 3)
+    main._RATE_BUCKETS.clear()
+    statuses = [
+        client.post("/api/enumerate", json={"domain": "example.com"}).status_code
+        for _ in range(6)
+    ]
+    assert statuses[:3] == [200, 200, 200]
+    assert 429 in statuses[3:]
+
+
 # ---------------------------------------------------------------------------
 # 3. Request-body / wordlist size cap (A04/API4)
 # ---------------------------------------------------------------------------
@@ -246,8 +304,10 @@ def test_is_safe_public_ip_allows_public(ip):
 def test_verified_client_does_not_follow_redirects():
     with TestClient(main.app):
         assert main.app.state.client.follow_redirects is False
-        # The probe client keeps redirects on (IP-guarded at the call site).
-        assert main.app.state.probe_client.follow_redirects is True
+        # The probe client also disables redirects: each probe connects to a
+        # pre-validated PINNED IP, and following a 3xx would let httpx resolve
+        # the redirect target independently of the SSRF guard (DNS-rebinding).
+        assert main.app.state.probe_client.follow_redirects is False
 
 
 @respx.mock

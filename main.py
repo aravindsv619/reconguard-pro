@@ -906,9 +906,12 @@ async def fetch_title(probe_client: httpx.AsyncClient, host: str) -> Optional[st
         if not is_valid_hostname(host):
             return None
         ip_addresses, _ = await resolve_dns_detailed(host)
-        if ip_addresses and not any(_is_safe_public_ip(ip) for ip in ip_addresses):
+        # DNS-rebinding fix: pin the validated public IP; never hand the
+        # hostname to httpx for independent resolution.
+        pinned_ip = _pin_safe_ip(ip_addresses)
+        if pinned_ip is None:
             return None
-        _http, _https, body = await check_http(probe_client, host)
+        _http, _https, body = await check_http(probe_client, host, pinned_ip=pinned_ip)
         return _extract_title(body)
     except Exception:  # noqa: BLE001
         return None
@@ -1037,12 +1040,15 @@ async def analyze_candidate(
 
         ip_addresses, dns_status = await resolve_dns_detailed(candidate)
         if dns_status == "RESOLVED":
-            # SSRF guard: only probe when at least one resolved IP is public.
-            if ip_addresses and not any(_is_safe_public_ip(ip) for ip in ip_addresses):
+            # SSRF + DNS-rebinding guard: pin the single validated public IP and
+            # connect to that address (Host header preserved); httpx never
+            # re-resolves the candidate hostname.
+            pinned_ip = _pin_safe_ip(ip_addresses)
+            if pinned_ip is None:
                 http_status, https_status, body = None, None, ""
             else:
                 http_status, https_status, body = await check_http(
-                    probe_client, candidate
+                    probe_client, candidate, pinned_ip=pinned_ip
                 )
                 page_title = _extract_title(body)
             try:
@@ -2179,29 +2185,83 @@ async def resolve_dns_records(host: str) -> dict[str, list[str]]:
         return {}
 
 
-async def check_http(client: httpx.AsyncClient, host: str) -> tuple[Optional[int], Optional[int], str]:
+def _pin_safe_ip(ip_addresses: list[str]) -> Optional[str]:
+    """Return the FIRST resolved address that passes ``_is_safe_public_ip``.
+
+    This is the single address a probe is allowed to connect to. Returning
+    ``None`` means no resolved IP is public, so the caller must NOT probe.
+    """
+    for ip in ip_addresses or []:
+        if _is_safe_public_ip(ip):
+            return ip
+    return None
+
+
+def _ip_authority(ip: str) -> str:
+    """Format ``ip`` as a URL authority, bracketing IPv6 literals ([::1])."""
+    try:
+        if ipaddress.ip_address(ip).version == 6:
+            return f"[{ip}]"
+    except ValueError:
+        pass
+    return ip
+
+
+async def check_http(
+    client: httpx.AsyncClient,
+    host: str,
+    pinned_ip: Optional[str] = None,
+) -> tuple[Optional[int], Optional[int], str]:
     """Probe http:// and https://; return (http_status, https_status, body).
 
     ``client`` here is the probe client (TLS verification disabled) so that
     arbitrary target subdomains presenting expired or self-signed certs do not
     produce spurious failures. It is never used for authenticated API calls.
 
-    SSRF note: callers MUST only invoke this for hosts whose resolved IPs are
-    public (see the ``_is_safe_public_ip`` gate in ``analyze_subdomain``). This
-    function does not re-resolve, so the IP-range guard lives at the single
-    call site to avoid a resolve/connect TOCTOU window.
+    DNS-REBINDING TOCTOU FIX (A10/API7): callers first resolve ``host`` and
+    pick a single ``_is_safe_public_ip``-approved address, then pass it here as
+    ``pinned_ip``. When pinned, the request CONNECTS to that exact IP (the URL
+    authority is the IP) while the original hostname is preserved as the
+    ``Host`` header and as the TLS SNI/server-name (``sni_hostname`` extension)
+    so virtual-hosted and TLS sites still respond. Because httpx never re-looks-
+    up the hostname, a hostile resolver cannot answer with a safe public IP for
+    the guard check and a private/metadata IP for the connect — the resolve and
+    the connect use the SAME validated address, closing the rebinding window.
+
+    Defense in depth: even if ``pinned_ip`` is somehow non-public it is
+    re-checked here and the probe is skipped. If ``pinned_ip`` is None (the
+    FIXED trusted-source paths never call this; only user-influenced probes do,
+    and they always pin) the function makes no connection and returns empties
+    rather than letting httpx resolve the hostname itself.
     """
     http_status: Optional[int] = None
     https_status: Optional[int] = None
     body = ""
+    # Never connect without a pre-validated pinned IP: this guarantees no
+    # user-influenced hostname is ever handed to httpx for independent
+    # resolution (which would re-open the rebinding window).
+    if not pinned_ip or not _is_safe_public_ip(pinned_ip):
+        return http_status, https_status, body
+    authority = _ip_authority(pinned_ip)
     for scheme in ("http", "https"):
         try:
             # Stream + cap the probe body (API10/API4): a hostile target must
             # not OOM the process with a huge body. The status code is still
             # recorded; an oversize body is dropped (treated as empty) so
             # fingerprint matching simply finds nothing rather than crashing.
+            #
+            # Connect to the PINNED IP (authority); keep Host = original
+            # hostname so virtual-hosted sites answer, and pin the TLS SNI to
+            # the hostname via the sni_hostname extension so https probes still
+            # negotiate the right certificate (verify is off on this probe
+            # client, so a mismatch is tolerated as before — we only pin the
+            # address).
             req = client.build_request(
-                "GET", f"{scheme}://{host}", timeout=HTTP_PROBE_TIMEOUT
+                "GET",
+                f"{scheme}://{authority}",
+                headers={"Host": host},
+                timeout=HTTP_PROBE_TIMEOUT,
+                extensions={"sni_hostname": host} if scheme == "https" else {},
             )
             resp = await client.send(req, stream=True)
             try:
@@ -2510,8 +2570,11 @@ async def verify_takeover(
 
         target_nxdomain = target_dns_status == "NXDOMAIN"
         target_resolved = target_dns_status == "RESOLVED"
+        # DNS-rebinding fix: the single validated public IP the probe will pin.
+        # None means no resolved IP is public -> do not probe.
+        target_pinned_ip = _pin_safe_ip(target_ips)
         # True iff at least one resolved IP is a public/routable address.
-        target_has_public_ip = any(_is_safe_public_ip(ip) for ip in target_ips)
+        target_has_public_ip = target_pinned_ip is not None
 
         # SSRF guard: if the target resolved to IP(s) and NONE are public, the
         # target points only at private/internal/metadata space — do NOT probe
@@ -2528,11 +2591,12 @@ async def verify_takeover(
         # existing DNS-based verdicts intact while never reaching an internal
         # host via a probe.
         #
-        # Residual: a small resolve->connect TOCTOU window remains for the
-        # probed case — we resolve here, then httpx re-resolves at connect, so a
-        # hostile resolver could flip the answer between the two. Fully
-        # eliminating it needs a pinned-IP transport; documented in the audit as
-        # an accepted residual risk.
+        # DNS-rebinding TOCTOU FIXED: the probe below connects to
+        # target_pinned_ip (the exact IP validated here), with the hostname kept
+        # as the Host header — httpx performs NO second resolution, so a hostile
+        # resolver can no longer flip a safe-public answer (guard) to a
+        # private/metadata answer (connect). The previous resolve->connect
+        # window is closed; see check_http.
         probe_allowed = target_has_public_ip
 
         http_status: Optional[int] = None
@@ -2569,7 +2633,9 @@ async def verify_takeover(
             try:
                 async with sem:
                     http_status, https_status, body = await asyncio.wait_for(
-                        check_http(probe_client, final_target_norm),
+                        check_http(
+                            probe_client, final_target_norm, pinned_ip=target_pinned_ip
+                        ),
                         timeout=VERIFY_HTTP_TIMEOUT,
                     )
                 probed = True
@@ -2984,12 +3050,21 @@ async def analyze_subdomain(
         # SSRF guard: never probe a host that resolves to a private/internal/
         # loopback/link-local/metadata address. If the host resolved to IP(s)
         # but none are public, skip the HTTP probe entirely (status stays None,
-        # alive=False). Hosts with no A/AAAA records (CNAME-only) are probed via
-        # their CNAME chain, which httpx re-resolves at connect time.
-        if ip_addresses and not any(_is_safe_public_ip(ip) for ip in ip_addresses):
+        # alive=False). Hosts with no A/AAAA records (CNAME-only) have no
+        # pinnable public IP, so they are NOT probed by hostname (that would let
+        # httpx re-resolve at connect time = the DNS-rebinding window); their
+        # takeover risk is still scored from the captured CNAME chain + DNS.
+        # DNS-rebinding fix: pin the single validated public IP and connect to
+        # THAT address (Host header preserved), so httpx never re-resolves the
+        # hostname. A CNAME-only host (no A/AAAA) has no pinnable IP and is NOT
+        # probed by hostname — that would re-open the rebinding window.
+        pinned_ip = _pin_safe_ip(ip_addresses)
+        if pinned_ip is None:
             http_status, https_status, body = None, None, ""
         else:
-            http_status, https_status, body = await check_http(probe_client, sub)
+            http_status, https_status, body = await check_http(
+                probe_client, sub, pinned_ip=pinned_ip
+            )
         ptr_hosts = await _resolve_ptrs(ip_addresses)
 
     # resolved is true iff DNS actually returned addresses (dns_status
@@ -3146,6 +3221,9 @@ async def _periodic_cleanup() -> None:
             await asyncio.sleep(300)
             cleanup_old_jobs()
             cleanup_old_lookalike_jobs()
+            # Proactively reclaim memory from idle per-IP rate buckets so a
+            # churn of one-off client IPs never accumulates (bounded memory).
+            _evict_idle_rate_buckets()
         except asyncio.CancelledError:
             break
         except Exception as exc:  # noqa: BLE001
@@ -3458,13 +3536,19 @@ async def lifespan(app: FastAPI):
     # Separate probe client with TLS verification disabled, used only to fetch
     # target subdomain bodies (which frequently present invalid/self-signed
     # certs) for liveness and takeover-fingerprint checks. No credentials are
-    # ever sent on this client. Redirects stay ENABLED here because target
-    # liveness/fingerprint detection often depends on following a 3xx to the
-    # provider's "gone" page; the probe is already IP-guarded at every call site
-    # (_is_safe_public_ip in analyze_subdomain / probe_allowed in verify_takeover).
+    # ever sent on this client.
+    #
+    # A10/API7 DNS-REBINDING FIX: follow_redirects is DISABLED on the probe
+    # client. Every probe now connects to a pre-validated PINNED IP (see
+    # check_http); if httpx were allowed to follow a 3xx it would resolve the
+    # redirect's Location hostname INDEPENDENTLY of our _is_safe_public_ip
+    # guard, re-opening the exact resolve->connect window the pinning closes.
+    # The 3xx status is still recorded (takeover scoring reads status + body
+    # fingerprints), so disabling redirect-following keeps liveness/fingerprint
+    # detection working while guaranteeing no unpinned re-resolution occurs.
     app.state.probe_client = httpx.AsyncClient(
         headers={"User-Agent": USER_AGENT},
-        follow_redirects=True,
+        follow_redirects=False,
         timeout=HTTP_PROBE_TIMEOUT,
         verify=False,
     )
@@ -3511,11 +3595,49 @@ app.add_middleware(SecurityHeadersMiddleware)
 # ---------------------------------------------------------------------------
 # Per-client rate limit (A04/API4)
 # ---------------------------------------------------------------------------
-# In-memory token bucket keyed by client IP. Not shared across processes (this
-# is a single-process local tool); it bounds abusive bursts from one client.
-# Each bucket is [tokens, last_refill_ts]. Access is single-threaded under the
-# asyncio event loop, so no lock is needed.
+# In-memory token bucket keyed by client IP. Each bucket is
+# [tokens, last_refill_ts]. Access is single-threaded under the asyncio event
+# loop, so no lock is needed.
+#
+# SCOPE (A04/API4): this limiter is IN-MEMORY and PER-PROCESS. That is correct
+# and sufficient for the single-instance deployment this tool ships as (one
+# uvicorn process bound to 127.0.0.1). Horizontal scaling across multiple
+# processes/replicas would require an EXTERNAL shared limiter (e.g. Redis),
+# which is intentionally NOT added here to avoid a dependency for the
+# single-user model.
+#
+# MEMORY BOUND: distinct client IPs each create a bucket, so a flood of unique
+# IPs could grow the table. Memory is bounded two ways: (1) a PROACTIVE sweep
+# in _periodic_cleanup evicts buckets that have fully refilled (idle), and
+# (2) a hard cap (RATE_LIMIT_MAX_BUCKETS) with an emergency prune inside
+# _rate_limit_ok guarantees the table can never grow without bound even between
+# sweeps.
 _RATE_BUCKETS: dict[str, list[float]] = {}
+
+
+def _evict_idle_rate_buckets(now: Optional[float] = None) -> int:
+    """Proactively drop fully-refilled (idle) per-IP rate buckets.
+
+    A bucket whose tokens have refilled back to RATE_LIMIT_BURST represents an
+    IP that has gone quiet: dropping it is equivalent to never having seen that
+    IP (its next request starts from a full burst again), so eviction is
+    behavior-neutral and reclaims memory for one-off IPs over time. Called from
+    the periodic cleanup task. Never raises. Returns the number evicted.
+    """
+    try:
+        if now is None:
+            now = time.monotonic()
+        refill_rate = RATE_LIMIT_PER_MINUTE / RATE_LIMIT_WINDOW  # tokens/sec
+        evicted = 0
+        for ip in list(_RATE_BUCKETS.keys()):
+            tokens, last = _RATE_BUCKETS[ip]
+            refilled = min(RATE_LIMIT_BURST, tokens + (now - last) * refill_rate)
+            if refilled >= RATE_LIMIT_BURST:
+                del _RATE_BUCKETS[ip]
+                evicted += 1
+        return evicted
+    except Exception:  # noqa: BLE001 — cleanup must never crash the task.
+        return 0
 
 
 def _rate_limit_ok(client_ip: Optional[str]) -> bool:
