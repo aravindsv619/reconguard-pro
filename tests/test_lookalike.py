@@ -407,7 +407,7 @@ async def test_analyze_hugedomains_redirect_resembling_not_high(monkeypatch):
     res = await _run_analyze(
         monkeypatch, ips=["93.184.216.34"], dns_status="RESOLVED",
         http=302, https=None, body="<title>acmebrand.com</title>", mx=False,
-        candidate="innovationinc-acmebrand.com",
+        candidate="acme-brand.com",
         brand_label="acmebrand",
         redirect_host="www.hugedomains.com",
     )
@@ -422,7 +422,7 @@ async def test_analyze_sedo_redirect_not_resembling_low(monkeypatch):
     # A redirect to sedo.com on a non-resembling label -> parked -> LOW.
     res = await _run_analyze(
         monkeypatch, ips=["93.184.216.34"], dns_status="RESOLVED",
-        http=303, https=None, body="<title>acmebrand.com</title>", mx=False,
+        http=303, https=None, body="<title>unrelated-xyz.com</title>", mx=False,
         candidate="unrelated-xyz.com", brand_label="acmebrand",
         redirect_host="sedo.com",
     )
@@ -438,7 +438,7 @@ async def test_analyze_live_impersonation_still_high(monkeypatch):
         monkeypatch, ips=["93.184.216.34"], dns_status="RESOLVED",
         http=200, https=None,
         body="<title>Acme Brand - Login to your account</title>",
-        mx=False, candidate="innovation-incacmebrand.com",
+        mx=False, candidate="acme-brand.com",
         brand_label="acmebrand",
     )
     assert res["resembles_original"] is True
@@ -466,12 +466,12 @@ async def test_analyze_redirect_detection_is_header_only_no_extra_fetch(monkeypa
 
     import asyncio
     res = await main.analyze_candidate(
-        None, None, "innovationinc-acmebrand.com", "lookalike", None, False,
+        None, None, "acme-brand.com", "lookalike", None, False,
         asyncio.Semaphore(5), asyncio.Semaphore(5),
         brand_label="acmebrand",
     )
     # Only the candidate itself was probed; no second fetch to hugedomains.com.
-    assert calls == ["innovationinc-acmebrand.com"]
+    assert calls == ["acme-brand.com"]
     assert "hugedomains.com" not in calls
     assert res["risk"] != "HIGH"
 
